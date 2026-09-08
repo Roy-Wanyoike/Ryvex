@@ -29,6 +29,7 @@ const (
 	CodeConflict         = "conflict"
 	CodeValidation       = "validation_failed"
 	CodeUnauthorized     = "unauthorized"
+	CodeForbidden        = "forbidden" // RBAC denial (issue #16)
 	CodeMethodNotAllowed = "method_not_allowed"
 	CodeBadRequest       = "bad_request"
 	CodeInternal         = "internal_error"

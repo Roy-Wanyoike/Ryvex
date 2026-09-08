@@ -24,6 +24,7 @@ const (
 	KindPolicy       = "Policy"
 	KindSecret       = "Secret"
 	KindSubscription = "Subscription"
+	KindAPIKey       = "APIKey" // managed API keys, reserved namespace (issue #16)
 )
 
 // Kinds is the authoritative set of supported resource kinds.
@@ -32,6 +33,7 @@ var Kinds = map[string]bool{
 	KindDeployment: true, KindCluster: true, KindNode: true,
 	KindDatabase: true, KindCache: true, KindBucket: true,
 	KindPolicy: true, KindSecret: true, KindSubscription: true,
+	KindAPIKey: true,
 }
 
 // Phases of the reconciliation lifecycle.
@@ -110,6 +112,16 @@ var (
 func (r *Resource) Validate() error {
 	if !Kinds[r.Kind] {
 		return &ValidationError{Field: "kind", Message: fmt.Sprintf("unsupported kind %q; supported: %v", r.Kind, knownKinds())}
+	}
+	// Managed API keys validate against their own schema and live
+	// exclusively in the reserved namespace (issue #16).
+	if r.Kind == KindAPIKey {
+		return r.validateAPIKey()
+	}
+	// The reserved org is unreachable for every other kind: only the
+	// keys service may write there, via the APIKey path above.
+	if r.Org == ReservedOrg {
+		return &ValidationError{Field: "org", Message: fmt.Sprintf("org %q is reserved for managed API keys", ReservedOrg)}
 	}
 	for _, f := range []struct{ name, v string }{{"org", r.Org}, {"project", r.Project}, {"env", r.Env}, {"name", r.Name}} {
 		if !scopeRe.MatchString(f.v) {
