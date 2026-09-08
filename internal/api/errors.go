@@ -32,6 +32,7 @@ const (
 	CodeForbidden        = "forbidden" // RBAC denial (issue #16)
 	CodeMethodNotAllowed = "method_not_allowed"
 	CodeBadRequest       = "bad_request"
+	CodePayloadTooLarge  = "payload_too_large" // 413 (issue #38)
 	CodeInternal         = "internal_error"
 )
 

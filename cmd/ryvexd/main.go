@@ -17,12 +17,19 @@ Usage:
   ryvexd version          print version information
 
 Flags (serve):
-  --http addr      listen address (default ":8080", env RYVEX_HTTP_ADDR)
-  --store kind     state backend: "memory" (default)
-  --dev-auth       accept any well-formed ryk_ bearer token (dev only)
-  --api-keys list  comma-separated name=token pairs of static API keys
-  --seed           load the demo dataset on boot
-  --log-level lvl  debug | info | warn | error (default info)
+  --http addr          listen address (default ":8080", env RYVEX_HTTP_ADDR)
+  --store kind         state backend: "memory" (default) or "postgres" (requires --dsn)
+  --dsn url            Postgres DSN (required when --store=postgres, env RYVEX_DATABASE_URL)
+  --bus kind           event bus backend: "memory" (default) or "nats" (JetStream)
+  --nats-url url       NATS server URL used when --bus=nats (default "nats://127.0.0.1:4222", env RYVEX_NATS_URL)
+  --dev-auth           accept any well-formed ryk_ bearer token (dev only; refused with
+                       --store postgres / --bus nats unless RYVEX_ALLOW_DEV_AUTH=1)
+  --api-keys list      comma-separated name=token pairs of static API keys (env RYVEX_API_KEYS)
+  --cors-origins list  comma-separated browser origins allowed to call the API (env RYVEX_CORS_ORIGINS)
+  --webhook-secret key HMAC key material for webhook signatures (random per boot when unset, env RYVEX_WEBHOOK_SECRET)
+  --metrics-addr addr  dedicated listen address for /metrics (empty disables, env RYVEX_METRICS_ADDR)
+  --seed               load the demo dataset on boot
+  --log-level lvl      debug | info | warn | error (default info)
 `
 
 func main() {

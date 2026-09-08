@@ -288,7 +288,7 @@ func (s *Server) handleKeysCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createKeyRequest
 	if err := decodeBody(r, &req); err != nil {
-		stateStatus(w, r, err)
+		bodyStatus(w, r, err)
 		return
 	}
 	token, view, err := s.keys.Create(ident.Principal, req)
@@ -329,7 +329,7 @@ func (s *Server) handleKeysUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req updateKeyRequest
 	if err := decodeBody(r, &req); err != nil {
-		stateStatus(w, r, err)
+		bodyStatus(w, r, err)
 		return
 	}
 	view, err := s.keys.Update(ident.Principal, r.PathValue("id"), req)
