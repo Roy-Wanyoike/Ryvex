@@ -16,6 +16,7 @@ import (
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/reconcile"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
+	"github.com/Roy-Wanyoike/Ryvex/internal/webhook"
 )
 
 // runServe boots the full control plane stack:
@@ -32,6 +33,8 @@ func runServe(args []string) error {
 	corsOrigins := fs.String("cors-origins", envOr("RYVEX_CORS_ORIGINS", ""), "browser origins allowed to call the API, comma-separated")
 	seed := fs.Bool("seed", false, "load the demo dataset on boot")
 	logLevel := fs.String("log-level", "info", "log level")
+	// --- webhooks (issue #13): signing-secret flag ---
+	webhookSecret := fs.String("webhook-secret", envOr("RYVEX_WEBHOOK_SECRET", ""), "HMAC key material for webhook signatures (random per boot when unset)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -56,6 +59,12 @@ func runServe(args []string) error {
 		Interval:    30 * time.Second,
 		Concurrency: 4,
 		Logger:      log,
+	})
+
+	// --- webhooks (issue #13): event dispatcher ---
+	dispatcher := webhook.NewDispatcher(store, eventBus, webhook.Options{
+		ServerSecret: *webhookSecret,
+		Logger:       log,
 	})
 
 	auth := api.AuthOptions{DevAuth: *devAuth, APIKeys: map[string]string{}}
@@ -91,6 +100,7 @@ func runServe(args []string) error {
 	recCtx, recCancel := context.WithCancel(ctx)
 	defer recCancel()
 	reconciler.Start(recCtx)
+	dispatcher.Start(recCtx) // --- webhooks (issue #13) ---
 
 	if *seed {
 		n, err := seedDemoData(ctx, store, log)
@@ -120,6 +130,7 @@ func runServe(args []string) error {
 	_ = srv.Shutdown(shCtx)
 	recCancel()
 	reconciler.Stop(3 * time.Second)
+	dispatcher.Stop(3 * time.Second) // --- webhooks (issue #13) ---
 	log.Info("ryvexd stopped cleanly")
 	return nil
 }
