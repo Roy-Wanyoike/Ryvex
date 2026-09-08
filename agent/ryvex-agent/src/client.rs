@@ -22,9 +22,70 @@ pub enum Outcome {
     Rejected(String),
 }
 
+/// Throttle state for the heartbeat spec-refresh window. See
+/// [`next_last_seen`] for the decision and the rationale.
+#[derive(Default)]
+struct SyncState {
+    /// `spec.last_seen` value carried by the most recent document.
+    last_seen: Option<String>,
+    /// When that value was refreshed (drives the throttle window).
+    last_refresh: Option<std::time::Instant>,
+}
+
+impl SyncState {
+    /// Apply the throttle decision for this cycle and persist it.
+    /// Sync-only: callers must drop the guard before awaiting.
+    fn refresh(&mut self, now: &str, refresh_secs: u64) -> String {
+        let since = self.last_refresh.map(|t| t.elapsed());
+        let (last_seen, refreshed) =
+            next_last_seen(self.last_seen.as_deref(), since, refresh_secs, now);
+        if refreshed {
+            self.last_refresh = Some(std::time::Instant::now());
+        }
+        self.last_seen = Some(last_seen.clone());
+        last_seen
+    }
+}
+
+/// Heartbeat spec-throttle decision (pure, unit-tested).
+///
+/// Returns the `spec.last_seen` the next document should carry, plus
+/// whether the value changed (and the throttle window reset). Refreshes
+/// when there is no previous value or when `since_refresh` has reached
+/// `refresh_secs`; otherwise the previous timestamp is re-sent.
+///
+/// Rationale (issue #43): `last_seen` used to change on every tick, so
+/// every heartbeat was a spec change that bumped the resource
+/// generation — an "updated" event storm flooding the replay ring and
+/// audit log, and a permanent CAS race against human edits. The
+/// control plane treats an upsert whose spec equals the stored one as
+/// a no-op (`internal/api/handlers.go` handleScopePut →
+/// `internal/state/store.go` UpdateResource: `specLabelsEqual` →
+/// generation NOT advanced, no event), so re-sending an identical
+/// spec between refreshes is free.
+pub fn next_last_seen(
+    prev: Option<&str>,
+    since_refresh: Option<Duration>,
+    refresh_secs: u64,
+    now: &str,
+) -> (String, bool) {
+    let refresh = prev.is_none()
+        || match since_refresh {
+            Some(elapsed) => elapsed >= Duration::from_secs(refresh_secs),
+            None => true,
+        };
+    if refresh {
+        (now.to_string(), true)
+    } else {
+        (prev.unwrap_or(now).to_string(), false)
+    }
+}
+
 pub struct ApiClient {
     http: reqwest::Client,
     cfg: Config,
+    /// Heartbeat throttle state; guard never held across an await.
+    sync: std::sync::Mutex<SyncState>,
 }
 
 impl ApiClient {
@@ -33,7 +94,11 @@ impl ApiClient {
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|e| format!("http client: {e}"))?;
-        Ok(Self { http, cfg })
+        Ok(Self {
+            http,
+            cfg,
+            sync: std::sync::Mutex::new(SyncState::default()),
+        })
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -83,8 +148,9 @@ impl ApiClient {
         }
     }
 
-    /// PUT the node document; classifies the response.
-    async fn put_node(&self, doc: &Value) -> Outcome {
+    /// PUT the node document; classifies the response. Public so the
+    /// mock-server integration suite can drive single transitions.
+    pub async fn put_node(&self, doc: &Value) -> Outcome {
         let resp = match self.put(&self.cfg.node_path(), doc).send().await {
             Ok(r) => r,
             Err(e) => return Outcome::Transient(format!("put node: {e}")),
@@ -112,7 +178,10 @@ impl ApiClient {
     }
 
     /// Enroll or heartbeat the node (same upsert, different messaging).
-    /// CAS-aware with one bounded retry; self-heals on 404.
+    /// CAS-aware with a bounded 3-attempt retry; self-heals on 404.
+    /// Never leaks [`Outcome::Conflict`] to the caller: a conflict on
+    /// the final attempt degrades to `Transient("gave up after CAS
+    /// retries")` (issue #43 — run() used to panic on that arm).
     pub async fn sync_node(&self, agent_version: &str, status_message: Option<&str>) -> Outcome {
         let now = spec::rfc3339(
             std::time::SystemTime::now()
@@ -120,20 +189,30 @@ impl ApiClient {
                 .unwrap_or_default()
                 .as_secs(),
         );
+        // Heartbeat spec-throttle (issue #43): pick the spec.last_seen
+        // this cycle carries. The guard is dropped at the end of this
+        // block — never held across an await below.
+        let last_seen = {
+            let mut state = self
+                .sync
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.refresh(&now, self.cfg.spec_refresh_secs)
+        };
         for attempt in 0..3 {
             let generation = match self.fetch_node().await {
                 Ok(Some(v)) => Some(v["generation"].as_i64().unwrap_or(0)),
                 Ok(None) => None,
                 Err(e) => return Outcome::Transient(e),
             };
-            let doc = spec::node_document(&self.cfg, agent_version, &now, generation, status_message);
+            let doc = spec::node_document(&self.cfg, agent_version, &last_seen, generation, status_message);
             match self.put_node(&doc).await {
                 Outcome::Conflict { fresh_generation } if attempt < 2 => {
-                    tracing::debug!(fresh_generation, "CAS conflict, retrying once with fresh generation");
+                    tracing::debug!(fresh_generation, "CAS conflict, retrying with fresh generation");
                     let doc = spec::node_document(
                         &self.cfg,
                         agent_version,
-                        &now,
+                        &last_seen,
                         Some(fresh_generation),
                         status_message,
                     );
@@ -141,6 +220,16 @@ impl ApiClient {
                         return upserted;
                     }
                     continue;
+                }
+                // Final attempt: surface as Transient instead of leaking
+                // Conflict to run() (used to be a reachable
+                // unreachable!() panic there — issue #43).
+                Outcome::Conflict { fresh_generation } => {
+                    tracing::error!(
+                        fresh_generation,
+                        "CAS conflict on final retry; giving up until next tick"
+                    );
+                    return Outcome::Transient("gave up after CAS retries".into());
                 }
                 outcome => return outcome,
             }

@@ -51,23 +51,43 @@ fn node_path_scope_addressing() {
     assert_eq!(c.node_path(), "/v1/acme/core/prod/nodes/n1");
 }
 
+#[test]
+fn node_path_percent_encodes_space_in_name() {
+    let mut c = cfg(&["--token", "ryk_x", "--name", "node 01 eu"]).unwrap();
+    c.validate().unwrap();
+    // space (0x20) is outside the RFC 3986 unreserved set -> %20
+    assert_eq!(c.node_path(), "/v1/acme/core/prod/nodes/node%2001%20eu");
+}
+
+#[test]
+fn node_path_escapes_slashes_to_single_segment() {
+    let mut c = cfg(&["--token", "ryk_x", "--org", "ac/me", "--name", "../admin"]).unwrap();
+    c.validate().unwrap();
+    // '/' -> %2F: a hostile name cannot add or traverse path segments
+    assert_eq!(c.node_path(), "/v1/ac%2Fme/core/prod/nodes/..%2Fadmin");
+}
+
 // ---- backoff ----
 
 #[test]
-fn backoff_doubles_then_caps() {
+fn backoff_doubles_then_caps_with_symmetric_jitter() {
     let mut b = Backoff::new();
     let mut waits = Vec::new();
     for _ in 0..8 {
         waits.push(b.advance().as_secs());
     }
-    // base sequence 1,2,4,8,16,30(cap),30,30 (jitter keeps within [-jitter/2, +jitter/2) of cap)
-    assert!(waits[0] <= 1, "w0={}", waits[0]);
-    assert!(waits[1] <= 2 && waits[1] >= 1, "w1={}", waits[1]);
-    assert!(waits[2] <= 4 && waits[2] >= 2, "w2={}", waits[2]);
-    assert!(waits[4] <= 16 && waits[4] >= 8, "w4={}", waits[4]);
-    assert!(waits[5] <= 30 && waits[5] >= 15, "w5={}", waits[5]);
-    // at the cap the jitter keeps the wait within [27, 30]
-    assert!(waits[6] <= 30 && waits[6] >= 27, "w6={}", waits[6]);
+    // Symmetric ±20% jitter (issue #43) on the doubling sequence
+    // 1,2,4,8,16,30(cap),30,30, floored at 1s and truncated to whole
+    // seconds: expected ranges [1,1] [1,2] [3,4] [6,9] [12,19] [24,35].
+    assert_eq!(waits[0], 1, "w0={}", waits[0]);
+    assert!(waits[1] >= 1 && waits[1] <= 2, "w1={}", waits[1]);
+    assert!(waits[2] >= 3 && waits[2] <= 4, "w2={}", waits[2]);
+    assert!(waits[3] >= 6 && waits[3] <= 9, "w3={}", waits[3]);
+    assert!(waits[4] >= 12 && waits[4] <= 19, "w4={}", waits[4]);
+    assert!(waits[5] >= 24 && waits[5] <= 35, "w5={}", waits[5]);
+    // at the cap the jitter is symmetric around 30s: [24, 36)
+    assert!(waits[6] >= 24 && waits[6] <= 35, "w6={}", waits[6]);
+    assert!(waits[7] >= 24 && waits[7] <= 35, "w7={}", waits[7]);
     b.reset();
     assert_eq!(b.attempts(), 0);
 }

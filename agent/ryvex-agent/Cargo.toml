@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Ryvex data-plane node agent: enrolls with the control plane, heartbeats, self-heals"
 license = "Apache-2.0"
+repository = "https://github.com/Roy-Wanyoike/Ryvex"
 
 [[bin]]
 name = "ryvex-agent"
