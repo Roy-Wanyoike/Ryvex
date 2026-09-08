@@ -207,7 +207,7 @@ export function ResourceDrawer({ resource, onClose, onMutated }: ResourceDrawerP
               {doc.org}/{doc.project}/{doc.env}
             </p>
           </div>
-          <PhaseBadge phase={doc.status.phase} />
+          <PhaseBadge phase={doc.status?.phase} />
           <button
             type="button"
             onClick={onClose}
@@ -231,11 +231,11 @@ export function ResourceDrawer({ resource, onClose, onMutated }: ResourceDrawerP
               <MetaRow label="Generation">
                 <span className="font-semibold text-[var(--violet)]">gen {doc.generation}</span>
                 <span className="ml-2 text-xs text-[var(--muted)]">
-                  observed {doc.status.observed_generation}
+                  observed {doc.status?.observed_generation ?? "?"}
                 </span>
               </MetaRow>
               <MetaRow label="Status">
-                <span className="text-sm">{doc.status.message ?? "no status message"}</span>
+                <span className="text-sm">{doc.status?.message ?? "no status message"}</span>
               </MetaRow>
               <MetaRow label="Created">
                 <TimeAgo iso={doc.created_at} />

@@ -1,39 +1,90 @@
-import { DEMO_AUDIT, DEMO_EVENTS, DEMO_RESOURCES } from "./demo";
+import { demoAudit, demoEvents, demoResources } from "./demo";
 import type { AuditEntry, Resource, RyvexEvent } from "./types";
 
 /**
  * The console talks to the Ryvex control plane API (ryvexd).
  *
  * Configuration resolution order (strongest first):
- *   1. localStorage  ryvex.apiBase / ryvex.token  (set from the Settings view)
- *   2. build-time env  NEXT_PUBLIC_RYVEX_API / NEXT_PUBLIC_RYVEX_TOKEN
- *   3. defaults        no base (demo mode) + "ryk_console_dev"
+ *   1. localStorage  ryvex.apiBase / ryvex.token / ryvex.org / ryvex.project / ryvex.env
+ *                      (set from the Settings view)
+ *   2. build-time env  NEXT_PUBLIC_RYVEX_API / NEXT_PUBLIC_RYVEX_TOKEN /
+ *                      NEXT_PUBLIC_RYVEX_ORG / NEXT_PUBLIC_RYVEX_PROJECT / NEXT_PUBLIC_RYVEX_ENV
+ *   3. defaults        no base (demo mode) + "ryk_console_dev" + scope acme/core/prod
  *
- * When no API base resolves the console degrades gracefully to an embedded
- * demo snapshot so the UI is always reviewable. Mutations in demo mode throw
- * a DemoModeError which callers render as an info toast.
+ * TRUST RULE (issue #41): demo data is served ONLY when no API base is
+ * configured. In live mode a failed read never masquerades as demo data —
+ * every read returns a FetchResult carrying {data, status, at, reason} so the
+ * UI can tell the truth:
+ *   - "ok"        fresh data from the control plane
+ *   - "degraded"  the fetch failed; `data` is the last good snapshot (or a
+ *                 partial page) and `at` says when it was fetched
+ *   - "error"     the fetch failed and there is no data to show at all
+ *
+ * Mutations in demo mode throw a DemoModeError which callers render as an
+ * info toast.
  */
 
 const ENV_API_BASE = process.env.NEXT_PUBLIC_RYVEX_API ?? "";
 const ENV_TOKEN = process.env.NEXT_PUBLIC_RYVEX_TOKEN ?? "ryk_console_dev";
+const ENV_ORG = process.env.NEXT_PUBLIC_RYVEX_ORG ?? "acme";
+const ENV_PROJECT = process.env.NEXT_PUBLIC_RYVEX_PROJECT ?? "core";
+const ENV_ENV = process.env.NEXT_PUBLIC_RYVEX_ENV ?? "prod";
 
 export const LS_API_BASE = "ryvex.apiBase";
 export const LS_TOKEN = "ryvex.token";
+export const LS_ORG = "ryvex.org";
+export const LS_PROJECT = "ryvex.project";
+export const LS_ENV = "ryvex.env";
+
 const DEFAULT_TOKEN = "ryk_console_dev";
+const DEFAULT_ORG = "acme";
+const DEFAULT_PROJECT = "core";
+const DEFAULT_ENV = "prod";
+
+/** Every network read/write is bounded by this timeout. */
+export const REQUEST_TIMEOUT_MS = 10_000;
+
+/** Hard cap on resources accumulated by the pagination loop. */
+const RESOURCE_PAGE_LIMIT = 200; // server max page size
+const RESOURCE_TOTAL_CAP = 1000;
 
 // ---- module-level runtime config store ----
 
 let runtimeApiBase = ENV_API_BASE;
 let runtimeToken = ENV_TOKEN;
+let runtimeOrg = ENV_ORG;
+let runtimeProject = ENV_PROJECT;
+let runtimeEnv = ENV_ENV;
+
+export interface ScopeConfig {
+  org: string;
+  project: string;
+  env: string;
+}
 
 function normalizeBase(base: string): string {
   return base.trim().replace(/\/+$/, "");
 }
 
-/** Runtime override. Callers pass raw form values; bases are normalized. */
-export function configureApi(opts: { apiBase?: string; token?: string }): void {
+/**
+ * Runtime override. Callers pass raw form values; bases are normalized and
+ * scope fields fall back to their defaults when blanked out.
+ * Cached "last good" feeds are dropped: they belong to the previous
+ * configuration and must never be shown as fresh fallback data afterwards.
+ */
+export function configureApi(opts: {
+  apiBase?: string;
+  token?: string;
+  org?: string;
+  project?: string;
+  env?: string;
+}): void {
   if (opts.apiBase !== undefined) runtimeApiBase = normalizeBase(opts.apiBase);
   if (opts.token !== undefined) runtimeToken = opts.token.trim();
+  if (opts.org !== undefined) runtimeOrg = opts.org.trim() || DEFAULT_ORG;
+  if (opts.project !== undefined) runtimeProject = opts.project.trim() || DEFAULT_PROJECT;
+  if (opts.env !== undefined) runtimeEnv = opts.env.trim() || DEFAULT_ENV;
+  lastGood.clear();
 }
 
 export function getApiBase(): string {
@@ -44,6 +95,23 @@ export function getApiToken(): string {
   return runtimeToken;
 }
 
+export function getOrg(): string {
+  return runtimeOrg;
+}
+
+export function getProject(): string {
+  return runtimeProject;
+}
+
+export function getEnv(): string {
+  return runtimeEnv;
+}
+
+export function getScope(): ScopeConfig {
+  return { org: runtimeOrg, project: runtimeProject, env: runtimeEnv };
+}
+
+/** Config-derived mode. Truthful *health* comes from FetchResult.status. */
 export function getApiMode(): "live" | "demo" {
   return runtimeApiBase ? "live" : "demo";
 }
@@ -53,11 +121,34 @@ export function getApiMode(): "live" | "demo" {
  * stored but empty, which is distinct from "not set"). Safe to call on the
  * server: returns blanks there.
  */
-export function loadStoredConfig(): { apiBase: string; token: string; hasBase: boolean; hasToken: boolean } {
-  if (typeof window === "undefined") return { apiBase: "", token: "", hasBase: false, hasToken: false };
-  const apiBase = window.localStorage.getItem(LS_API_BASE) ?? "";
-  const token = window.localStorage.getItem(LS_TOKEN) ?? "";
-  return { apiBase, token, hasBase: window.localStorage.getItem(LS_API_BASE) !== null, hasToken: window.localStorage.getItem(LS_TOKEN) !== null };
+export function loadStoredConfig(): {
+  apiBase: string;
+  token: string;
+  org: string;
+  project: string;
+  env: string;
+  hasBase: boolean;
+  hasToken: boolean;
+  hasOrg: boolean;
+  hasProject: boolean;
+  hasEnv: boolean;
+} {
+  if (typeof window === "undefined") {
+    return { apiBase: "", token: "", org: "", project: "", env: "", hasBase: false, hasToken: false, hasOrg: false, hasProject: false, hasEnv: false };
+  }
+  const raw = (key: string) => window.localStorage.getItem(key);
+  return {
+    apiBase: raw(LS_API_BASE) ?? "",
+    token: raw(LS_TOKEN) ?? "",
+    org: raw(LS_ORG) ?? "",
+    project: raw(LS_PROJECT) ?? "",
+    env: raw(LS_ENV) ?? "",
+    hasBase: raw(LS_API_BASE) !== null,
+    hasToken: raw(LS_TOKEN) !== null,
+    hasOrg: raw(LS_ORG) !== null,
+    hasProject: raw(LS_PROJECT) !== null,
+    hasEnv: raw(LS_ENV) !== null,
+  };
 }
 
 /**
@@ -69,15 +160,21 @@ export function hydrateApiFromStorage(): void {
   if (stored.hasBase) runtimeApiBase = normalizeBase(stored.apiBase);
   if (stored.hasToken) runtimeToken = stored.token.trim();
   else if (!runtimeToken) runtimeToken = DEFAULT_TOKEN;
+  if (stored.hasOrg) runtimeOrg = stored.org.trim() || DEFAULT_ORG;
+  if (stored.hasProject) runtimeProject = stored.project.trim() || DEFAULT_PROJECT;
+  if (stored.hasEnv) runtimeEnv = stored.env.trim() || DEFAULT_ENV;
 }
 
 /** Persist the given settings; also applies them to the runtime store. */
-export function storeConfig(apiBase: string, token: string): void {
+export function storeConfig(apiBase: string, token: string, scope?: Partial<ScopeConfig>): void {
   if (typeof window !== "undefined") {
     window.localStorage.setItem(LS_API_BASE, normalizeBase(apiBase));
     window.localStorage.setItem(LS_TOKEN, token.trim());
+    if (scope?.org !== undefined) window.localStorage.setItem(LS_ORG, scope.org.trim());
+    if (scope?.project !== undefined) window.localStorage.setItem(LS_PROJECT, scope.project.trim());
+    if (scope?.env !== undefined) window.localStorage.setItem(LS_ENV, scope.env.trim());
   }
-  configureApi({ apiBase, token });
+  configureApi({ apiBase, token, ...scope });
 }
 
 // ---- error envelope (frozen contract) ----
@@ -132,11 +229,44 @@ export class DemoModeError extends Error {
   }
 }
 
+// ---- failure reasons (operator-actionable, per issue #41) ----
+
+/** Why a network-level fetch failed — timeout vs. unreachable vs. malformed. */
+export function failureReason(err: unknown): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
+    return `request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`;
+  }
+  if (err instanceof SyntaxError) return "control plane returned a malformed response";
+  return "unreachable — check --cors-origins / base URL";
+}
+
+/** Why an HTTP-level failure happened — 401/403 are called out as token issues. */
+export function httpReason(status: number): string {
+  if (status === 401 || status === 403) return `invalid token (HTTP ${status})`;
+  return `control plane returned HTTP ${status}`;
+}
+
+/** Human line for mutation failures and the connection test. */
 function describeFailure(err: unknown, base: string): string {
-  if (err instanceof Error && err.name === "AbortError") {
+  if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
     return `request to ${base} timed out`;
   }
-  return `cannot reach control plane at ${base}`;
+  return `cannot reach control plane at ${base} — ${failureReason(err)}`;
+}
+
+/**
+ * Combine the caller's abort signal with a hard per-request deadline.
+ * The combined signal fires when EITHER source trips, so a superseded poll is
+ * cancelled immediately and no request can hang past REQUEST_TIMEOUT_MS.
+ */
+function requestSignal(external?: AbortSignal): AbortSignal {
+  const deadline = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  if (!external) return deadline;
+  // AbortSignal.any is available in all modern engines; on the off-chance an
+  // older engine lacks it, the deadline still bounds the request.
+  if (typeof AbortSignal.any === "function") return AbortSignal.any([external, deadline]);
+  return deadline;
 }
 
 /** Single request primitive for mutations: JSON in, ApiError on failure. */
@@ -155,6 +285,7 @@ async function apiRequest<T>(method: string, path: string, body?: unknown): Prom
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (err) {
     throw new ApiError(0, "network_error", describeFailure(err, base));
@@ -241,7 +372,7 @@ export async function fetchResource(
 ): Promise<Resource | null> {
   if (!getApiBase()) {
     return (
-      DEMO_RESOURCES.find(
+      demoResources().find(
         (r) => r.org === org && r.project === project && r.env === env && r.kind === kind && r.name === name,
       ) ?? null
     );
@@ -279,7 +410,7 @@ export async function testConnection(rawBase: string, token: string): Promise<Co
     const res = await fetch(`${base}/healthz`, {
       headers: token.trim() ? { Authorization: `Bearer ${token.trim()}` } : {},
       cache: "no-store",
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) {
       let envelope: unknown = null;
@@ -298,40 +429,148 @@ export async function testConnection(rawBase: string, token: string): Promise<Co
   }
 }
 
-// ---- read paths (demo-fallback as before) ----
+// ---- read paths with per-fetch health (issue #41) ----
 
-async function get<T>(path: string, fallback: T): Promise<T> {
+export type FetchHealth = "ok" | "degraded" | "error";
+
+/**
+ * Result of a console read. `status` — not configuration — is what the UI
+ * badges are computed from, so a dead control plane can never look "Live".
+ */
+export interface FetchResult<T> {
+  data: T;
+  status: FetchHealth;
+  /** Epoch ms when `data` was fetched from the control plane ("last good" time when degraded). */
+  at: number;
+  /** Present when status !== "ok": operator-actionable failure reason. */
+  reason?: string;
+}
+
+/**
+ * Last good feed data, keyed by wire path. In live mode a failed read falls
+ * back to this (status "degraded") instead of demo data. Cleared whenever the
+ * runtime config changes so stale data from a previous control plane is never
+ * presented as current.
+ */
+const lastGood = new Map<string, { data: unknown; at: number }>();
+
+interface ResourcePage {
+  items: Resource[];
+  next_cursor?: string;
+}
+
+/**
+ * GET /v1/resources following `next_cursor` until exhausted. Hard caps at
+ * RESOURCE_TOTAL_CAP items and guards against control planes that keep
+ * returning the same cursor (tracked in `seen`). Pages are pushed into `into`
+ * as they arrive, so a mid-pagination failure still leaves the partial page
+ * inspectable by the caller.
+ */
+async function listAllResources(into: Resource[], signal?: AbortSignal): Promise<Resource[]> {
   const base = getApiBase();
-  if (!base) return fallback;
+  const seenCursors = new Set<string>();
+  let cursor = "";
+
+  while (into.length < RESOURCE_TOTAL_CAP) {
+    const qs = new URLSearchParams({ limit: String(RESOURCE_PAGE_LIMIT) });
+    if (cursor) qs.set("cursor", cursor);
+    const res = await fetch(`${base}/v1/resources?${qs.toString()}`, {
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${getApiToken()}` },
+      cache: "no-store",
+      signal: requestSignal(signal),
+    });
+    if (!res.ok) throw new ApiError(res.status, `http_${res.status}`, httpReason(res.status));
+    const page = (await res.json()) as ResourcePage;
+    into.push(...(page.items ?? []));
+
+    const next = typeof page.next_cursor === "string" ? page.next_cursor : "";
+    if (!next || seenCursors.has(next) || into.length >= RESOURCE_TOTAL_CAP) break;
+    seenCursors.add(next);
+    cursor = next;
+  }
+
+  return into.slice(0, RESOURCE_TOTAL_CAP);
+}
+
+/** Single-request feed with last-good fallback. Never throws. */
+async function fetchFeed<T>(
+  path: string,
+  demo: () => T,
+  empty: () => T,
+  opts?: { signal?: AbortSignal },
+): Promise<FetchResult<T>> {
+  // Demo data ONLY when no API base is configured — that is the mode.
+  if (!getApiBase()) {
+    return { data: demo(), status: "ok", at: Date.now() };
+  }
+  const base = getApiBase();
   try {
     const res = await fetch(`${base}${path}`, {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${getApiToken()}` },
       cache: "no-store",
+      signal: requestSignal(opts?.signal),
     });
-    if (!res.ok) return fallback;
-    return (await res.json()) as T;
-  } catch {
-    return fallback;
+    if (!res.ok) throw new ApiError(res.status, `http_${res.status}`, httpReason(res.status));
+    const data = (await res.json()) as T;
+    const now = Date.now();
+    lastGood.set(path, { data, at: now });
+    return { data, status: "ok", at: now };
+  } catch (err) {
+    const reason = failureReason(err);
+    const cached = lastGood.get(path) as { data: T; at: number } | undefined;
+    if (cached) return { data: cached.data, status: "degraded", at: cached.at, reason };
+    return { data: empty(), status: "error", at: Date.now(), reason };
   }
 }
 
-export function fetchResources(): Promise<{ items: Resource[] }> {
-  return get<{ items: Resource[] }>(
-    "/v1/resources?limit=200",
-    { items: DEMO_RESOURCES },
+/**
+ * Resources list: paginated (follows next_cursor up to the 1000-item cap).
+ * In live mode, NEVER returns demo data — a total failure yields
+ * status "error" with an empty list, a mid-pagination failure yields the
+ * partial page as "degraded" (fresher than any cached snapshot).
+ */
+export async function fetchResources(opts?: { signal?: AbortSignal }): Promise<FetchResult<Resource[]>> {
+  if (!getApiBase()) {
+    return { data: demoResources(), status: "ok", at: Date.now() };
+  }
+  const key = "/v1/resources";
+  const partial: Resource[] = [];
+  try {
+    const items = await listAllResources(partial, opts?.signal);
+    const now = Date.now();
+    lastGood.set(key, { data: items, at: now });
+    return { data: items, status: "ok", at: now };
+  } catch (err) {
+    const reason = failureReason(err);
+    // Partial page from this attempt? Show it (clearly degraded) rather than
+    // silently replacing fresher data with an older full snapshot.
+    if (partial.length > 0) {
+      return { data: partial, status: "degraded", at: Date.now(), reason: `${reason} — partial list (${partial.length} items)` };
+    }
+    const cached = lastGood.get(key) as { data: Resource[]; at: number } | undefined;
+    if (cached) return { data: cached.data, status: "degraded", at: cached.at, reason };
+    return { data: [], status: "error", at: Date.now(), reason };
+  }
+}
+
+/** Events for the configured org (newest first, limit 100). */
+export function fetchEvents(opts?: { signal?: AbortSignal }): Promise<FetchResult<{ events: RyvexEvent[] }>> {
+  const org = encodeURIComponent(getOrg());
+  return fetchFeed<{ events: RyvexEvent[] }>(
+    `/v1/${org}/events?limit=100`,
+    () => ({ events: demoEvents() }),
+    () => ({ events: [] }),
+    opts,
   );
 }
 
-export function fetchEvents(): Promise<{ events: RyvexEvent[] }> {
-  return get<{ events: RyvexEvent[] }>(
-    "/v1/acme/events?limit=100",
-    { events: DEMO_EVENTS },
-  );
-}
-
-export function fetchAudit(): Promise<{ entries: AuditEntry[] }> {
-  return get<{ entries: AuditEntry[] }>(
-    "/v1/acme/audit?limit=100",
-    { entries: DEMO_AUDIT },
+/** Audit entries for the configured org (newest first, limit 100). */
+export function fetchAudit(opts?: { signal?: AbortSignal }): Promise<FetchResult<{ entries: AuditEntry[] }>> {
+  const org = encodeURIComponent(getOrg());
+  return fetchFeed<{ entries: AuditEntry[] }>(
+    `/v1/${org}/audit?limit=100`,
+    () => ({ entries: demoAudit() }),
+    () => ({ entries: [] }),
+    opts,
   );
 }

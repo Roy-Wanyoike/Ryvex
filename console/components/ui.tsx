@@ -11,13 +11,28 @@ export const PHASE_STYLES: Record<Phase, string> = {
   Terminating: "text-zinc-300 border-zinc-400/30 bg-zinc-400/10",
 };
 
-export function PhaseBadge({ phase }: { phase: Phase }) {
+/**
+ * Style for any wire-supplied phase label. Unknown/missing phases fall back
+ * to the Pending (amber) treatment instead of crashing — malformed status is
+ * rendered as "Unknown", never dereferenced blindly (issue #41).
+ */
+export function phaseStyleFor(phase: string | null | undefined): string {
+  if (typeof phase === "string" && phase in PHASE_STYLES) return PHASE_STYLES[phase as Phase];
+  return PHASE_STYLES.Pending;
+}
+
+/**
+ * Phase badge tolerant of untrusted wire data: accepts any string (or
+ * absence) and degrades to an amber "Unknown" chip.
+ */
+export function PhaseBadge({ phase }: { phase?: Phase | string | null }) {
+  const label = phase || "Unknown";
   return (
     <span
-      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${PHASE_STYLES[phase] ?? PHASE_STYLES.Pending}`}
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${phaseStyleFor(label)}`}
     >
       <span className="h-1.5 w-1.5 rounded-full bg-current" />
-      {phase}
+      {label}
     </span>
   );
 }
