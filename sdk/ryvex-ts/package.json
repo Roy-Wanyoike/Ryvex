@@ -1,0 +1,47 @@
+{
+  "name": "ryvex",
+  "version": "0.1.0",
+  "description": "TypeScript client for the Ryvex control plane REST API (/v1 face)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({ type: 'commonjs' }, null, 2) + '\\n')\"",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "keywords": [
+    "ryvex",
+    "control-plane",
+    "declarative",
+    "infrastructure",
+    "reconciler",
+    "client"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Roy-Wanyoike/Ryvex.git",
+    "directory": "sdk/ryvex-ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
