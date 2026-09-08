@@ -33,7 +33,7 @@
 
 `ryvexd` is a single Go binary that hosts all four control-plane
 components. Everything is in-process for the reference deployment; the
-interfaces (`state.Store`, `bus.Bus`) are contracts, so durable backends
+interfaces (`state.Backend`, `bus.BusI`) are contracts, so durable backends
 (Postgres, NATS) can replace the in-memory implementations without
 touching the API or the reconciler.
 
@@ -51,26 +51,35 @@ touching the API or the reconciler.
    stamping observed state as it goes.
 4. **Observe.** Every mutation and transition is a typed event on the
    bus (`ryvex.resource.{org}.{kind}.{event}`) — the console, webhooks
-   and future agents subscribe to exactly the slice they care about.
+   and the node agent subscribe to exactly the slice they care about.
 
 ## Components
 
 ### State store (`internal/state`)
 
-- **Model.** 11 kinds: Project, Environment, Application, Deployment,
-  Cluster, Node, Database, Cache, Bucket, Policy, Secret.
+- **Model.** 13 kinds: Project, Environment, Application, Deployment,
+  Cluster, Node, Database, Cache, Bucket, Policy, Secret,
+  Subscription (webhook subscriptions) and APIKey (managed keys).
 - **Identity.** Logical address `org/project/env/kind/name` (unique) +
-  opaque ID `r-<hex>` (stable handle).
-- **Concurrency.** Mutex-guarded; updates take an optional
-  `ExpectedGeneration` for compare-and-swap — stale writers get `409`.
+  opaque ID `r-<hex>` (stable handle). Managed API keys live in the
+  reserved namespace `ryvex/system/system`, which is unreachable for
+  every other kind.
+- **Concurrency.** Mutex-guarded (in-memory) or SQL-backed (Postgres);
+  updates take an optional `ExpectedGeneration` for compare-and-swap —
+  stale writers get `409`.
 - **Governance.** Every create/update/delete/status-change lands in the
   audit log with actor + reason.
+- **Backends.** In-memory by default; `--store postgres` swaps in the
+  durable backend (see [Durable state](#durable-state-postgres)) with
+  parity-tested semantics — both pass the same state suite.
 
 ### Event bus (`internal/bus`)
 
 - NATS-style subjects with `*` (one segment) and `>` (tail) wildcards.
 - Synchronous fan-out with subscriber panic isolation.
-- 1024-event replay ring powering `GET /v1/{org}/events`.
+- 1024-event replay ring (in-memory) powering `GET /v1/{org}/events`;
+  the JetStream backend replays from the stream and adds the
+  `?from=` sequence cursor (see below).
 
 ### Reconciler (`internal/reconcile`)
 
@@ -83,11 +92,17 @@ touching the API or the reconciler.
 
 ### REST API (`internal/api`)
 
-- stdlib-only HTTP stack: request-ID → recover → logging → CORS →
-  bearer auth → routes.
+- stdlib-only HTTP stack: request-ID → recover → security headers →
+  logging → CORS → auth → routes. Auth is bearer-only, or org/project-
+  scoped RBAC when the authorizer is enabled (the `serve` default).
 - Manual `/v1` dispatcher because the path space
   (`/v1/resources/{id}` vs `/v1/{org}/events`) is ambiguous to pattern
   routers.
+- Hardening: conservative response headers (`X-Content-Type-Options:
+  nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store` on
+  `/v1`), production server timeouts (30s read / 10s read-header /
+  60s write / 120s idle, 1 MiB header cap) and a 1 MiB JSON body cap
+  that answers `413 payload_too_large` instead of a misleading `400`.
 - Frozen error envelope and status mapping (see
   [api-contracts.md](./api-contracts.md)).
 
@@ -100,22 +115,47 @@ ryvexd serve --http :8080 --dev-auth --seed --cors-origins http://localhost:3100
 | Flag | Env | Meaning |
 |------|-----|---------|
 | `--http` | `RYVEX_HTTP_ADDR` | Listen address (`:8080`) |
-| `--store` | | Backend (`memory`) |
-| `--dev-auth` | | Accept any well-formed `ryk_` token (dev only) |
-| `--api-keys` | `RYVEX_API_KEYS` | Static keys `name=token,…` |
+| `--store` | | State backend: `memory` (default) or `postgres` (needs `--dsn`) |
+| `--dsn` | `RYVEX_DATABASE_URL` | Postgres DSN when `--store postgres` |
+| `--bus` | | Event bus backend: `memory` (default) or `nats` (see below) |
+| `--nats-url` | `RYVEX_NATS_URL` | NATS URL when `--bus nats` |
+| `--dev-auth` | | Accept any well-formed `ryk_` token (dev only; see guard below) |
+| `--api-keys` | `RYVEX_API_KEYS` | Static keys `name=token,…` (bootstrapped as admin keys) |
 | `--cors-origins` | `RYVEX_CORS_ORIGINS` | Browser origins allowed cross-origin |
+| `--webhook-secret` | `RYVEX_WEBHOOK_SECRET` | HMAC key for webhook signatures (random per boot when unset) |
+| `--metrics-addr` | `RYVEX_METRICS_ADDR` | Dedicated `/metrics` sidecar address (empty disables) |
 | `--seed` | | Load the 15-resource demo dataset |
 | `--log-level` | | `debug` … `error` |
 
 Graceful shutdown: SIGINT/SIGTERM stops the listener, drains the HTTP
-server, cancels the reconciler and waits for workers.
+server (and the metrics sidecar), cancels the reconciler and webhook
+dispatcher, and waits for workers.
+
+Boot guard: `--dev-auth` combined with a durable backend (`--store
+postgres` or `--bus nats`) is refused at boot — any well-formed `ryk_`
+token would get full admin over durable state. Set
+`RYVEX_ALLOW_DEV_AUTH=1` to override deliberately; a non-loopback
+`--http` address under dev-auth logs a loud warning either way.
+
+Webhook egress guard: `Subscription` webhook targets on loopback,
+link-local, RFC1918/ULA, CGNAT, multicast or unresolvable hosts are
+refused at spec validation *and* re-checked at dispatch time (DNS
+rebinding defense); redirects are never followed. On-prem deployments
+that genuinely deliver internally can opt out with
+`RYVEX_ALLOW_PRIVATE_WEBHOOKS=1`.
 
 ## Web console (`console/`)
 
-Next.js 15 + React 19 + Tailwind 4. Read-only client of the REST API
-with a 15s refresh loop; degrades to an embedded demo snapshot when no
-daemon is configured, so the UI is always presentable. Five views:
-Overview, Resources, Topology, Events, Audit.
+Next.js 15 + React 19 + Tailwind 4. A read **and write** client of the
+REST API: the resource drawer edits specs and labels with CAS-aware
+saves (a stale `generation` comes back as `409` with an inline
+reload), and resources can be deleted. Reads refresh on a 15s loop
+and carry truthful health: in live mode a failed fetch is shown as
+`degraded` (last good snapshot) or `error` — it never masquerades as
+demo data. With no daemon configured the console renders an embedded
+demo snapshot so the UI is always presentable. Views: Overview,
+Resources, Topology, Events, Audit, plus a Settings view for
+API/token/scope configuration.
 
 ## Design principles
 
@@ -174,3 +214,53 @@ How it works:
 Boot semantics: with `--bus nats` a failed connection is a fatal boot error —
 the daemon refuses to silently degrade to the in-memory bus. The memory bus
 is used when `--bus` is unset (or `--bus memory`).
+
+## Durable state (Postgres)
+
+The state store is swappable in the same spirit. `internal/state` defines
+the backend contract and the in-memory implementation; `internal/state/pgstore`
+implements the same surface on Postgres so resources, generations and the
+audit log survive daemon restarts (issue #14). Both backends run the same
+behavioral suite (`internal/state/statetest`) — validation, CAS semantics,
+pagination cursors and audit behavior are identical.
+
+```
+ryvexd serve --store postgres --dsn postgres://postgres:postgres@127.0.0.1:5432/ryvex?sslmode=disable
+RYVEX_DATABASE_URL=postgres://… ryvexd serve --store postgres ...
+```
+
+| Flag | Env | Meaning |
+|------|-----|---------|
+| `--store` | | State backend: `memory` (default) or `postgres` |
+| `--dsn` | `RYVEX_DATABASE_URL` | Postgres DSN; **required** when `--store postgres` |
+
+For local development, `docker-compose.yml` starts a Postgres 16 container
+with matching credentials:
+
+```
+docker compose up -d
+ryvexd serve --store postgres \
+    --dsn postgres://postgres:postgres@127.0.0.1:5432/ryvex?sslmode=disable
+```
+
+How it works:
+
+- **Boot.** `--store postgres` without a DSN is a boot error
+  (`--dsn` / `RYVEX_DATABASE_URL` must be set). A failed connection is fatal —
+  there is never a silent fallback to the in-memory store, mirroring the NATS
+  bus boot semantics. Note the guard: `--dev-auth` plus `--store postgres` is
+  refused unless `RYVEX_ALLOW_DEV_AUTH=1` (see the boot guard above).
+- **Migrations.** The schema ships inside the binary as embedded SQL
+  (`go:embed` of `internal/state/pgstore/migrations/*.sql`). On boot the
+  daemon brings the database up to date: each migration runs exactly once,
+  inside a transaction that also records its version in `schema_migrations`.
+  Migration is idempotent — safe to run on every boot — and bounded by a
+  30-second timeout; a failure aborts boot. Migrations are append-only:
+  applied steps are never edited, new steps are added as new files.
+- **Persistence.** Resources (including `generation` counters), audit entries
+  and managed API keys live in Postgres, so a restarted daemon resumes with
+  the exact state it had — including CAS generations that in-flight writers
+  depend on.
+- **Parity testing.** The pgstore suite runs the shared behavioral suite
+  against a live database when `RYVEX_TEST_PG_DSN` is provided
+  (`RYVEX_TEST_PG_DSN=… go test ./internal/state/...`).

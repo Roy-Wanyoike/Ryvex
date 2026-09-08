@@ -76,6 +76,8 @@ the `routeV1` dispatcher and replaces parameters with placeholders:
 | `index` | `/`, `/v1`, `/v1/` |
 | `resources` | `/v1/resources` (list/create) |
 | `resources/{id}` | `/v1/resources/{id}` |
+| `keys` | `/v1/keys` (list/create) |
+| `keys/{id}` | `/v1/keys/{id}` |
 | `org/events` | `/v1/{org}/events` |
 | `org/audit` | `/v1/{org}/audit` |
 | `org/reconcile/{id}` | `/v1/{org}/reconcile/{id}` |
