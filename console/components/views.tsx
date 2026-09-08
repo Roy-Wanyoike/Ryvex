@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import type { AuditEntry, Resource, RyvexEvent } from "@/lib/types";
-import { KindChip, PhaseBadge, SectionTitle, StatCard, TimeAgo } from "./ui";
+import { CopyButton, KindChip, PhaseBadge, SectionTitle, StatCard, TimeAgo } from "./ui";
 
 /* ---------------- Overview ---------------- */
 
@@ -38,7 +38,7 @@ export function OverviewView({
         </div>
         <div className="panel p-5 lg:col-span-3">
           <SectionTitle>Recent events</SectionTitle>
-          <EventStream events={events.slice(0, 6)} compact />
+          <EventStream events={events.slice(0, 6)} />
         </div>
       </div>
     </div>
@@ -53,6 +53,8 @@ const DONUT_COLORS: Record<string, string> = {
   Failed: "#f87171",
   Terminating: "#a1a1aa",
 };
+/** Neutral zinc for unknown phases — matches the PhaseBadge fallback (#42). */
+const DONUT_UNKNOWN_COLOR = "#a1a1aa";
 
 function PhaseDonut({ data, total }: { data: [string, number][]; total: number }) {
   const size = 170;
@@ -72,7 +74,7 @@ function PhaseDonut({ data, total }: { data: [string, number][]; total: number }
             <circle
               key={phase}
               cx={size / 2} cy={size / 2} r={r} fill="none"
-              stroke={DONUT_COLORS[phase] ?? "#7c5cff"}
+              stroke={DONUT_COLORS[phase] ?? DONUT_UNKNOWN_COLOR}
               strokeWidth={stroke}
               strokeDasharray={`${dash} ${c - dash}`}
               strokeDashoffset={-offset}
@@ -85,7 +87,7 @@ function PhaseDonut({ data, total }: { data: [string, number][]; total: number }
       <ul className="space-y-2 text-sm">
         {data.map(([phase, count]) => (
           <li key={phase} className="flex items-center gap-2">
-            <span className="h-2.5 w-2.5 rounded-full" style={{ background: DONUT_COLORS[phase] ?? "#7c5cff" }} />
+            <span className="h-2.5 w-2.5 rounded-full" style={{ background: DONUT_COLORS[phase] ?? DONUT_UNKNOWN_COLOR }} />
             <span className="text-[var(--text)]">{phase}</span>
             <span className="text-[var(--muted)]">{count}</span>
           </li>
@@ -97,8 +99,6 @@ function PhaseDonut({ data, total }: { data: [string, number][]; total: number }
 
 /* ---------------- Resources ---------------- */
 
-const KIND_FILTERS = ["All", "Application", "Deployment", "Database", "Cluster", "Node", "Policy", "Secret"];
-
 export function ResourcesView({
   resources,
   onOpen,
@@ -109,8 +109,18 @@ export function ResourcesView({
   const [q, setQ] = useState("");
   const [kind, setKind] = useState("All");
 
+  // Filter chips derived from the kinds actually present in the loaded data
+  // (#42) — the static list used to miss Project, Environment, Cache, Bucket.
+  const kinds = useMemo(
+    () => Array.from(new Set(resources.map((r) => r.kind))).sort(),
+    [resources],
+  );
+  // If the selected kind vanishes from a refreshed dataset, behave as "All"
+  // so the visible chip state always matches the active filter.
+  const activeKind = kind === "All" || kinds.includes(kind) ? kind : "All";
+
   const rows = resources.filter((r) => {
-    if (kind !== "All" && r.kind !== kind) return false;
+    if (activeKind !== "All" && r.kind !== activeKind) return false;
     if (!q) return true;
     const hay = `${r.name} ${r.env} ${r.project} ${r.org}`.toLowerCase();
     return hay.includes(q.toLowerCase());
@@ -123,15 +133,18 @@ export function ResourcesView({
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="Filter resources…"
+          aria-label="Filter resources by name, scope, or kind"
           className="w-64 rounded-lg border border-[var(--line)] bg-[var(--panel-2)] px-3 py-1.5 text-sm outline-none placeholder:text-[var(--muted)] focus:border-[var(--violet)]"
         />
         <div className="flex flex-wrap gap-1.5">
-          {KIND_FILTERS.map((k) => (
+          {["All", ...kinds].map((k) => (
             <button
               key={k}
+              type="button"
               onClick={() => setKind(k)}
+              aria-pressed={activeKind === k}
               className={`rounded-full border px-3 py-1 text-xs font-medium transition ${
-                kind === k
+                activeKind === k
                   ? "border-[var(--violet)] bg-[var(--violet)]/15 text-[var(--violet)]"
                   : "border-[var(--line)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
@@ -141,65 +154,79 @@ export function ResourcesView({
           ))}
         </div>
       </div>
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="border-b border-[var(--line)] text-left text-[11px] uppercase tracking-wider text-[var(--muted)]">
-            <th className="px-4 py-3 font-semibold">Kind</th>
-            <th className="px-4 py-3 font-semibold">Name</th>
-            <th className="px-4 py-3 font-semibold">Scope</th>
-            <th className="px-4 py-3 font-semibold">Phase</th>
-            <th className="px-4 py-3 font-semibold">Gen</th>
-            <th className="px-4 py-3 font-semibold">Updated</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr
-              key={r.id}
-              tabIndex={0}
-              aria-label={`Inspect ${r.kind} ${r.name}`}
-              onClick={() => onOpen(r)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  onOpen(r);
-                }
-              }}
-              className="cursor-pointer border-b border-[var(--line)]/50 transition hover:bg-[var(--panel-2)] focus:bg-[var(--panel-2)] focus:outline-none"
-            >
-              <td className="px-4 py-3"><KindChip kind={r.kind} /></td>
-              <td className="px-4 py-3 font-medium">{r.name}</td>
-              <td className="px-4 py-3 text-[var(--muted)]">{r.org}/{r.project}/{r.env}</td>
-              <td className="px-4 py-3"><PhaseBadge phase={r.status?.phase} /></td>
-              <td className="px-4 py-3 text-[var(--muted)]">{r.generation}</td>
-              <td className="px-4 py-3 text-[var(--muted)]"><TimeAgo iso={r.updated_at} /></td>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[640px] text-sm">
+          <thead>
+            <tr className="border-b border-[var(--line)] text-left text-[11px] uppercase tracking-wider text-[var(--muted)]">
+              <th className="px-4 py-3 font-semibold">Kind</th>
+              <th className="px-4 py-3 font-semibold">Name</th>
+              <th className="px-4 py-3 font-semibold">Scope</th>
+              <th className="px-4 py-3 font-semibold">Phase</th>
+              <th className="px-4 py-3 font-semibold">Gen</th>
+              <th className="px-4 py-3 font-semibold">Updated</th>
             </tr>
-          ))}
-          {rows.length === 0 ? (
-            <tr><td colSpan={6} className="px-4 py-10 text-center text-[var(--muted)]">No resources match this filter.</td></tr>
-          ) : null}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr
+                key={r.id}
+                tabIndex={0}
+                aria-label={`Inspect ${r.kind} ${r.name}`}
+                onClick={() => onOpen(r)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onOpen(r);
+                  }
+                }}
+                className="cursor-pointer border-b border-[var(--line)]/50 transition hover:bg-[var(--panel-2)] focus-visible:bg-[var(--panel-2)]"
+              >
+                <td className="px-4 py-3"><KindChip kind={r.kind} /></td>
+                <td className="px-4 py-3 font-medium">
+                  <span className="block max-w-[220px] truncate" title={r.name}>{r.name}</span>
+                </td>
+                <td className="px-4 py-3 text-[var(--muted)]">
+                  <span
+                    className="block max-w-[200px] truncate font-mono text-xs"
+                    title={`${r.org}/${r.project}/${r.env}`}
+                  >
+                    {r.org}/{r.project}/{r.env}
+                  </span>
+                </td>
+                <td className="px-4 py-3"><PhaseBadge phase={r.status?.phase} /></td>
+                <td className="px-4 py-3 text-[var(--muted)]">{r.generation}</td>
+                <td className="px-4 py-3 text-[var(--muted)]"><TimeAgo iso={r.updated_at} /></td>
+              </tr>
+            ))}
+            {rows.length === 0 ? (
+              <tr><td colSpan={6} className="px-4 py-10 text-center text-[var(--muted)]">No resources match this filter.</td></tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
 
 /* ---------------- Events ---------------- */
 
-export function EventStream({ events, compact = false }: { events: RyvexEvent[]; compact?: boolean }) {
+export function EventStream({ events }: { events: RyvexEvent[] }) {
   return (
-    <ul className={`mt-3 space-y-2 ${compact ? "" : ""}`}>
+    <ul className="mt-3 space-y-2">
       {events.map((e) => (
         <li key={e.id} className="flex items-start gap-3 rounded-lg border border-[var(--line)]/60 bg-[var(--panel-2)]/60 p-3">
           <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-[var(--violet)]" />
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-bold uppercase text-[var(--cyan)]">{e.type}</span>
-              <span className="truncate text-sm font-medium">{e.kind}/{e.name}</span>
+              <span className="truncate text-sm font-medium" title={`${e.kind}/${e.name}`}>{e.kind}/{e.name}</span>
               {e.phase ? <PhaseBadge phase={e.phase} /> : null}
             </div>
-            <div className="mt-1 flex flex-wrap items-center gap-x-3 text-xs text-[var(--muted)]">
-              <code className="truncate">{e.subject}</code>
+            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--muted)]">
+              <span className="flex min-w-0 items-center gap-1">
+                <code className="truncate" title={e.subject}>{e.subject}</code>
+                <CopyButton value={e.subject} label="event subject" />
+              </span>
               <span>·</span>
               <TimeAgo iso={e.time} />
               {e.actor ? <><span>·</span><span>{e.actor}</span></> : null}
@@ -231,37 +258,46 @@ export function AuditView({ entries }: { entries: AuditEntry[] }) {
       <div className="border-b border-[var(--line)] p-4">
         <SectionTitle>Audit trail — every mutation, attributed</SectionTitle>
       </div>
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="border-b border-[var(--line)] text-left text-[11px] uppercase tracking-wider text-[var(--muted)]">
-            <th className="px-4 py-3 font-semibold">Actor</th>
-            <th className="px-4 py-3 font-semibold">Action</th>
-            <th className="px-4 py-3 font-semibold">Resource</th>
-            <th className="px-4 py-3 font-semibold">Gen</th>
-            <th className="px-4 py-3 font-semibold">When</th>
-          </tr>
-        </thead>
-        <tbody>
-          {entries.map((a) => (
-            <tr key={a.id} className="border-b border-[var(--line)]/50 hover:bg-[var(--panel-2)]">
-              <td className="px-4 py-3 font-medium">{a.actor}</td>
-              <td className="px-4 py-3">
-                <span className={`chip ${
-                  a.action === "created" ? "text-emerald-300" :
-                  a.action === "deleted" ? "text-red-300" : "text-cyan-300"}`}>
-                  {a.action}
-                </span>
-              </td>
-              <td className="px-4 py-3 font-mono text-xs text-[var(--muted)]">{a.logical_key}</td>
-              <td className="px-4 py-3 text-[var(--muted)]">{a.generation}</td>
-              <td className="px-4 py-3 text-[var(--muted)]"><TimeAgo iso={a.time} /></td>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[640px] text-sm">
+          <thead>
+            <tr className="border-b border-[var(--line)] text-left text-[11px] uppercase tracking-wider text-[var(--muted)]">
+              <th className="px-4 py-3 font-semibold">Actor</th>
+              <th className="px-4 py-3 font-semibold">Action</th>
+              <th className="px-4 py-3 font-semibold">Resource</th>
+              <th className="px-4 py-3 font-semibold">Gen</th>
+              <th className="px-4 py-3 font-semibold">When</th>
             </tr>
-          ))}
-          {entries.length === 0 ? (
-            <tr><td colSpan={5} className="px-4 py-10 text-center text-[var(--muted)]">Audit log is empty.</td></tr>
-          ) : null}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {entries.map((a) => (
+              <tr key={a.id} className="border-b border-[var(--line)]/50 hover:bg-[var(--panel-2)]">
+                <td className="px-4 py-3 font-medium">
+                  <span className="block max-w-[160px] truncate" title={a.actor}>{a.actor}</span>
+                </td>
+                <td className="px-4 py-3">
+                  <span className={`chip ${
+                    a.action === "created" ? "text-emerald-300" :
+                    a.action === "deleted" ? "text-red-300" : "text-cyan-300"}`}>
+                    {a.action}
+                  </span>
+                </td>
+                <td className="px-4 py-3 font-mono text-xs text-[var(--muted)]">
+                  <span className="flex items-center gap-1">
+                    <span className="block max-w-[280px] truncate" title={a.logical_key}>{a.logical_key}</span>
+                    <CopyButton value={a.logical_key} label="logical key" />
+                  </span>
+                </td>
+                <td className="px-4 py-3 text-[var(--muted)]">{a.generation}</td>
+                <td className="px-4 py-3 text-[var(--muted)]"><TimeAgo iso={a.time} /></td>
+              </tr>
+            ))}
+            {entries.length === 0 ? (
+              <tr><td colSpan={5} className="px-4 py-10 text-center text-[var(--muted)]">Audit log is empty.</td></tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -273,6 +309,23 @@ export function TopologyView({ resources }: { resources: Resource[] }) {
   const nodes = resources.filter((r) => r.kind === "Node");
   const apps = resources.filter((r) => r.kind === "Application");
   const data = resources.filter((r) => ["Database", "Cache", "Bucket"].includes(r.kind));
+
+  const clusterNames = new Set(clusters.map((c) => c.name));
+  /** Attached only when spec.cluster explicitly names this cluster. */
+  const inCluster = (r: Resource, name: string) => r.spec?.cluster === name;
+  /**
+   * Anything whose spec.cluster is unset or does not match a registered
+   * cluster cannot be drawn under one — grouped as "unassigned" so multi-
+   * cluster fleets are never misattributed (#42).
+   */
+  const unassigned = (rs: Resource[]) =>
+    rs.filter((r) => {
+      const c = r.spec?.cluster;
+      return typeof c !== "string" || c === "" || !clusterNames.has(c);
+    });
+  const unassignedApps = unassigned(apps);
+  const unassignedData = unassigned(data);
+  const hasUnassigned = unassignedApps.length + unassignedData.length > 0;
 
   return (
     <div className="space-y-6">
@@ -287,13 +340,26 @@ export function TopologyView({ resources }: { resources: Resource[] }) {
           </div>
 
           <div className="mt-4 grid gap-4 md:grid-cols-3">
-            <TopologyGroup title="Nodes" items={nodes.filter((n) => n.spec?.cluster === c.name)} />
-            <TopologyGroup title="Applications" items={apps} />
-            <TopologyGroup title="Data services" items={data} />
+            <TopologyGroup title="Nodes" items={nodes.filter((n) => inCluster(n, c.name))} />
+            <TopologyGroup title="Applications" items={apps.filter((a) => inCluster(a, c.name))} />
+            <TopologyGroup title="Data services" items={data.filter((d) => inCluster(d, c.name))} />
           </div>
         </div>
       ))}
-      {clusters.length === 0 ? (
+      {hasUnassigned ? (
+        <div className="panel p-5">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-base font-bold">Unassigned</span>
+            <span className="chip border-amber-400/40 text-amber-300">spec.cluster not set or unknown</span>
+          </div>
+          <div className="mt-4 grid gap-4 md:grid-cols-3">
+            <TopologyGroup title="Nodes" items={unassigned(nodes)} />
+            <TopologyGroup title="Applications" items={unassignedApps} />
+            <TopologyGroup title="Data services" items={unassignedData} />
+          </div>
+        </div>
+      ) : null}
+      {clusters.length === 0 && !hasUnassigned ? (
         <div className="panel p-10 text-center text-[var(--muted)]">No clusters registered yet.</div>
       ) : null}
     </div>

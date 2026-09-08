@@ -25,6 +25,16 @@ body {
   background: rgba(124, 92, 255, 0.4);
 }
 
+/*
+ * Visible keyboard focus everywhere (issue #42): a violet ring on any
+ * :focus-visible target. Mouse/touch focus does not match :focus-visible, so
+ * clicked rows and buttons stay visually quiet.
+ */
+:focus-visible {
+  outline: 2px solid var(--violet);
+  outline-offset: 2px;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;

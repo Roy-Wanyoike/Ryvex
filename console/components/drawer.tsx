@@ -10,7 +10,7 @@ import {
 } from "@/lib/api";
 import type { Resource } from "@/lib/types";
 import { toast } from "@/lib/toast";
-import { KindChip, PhaseBadge, TimeAgo } from "./ui";
+import { CopyButton, KindChip, PhaseBadge, TimeAgo } from "./ui";
 
 /**
  * Right-side detail drawer for a single resource.
@@ -29,6 +29,10 @@ interface ResourceDrawerProps {
 }
 
 type ParsedSpec = { ok: true; value: Record<string, unknown> } | { ok: false; error: string };
+
+/** Query for elements that can take focus inside the dialog. */
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 function serializeSpec(spec: Record<string, unknown> | undefined): string {
   return JSON.stringify(spec ?? {}, null, 2);
@@ -88,6 +92,51 @@ export function ResourceDrawer({ resource, onClose, onMutated }: ResourceDrawerP
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // A11y (#42): move focus into the dialog on open, trap Tab inside it while
+  // it is up, restore focus to the invoking element on close, and lock body
+  // scroll so the page behind cannot scroll.
+  const panelRef = useRef<HTMLElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    returnFocusRef.current = document.activeElement as HTMLElement | null;
+    panelRef.current?.focus();
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      returnFocusRef.current?.focus();
+    };
+  }, []);
+
+  const handleTabTrap = (e: React.KeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const focusables = Array.from(
+      panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+    );
+    if (focusables.length === 0) {
+      e.preventDefault();
+      panel.focus();
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey) {
+      // Backwards from the first focusable (or the panel itself) wraps to last.
+      if (active === first || active === panel) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else if (active === last || !panel.contains(active)) {
+      // Forward from the last focusable (or anything outside) wraps to first.
+      e.preventDefault();
+      first.focus();
+    }
+  };
 
   const parsed: ParsedSpec = useMemo(() => {
     const trimmed = text.trim();
@@ -193,9 +242,12 @@ export function ResourceDrawer({ resource, onClose, onMutated }: ResourceDrawerP
 
       {/* panel */}
       <aside
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-label={`Resource ${doc.kind} ${doc.name}`}
+        tabIndex={-1}
+        onKeyDown={handleTabTrap}
         className="fixed inset-y-0 right-0 z-50 flex w-full max-w-xl flex-col border-l border-[var(--line)] bg-[var(--panel)] shadow-2xl shadow-black/60"
       >
         {/* header */}
@@ -223,10 +275,21 @@ export function ResourceDrawer({ resource, onClose, onMutated }: ResourceDrawerP
           <section>
             <MetaGrid>
               <MetaRow label="ID">
-                <code className="font-mono text-xs">{doc.id}</code>
+                <span className="flex items-center gap-1">
+                  <code className="font-mono text-xs">{doc.id}</code>
+                  <CopyButton value={doc.id} label="resource ID" />
+                </span>
               </MetaRow>
               <MetaRow label="Scope">
-                <span className="font-mono text-xs">{doc.org}/{doc.project}/{doc.env}/{doc.kind}/{doc.name}</span>
+                <span className="flex items-center gap-1">
+                  <span className="font-mono text-xs" title={`${doc.org}/${doc.project}/${doc.env}/${doc.kind}/${doc.name}`}>
+                    {doc.org}/{doc.project}/{doc.env}/{doc.kind}/{doc.name}
+                  </span>
+                  <CopyButton
+                    value={`${doc.org}/${doc.project}/${doc.env}/${doc.kind}/${doc.name}`}
+                    label="logical key"
+                  />
+                </span>
               </MetaRow>
               <MetaRow label="Generation">
                 <span className="font-semibold text-[var(--violet)]">gen {doc.generation}</span>
