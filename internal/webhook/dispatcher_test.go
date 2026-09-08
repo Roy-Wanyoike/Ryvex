@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -21,6 +24,16 @@ import (
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
 )
+
+// TestMain opts the webhook test binary into private-target delivery:
+// every httptest server below lives on 127.0.0.1, which the SSRF egress
+// guard (issue #36) refuses by default. This mirrors what an on-prem
+// deployment sets; individual tests that exercise the guard override it
+// with t.Setenv or Options.AllowPrivateEgress.
+func TestMain(m *testing.M) {
+	os.Setenv(state.EnvAllowPrivateWebhooks, "1")
+	os.Exit(m.Run())
+}
 
 // ---- helpers ----
 
@@ -504,4 +517,341 @@ func TestConcurrentFanoutNoLeak(t *testing.T) {
 		t.Errorf("goroutine leak: before=%d after=%d", before, after)
 	}
 	cancel()
+}
+
+// ---- SSRF egress guard (issue #36) ----
+
+// resolverFunc adapts a function to the state.HostResolver seam.
+type resolverFunc func(ctx context.Context, host string) ([]string, error)
+
+func (f resolverFunc) LookupHost(ctx context.Context, host string) ([]string, error) {
+	return f(ctx, host)
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// swapValidationResolver replaces the state-side resolver used by
+// ParseSubscriptionSpec and restores the original on cleanup.
+func swapValidationResolver(t *testing.T, r state.HostResolver) {
+	t.Helper()
+	orig := state.WebhookHostResolver
+	state.WebhookHostResolver = r
+	t.Cleanup(func() { state.WebhookHostResolver = orig })
+}
+
+func TestWebhookEgressIPGuard(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1", "127.255.255.254", "::1",
+		"169.254.169.254", "fe80::1", "fe80::",
+		"10.0.0.1", "10.255.255.255",
+		"172.16.0.1", "172.31.255.255",
+		"192.168.1.1",
+		"100.64.0.1", "100.127.255.255", // CGNAT 100.64/10 bounds
+		"0.0.0.0", "224.0.0.1", "ff02::1",
+		"240.0.0.1", "255.255.255.255",
+		"fd00::1", "fdff::", // IPv6 ULA fc00::/7
+		"::ffff:127.0.0.1", "::ffff:10.0.0.1", // IPv4-mapped forbidden
+	}
+	for _, s := range blocked {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("test bug: %q does not parse", s)
+		}
+		if !state.IsForbiddenWebhookIP(ip) {
+			t.Errorf("IsForbiddenWebhookIP(%s) = false, want true", s)
+		}
+		if state.ForbiddenWebhookIPReason(ip) == "" {
+			t.Errorf("ForbiddenWebhookIPReason(%s) empty for a blocked address", s)
+		}
+	}
+	allowed := []string{
+		"8.8.8.8", "1.1.1.1", "93.184.216.34",
+		"100.63.255.255", "100.128.0.1", // just outside CGNAT
+		"172.32.0.1", "172.15.255.255", // just outside 172.16/12
+		"2606:2800:220:1:248:1893:25c8:1946", "2001:4860:4860::8888",
+		"::ffff:8.8.8.8", // IPv4-mapped public
+	}
+	for _, s := range allowed {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("test bug: %q does not parse", s)
+		}
+		if state.IsForbiddenWebhookIP(ip) {
+			t.Errorf("IsForbiddenWebhookIP(%s) = true, want false", s)
+		}
+	}
+}
+
+// TestParseSubscriptionSpecEgressValidation drives the create/update-time
+// URL guard through the exported parse path. The env opt-in is cleared
+// (overriding TestMain) so the guard is fully active.
+func TestParseSubscriptionSpecEgressValidation(t *testing.T) {
+	t.Setenv(state.EnvAllowPrivateWebhooks, "")
+	cases := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		// forbidden IP literals
+		{"loopback v4", "http://127.0.0.1:8080/hook", true},
+		{"ipv6 loopback", "http://[::1]/hook", true},
+		{"cloud metadata", "http://169.254.169.254/latest/meta-data/", true},
+		{"ipv6 link-local", "http://[fe80::1]/hook", true},
+		{"rfc1918 10/8", "http://10.0.0.1/hook", true},
+		{"rfc1918 172.16/12", "http://172.16.0.1/hook", true},
+		{"rfc1918 192.168/16", "http://192.168.1.1/hook", true},
+		{"cgnat 100.64/10", "http://100.64.0.1/hook", true},
+		{"unspecified", "http://0.0.0.0/hook", true},
+		{"ipv4-mapped loopback", "http://[::ffff:127.0.0.1]/hook", true},
+		{"ipv4-mapped private", "http://[::ffff:10.0.0.1]/hook", true},
+		{"multicast", "http://224.0.0.1/hook", true},
+		{"zone-scoped", "http://[fe80::1%25eth0]/hook", true},
+		{"userinfo hides private host", "http://user:pass@10.0.0.1/", true},
+		{"port-only host", "http://:8080/hook", true},
+		// allowed
+		{"public v4 literal", "http://93.184.216.34/hook", false},
+		{"public v6 literal", "http://[2001:4860:4860::8888]/hook", false},
+		// RFC 6761 special-use TLD: can never resolve publicly, no DNS needed
+		{"reserved tld", "https://example.test/hook", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := state.ParseSubscriptionSpec(subSpecURL(tc.url))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ParseSubscriptionSpec(%q) accepted, want refusal", tc.url)
+				}
+				var ve *state.ValidationError
+				if !errors.As(err, &ve) || !errors.Is(err, state.ErrValidation) {
+					t.Fatalf("error %T (%v) is not a *state.ValidationError wrapping ErrValidation", err, err)
+				}
+				if ve.Field != "spec" || !strings.Contains(ve.Message, "spec.url") {
+					t.Errorf("error = field %q message %q, want spec/spec.url in message", ve.Field, ve.Message)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseSubscriptionSpec(%q) refused: %v", tc.url, err)
+			}
+		})
+	}
+}
+
+// TestParseSubscriptionSpecEgressResolution covers the DNS leg of the
+// create-time guard with an injected resolver (no real DNS in tests).
+func TestParseSubscriptionSpecEgressResolution(t *testing.T) {
+	t.Setenv(state.EnvAllowPrivateWebhooks, "")
+	cases := []struct {
+		name    string
+		ips     []string
+		resErr  error
+		wantErr bool
+		inMsg   string
+	}{
+		{name: "unresolvable refused", resErr: errors.New("nx"), wantErr: true, inMsg: "does not resolve"},
+		{name: "resolves private refused", ips: []string{"10.0.0.1"}, wantErr: true, inMsg: "10.0.0.1"},
+		{name: "resolves link-local refused", ips: []string{"169.254.169.254"}, wantErr: true, inMsg: "169.254.169.254"},
+		{name: "resolves public allowed", ips: []string{"93.184.216.34"}},
+		{name: "any private in set refused", ips: []string{"93.184.216.34", "192.168.1.1"}, wantErr: true, inMsg: "192.168.1.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			swapValidationResolver(t, resolverFunc(func(ctx context.Context, host string) ([]string, error) {
+				return tc.ips, tc.resErr
+			}))
+			_, err := state.ParseSubscriptionSpec(subSpecURL("https://hooks.example.com/endpoint"))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected refusal, got none")
+				}
+				if !strings.Contains(err.Error(), tc.inMsg) {
+					t.Errorf("error %q does not mention %q", err.Error(), tc.inMsg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected acceptance, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseSubscriptionSpecEgressOptIn: RYVEX_ALLOW_PRIVATE_WEBHOOKS=1
+// (the documented on-prem opt-in) lets private targets through validation.
+func TestParseSubscriptionSpecEgressOptIn(t *testing.T) {
+	t.Setenv(state.EnvAllowPrivateWebhooks, "1")
+	for _, url := range []string{
+		"http://127.0.0.1:9090/hook",
+		"http://169.254.169.254/",
+		"http://10.1.2.3/hook",
+		"https://[fe80::1]/hook",
+	} {
+		got, err := state.ParseSubscriptionSpec(subSpecURL(url))
+		if err != nil {
+			t.Errorf("opt-in parse %q: %v", url, err)
+			continue
+		}
+		if got.URL != url {
+			t.Errorf("opt-in parse %q: URL = %q", url, got.URL)
+		}
+	}
+}
+
+// subSpecURL builds a minimal valid Subscription spec around url.
+func subSpecURL(url string) map[string]any {
+	return map[string]any{
+		"url":      url,
+		"subjects": []any{"ryvex.resource.acme.>"},
+	}
+}
+
+// TestDispatchBlocksForbiddenTarget: a subscription whose URL is a
+// loopback IP literal passes create-time validation (env opt-in active in
+// this binary) but the dispatcher re-checks at dispatch time and refuses
+// terminally: nothing is sent, nothing is retried, and the refusal lands
+// in the audit log.
+func TestDispatchBlocksForbiddenTarget(t *testing.T) {
+	st := state.NewStore()
+	b := bus.New()
+	srv, deliveries := captureServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	createSubscription(t, st, "hooks", "private", map[string]any{
+		"url":         srv.URL, // http://127.0.0.1:<port> — forbidden literal
+		"subjects":    []any{"ryvex.resource.acme.application.>"},
+		"max_retries": 3, // would produce 3 more attempts if the guard retried
+	})
+
+	d := NewDispatcher(st, b, testOptions("secret", func(o *Options) {
+		o.AllowPrivateEgress = boolPtr(false) // force the guard on despite TestMain opt-in
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	defer d.Stop(2 * time.Second)
+
+	publishCreated(b, "acme", "sensitive")
+	waitUntil(t, "egress refusal audit entry", 5*time.Second, func() bool {
+		for _, e := range webhookAudit(st) {
+			if strings.Contains(e.Reason, "egress blocked") {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(150 * time.Millisecond) // grace: nothing may be sent afterwards
+	select {
+	case c := <-deliveries:
+		t.Fatalf("forbidden target received a delivery: %s", c.body)
+	default:
+	}
+
+	entries := webhookAudit(st)
+	if got := countActions(entries, ActionFailed); got != 1 {
+		t.Errorf("webhook_failed entries = %d, want 1 (terminal refusal, no retries)", got)
+	}
+	if got := countActions(entries, ActionDelivered); got != 0 {
+		t.Errorf("webhook_delivered entries = %d, want 0", got)
+	}
+	for _, e := range entries {
+		if !strings.Contains(e.Reason, "127.0.0.1") {
+			t.Errorf("refusal reason %q does not name the offending address", e.Reason)
+		}
+	}
+}
+
+// TestDispatchRevalidationBlocksDNSRebinding: the subscription hostname
+// is public when validated at create time, but by dispatch time it
+// re-resolves to a private address (the rebinding attack). The dispatcher
+// must refuse before connecting and audit the refusal.
+func TestDispatchRevalidationBlocksDNSRebinding(t *testing.T) {
+	st := state.NewStore()
+	b := bus.New()
+
+	// Validation-time view of DNS: the name is public.
+	swapValidationResolver(t, resolverFunc(func(ctx context.Context, host string) ([]string, error) {
+		return []string{"93.184.216.34"}, nil
+	}))
+	createSubscription(t, st, "hooks", "rebind", map[string]any{
+		// Not under a reserved TLD, so create-time validation resolves it.
+		"url":         "http://hooks.rebind.example.com/hook",
+		"subjects":    []any{"ryvex.resource.acme.application.>"},
+		"max_retries": 3,
+	})
+
+	// Dispatch-time view of DNS: the name has rebound to a private IP.
+	d := NewDispatcher(st, b, testOptions("secret", func(o *Options) {
+		o.AllowPrivateEgress = boolPtr(false)
+		o.Resolver = resolverFunc(func(ctx context.Context, host string) ([]string, error) {
+			return []string{"10.0.0.1"}, nil
+		})
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	defer d.Stop(2 * time.Second)
+
+	publishCreated(b, "acme", "rebind")
+	waitUntil(t, "rebinding refusal audit entry", 5*time.Second, func() bool {
+		for _, e := range webhookAudit(st) {
+			if strings.Contains(e.Reason, "egress blocked") && strings.Contains(e.Reason, "10.0.0.1") {
+				return true
+			}
+		}
+		return false
+	})
+
+	entries := webhookAudit(st)
+	if got := countActions(entries, ActionFailed); got != 1 {
+		t.Errorf("webhook_failed entries = %d, want 1 (terminal refusal, no retries)", got)
+	}
+	if got := countActions(entries, ActionDelivered); got != 0 {
+		t.Errorf("webhook_delivered entries = %d, want 0", got)
+	}
+}
+
+// TestDispatchDeniesRedirects: the delivery client must never follow a
+// redirect — the signature header would be re-sent to the Location host.
+func TestDispatchDeniesRedirects(t *testing.T) {
+	st := state.NewStore()
+	b := bus.New()
+	srvB, hitsB := captureServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK) // must never be reached
+	})
+	srvA, hitsA := captureServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srvB.URL+"/landed", http.StatusFound)
+	})
+	createSubscription(t, st, "hooks", "redirector", map[string]any{
+		"url":         srvA.URL,
+		"subjects":    []any{"ryvex.resource.acme.application.>"},
+		"max_retries": 0,
+	})
+
+	d := NewDispatcher(st, b, testOptions("secret", nil)) // default client gets the deny-redirect policy
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	defer d.Stop(2 * time.Second)
+
+	publishCreated(b, "acme", "redir")
+	got := recv(t, hitsA, 5*time.Second)
+	if got.header.Get("X-Ryvex-Signature") == "" {
+		t.Error("X-Ryvex-Signature missing on the original request")
+	}
+	waitUntil(t, "failed attempt audit after redirect denial", 5*time.Second, func() bool {
+		return countActions(webhookAudit(st), ActionFailed) == 1
+	})
+	time.Sleep(150 * time.Millisecond) // grace: the redirect target must stay silent
+	select {
+	case c := <-hitsB:
+		t.Fatalf("redirect target received a request (signature leaked: %q)", c.header.Get("X-Ryvex-Signature"))
+	default:
+	}
+	entries := webhookAudit(st)
+	if got := countActions(entries, ActionDelivered); got != 0 {
+		t.Errorf("webhook_delivered entries = %d, want 0", got)
+	}
+	if got := countActions(entries, ActionFailed); got != 1 {
+		t.Errorf("webhook_failed entries = %d, want 1 (single denied attempt)", got)
+	}
 }

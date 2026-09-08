@@ -50,6 +50,21 @@
 // random material generated at boot), so signatures rotate on
 // restart; durable per-subscription secrets arrive with the secrets
 // feature.
+//
+// # Egress guard (issue #36)
+//
+// The dispatcher refuses to deliver to private, loopback, link-local,
+// CGNAT or otherwise non-public targets. Subscription URLs are
+// validated at create/update time by state.ParseSubscriptionSpec
+// (HTTP 400 via *state.ValidationError); because DNS can change between
+// create and deliver, every dispatch attempt additionally re-resolves
+// the target host and re-checks it (egress.go) before connecting. A
+// refusal is terminal — nothing is sent, nothing is retried — and is
+// appended to the audit log as "webhook_failed" with an "egress
+// blocked" reason. Redirects are denied on the delivery client, so the
+// HMAC signature never leaks cross-host. On-prem deployments that must
+// deliver to internal targets set RYVEX_ALLOW_PRIVATE_WEBHOOKS=1 (see
+// state.EnvAllowPrivateWebhooks), read at dispatch time.
 package webhook
 
 import (
@@ -63,6 +78,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -126,6 +142,19 @@ type Options struct {
 	// QueueSize bounds each subscription's pending deliveries
 	// (default 256). Overflowing events are dropped and audited.
 	QueueSize int
+
+	// Resolver resolves subscription URL hostnames for the dispatch-
+	// time egress guard (DNS rebinding defense, issue #36). Nil
+	// selects net.DefaultResolver.
+	Resolver state.HostResolver
+
+	// AllowPrivateEgress overrides the RYVEX_ALLOW_PRIVATE_WEBHOOKS=1
+	// environment opt-in for delivering to private/loopback/link-local
+	// targets. Nil defers to the environment, consulted at dispatch
+	// time. Set it (to false) in tests that must exercise the guard
+	// deterministically, or (to true) for on-prem deployments that
+	// bypass the environment entirely.
+	AllowPrivateEgress *bool
 }
 
 // Dispatcher fans bus events out to Subscription resources. Construct
@@ -186,6 +215,17 @@ func NewDispatcher(store state.Backend, b bus.BusI, opts Options) *Dispatcher {
 	}
 	if opts.Client == nil {
 		opts.Client = &http.Client{} // per-attempt timeout enforced via request context
+	}
+	if opts.Client.CheckRedirect == nil {
+		// Issue #36: deny redirects on the delivery client unless the
+		// caller supplied an explicit policy. A followed redirect
+		// re-POSTs the signed body to a Location chosen by the first
+		// responder, leaking the signature cross-host; denial keeps
+		// every request on the validated target.
+		opts.Client.CheckRedirect = denyRedirect
+	}
+	if opts.Resolver == nil {
+		opts.Resolver = net.DefaultResolver
 	}
 	if opts.Clock == nil {
 		opts.Clock = time.Now
@@ -423,6 +463,18 @@ func (d *Dispatcher) process(h *subHandle, del delivery) {
 	for attempt := 1; ; attempt++ {
 		view = h.view.Load() // spec (url/secret) may have been updated
 		if view == nil {
+			return
+		}
+		// Egress guard (issue #36): re-resolve the target and refuse
+		// forbidden addresses immediately before connecting — DNS can
+		// change between create and deliver (DNS rebinding). Refusal
+		// is terminal: never send, never retry into a refused target,
+		// and land the refusal in the audit log.
+		if err := d.checkEgress(view); err != nil {
+			d.audit(view, ActionFailed,
+				fmt.Sprintf("%s egress blocked: %v", del.event.Subject, err))
+			d.log.Warn("webhook delivery refused by egress guard",
+				"subscription", h.id, "url", view.spec.URL, "err", err)
 			return
 		}
 		if d.attempt(view, body, del.event, h.id) {
