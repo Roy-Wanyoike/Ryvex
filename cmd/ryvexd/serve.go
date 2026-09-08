@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -56,6 +58,20 @@ func runServe(args []string) error {
 		return err
 	}
 
+	// --- dev-auth guard (issue #38) ---
+	// --dev-auth grants full admin to any well-formed ryk_ token;
+	// combined with a durable store/bus it is almost always a
+	// mistake, so refuse to boot unless explicitly overridden.
+	if err := checkDevAuthGuard(*devAuth, *storeKind, *busKind); err != nil {
+		return err
+	}
+	if *devAuth && !isLoopbackListenAddr(*httpAddr) {
+		log.Warn("DEV-AUTH LISTENING ON A NON-LOOPBACK ADDRESS: any ryk_ bearer token " +
+			"gets full admin access from any network that can reach " + *httpAddr +
+			"; use --dev-auth only on 127.0.0.1/localhost")
+	}
+	// --- end dev-auth guard ---
+
 	// --- postgres store (issue #14): backend selection ---
 	var store state.Backend
 	switch *storeKind {
@@ -91,11 +107,14 @@ func runServe(args []string) error {
 	case "nats":
 		nb, err := natsbus.New(*natsURL, natsbus.Options{Logger: log})
 		if err != nil {
-			return fmt.Errorf("nats event bus: %w (check --nats-url / RYVEX_NATS_URL; refusing to fall back to the memory bus)", err)
+			// Scrub credentials from the connect error before
+			// wrapping (issue #38): natsbus embeds the raw URL.
+			return fmt.Errorf("nats event bus: %w (check --nats-url / RYVEX_NATS_URL; refusing to fall back to the memory bus)", &redactedError{err: err, raw: *natsURL})
 		}
 		defer nb.Close()
 		eventBus = nb
-		log.Info("event bus: NATS JetStream", "url", *natsURL, "stream", natsbus.StreamName)
+		// Never log the URL raw: it may carry user:pass userinfo (issue #38).
+		log.Info("event bus: NATS JetStream", "url", redactURL(*natsURL), "stream", natsbus.StreamName)
 	default:
 		return fmt.Errorf("unsupported bus %q (want \"memory\" or \"nats\")", *busKind)
 	}
@@ -155,12 +174,9 @@ func runServe(args []string) error {
 		Logger:      log,
 		CORSOrigins: splitCommaList(*corsOrigins),
 		Authorizer:  authorizer,
+		Version:     Version, // plumbed to /healthz and the /v1 index (issue #38)
 	})
-	srv := &http.Server{
-		Addr:              *httpAddr,
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := newHTTPServer(*httpAddr, handler)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -192,11 +208,7 @@ func runServe(args []string) error {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok\n"))
 		})
-		metricsSrv = &http.Server{
-			Addr:              *metricsAddr,
-			Handler:           mmux,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
+		metricsSrv = newHTTPServer(*metricsAddr, mmux)
 		go func() {
 			log.Info("metrics endpoint listening", "addr", *metricsAddr)
 			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -237,6 +249,131 @@ func runServe(args []string) error {
 	// --- end nats bus ---
 	log.Info("ryvexd stopped cleanly")
 	return nil
+}
+
+// checkDevAuthGuard refuses to boot when --dev-auth is combined with a
+// durable backend (issue #38): any well-formed ryk_ token gets full
+// admin, and pairing that with postgres or JetStream is almost always
+// an accident of copying a dev command line into staging. The env
+// escape hatch RYVEX_ALLOW_DEV_AUTH=1 documents deliberate intent.
+func checkDevAuthGuard(devAuth bool, storeKind, busKind string) error {
+	if !devAuth {
+		return nil
+	}
+	durable := storeKind == "postgres" || busKind == "nats"
+	if !durable {
+		return nil
+	}
+	if envOr("RYVEX_ALLOW_DEV_AUTH", "") == "1" {
+		return nil
+	}
+	return fmt.Errorf(
+		"--dev-auth cannot be combined with --store postgres or --bus nats: any ryk_ bearer token would receive full admin access to durable state; set RYVEX_ALLOW_DEV_AUTH=1 to override",
+	)
+}
+
+// isLoopbackListenAddr reports whether addr listens only on a loopback
+// interface. Blank or wildcard hosts ("":8080", "0.0.0.0", "::") are
+// NOT loopback — they expose the listener to every interface.
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr // bare host/IP without a port
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Hostname: only the explicit loopback names are trusted.
+		return host == "localhost"
+	}
+	return ip.IsLoopback()
+}
+
+// redactURL reduces a connection URL to scheme://host[:port], dropping
+// userinfo and query strings so credentials never reach logs
+// (issue #38). Degenerate parses that cannot be redacted structurally
+// (opaque strings, embedded credentials) collapse to "(redacted)".
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(redacted)"
+	}
+	if u.Host == "" {
+		// No authority to speak of (e.g. "nats.example:4222" parsed as
+		// scheme+opaque). Return as-is only when there is nothing that
+		// looks like credentials anywhere in the string.
+		if strings.Contains(raw, "@") {
+			return "(redacted)"
+		}
+		return raw
+	}
+	if u.Scheme == "" {
+		return u.Host
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// stripUserinfo removes "user:pass@" credentials from every authority
+// embedded in s, however the URL is rendered (with/without trailing
+// slash, multiple URLs, alternate quoting). Used as the belt-and-braces
+// pass behind the exact-match replacement.
+func stripUserinfo(s string) string {
+	for i := 0; i < len(s); {
+		j := strings.Index(s[i:], "://")
+		if j < 0 {
+			return s
+		}
+		start := i + j + 3
+		end := start
+		for end < len(s) && !strings.ContainsRune("/?#", rune(s[end])) {
+			end++
+		}
+		auth := s[start:end]
+		if at := strings.LastIndex(auth, "@"); at >= 0 {
+			s = s[:start] + auth[at+1:] + s[end:]
+			i = start // the authority shrank; rescan from the same spot
+		} else {
+			i = end // nothing to strip; look for the next authority
+		}
+	}
+	return s
+}
+
+// scrubURL removes credential-bearing forms of raw from s: the URL
+// itself is replaced by its redacted form, then any userinfo that
+// survives in other renderings of the URL is stripped.
+func scrubURL(s, raw string) string {
+	return stripUserinfo(strings.ReplaceAll(s, raw, redactURL(raw)))
+}
+
+// redactedError wraps an error whose message may embed credentials,
+// redacting them in Error() while preserving the wrap chain for
+// errors.Is / errors.As.
+type redactedError struct {
+	err error
+	raw string // credential-bearing URL to scrub
+}
+
+func (e *redactedError) Error() string { return scrubURL(e.err.Error(), e.raw) }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// newHTTPServer builds an http.Server with the production timeout
+// posture (issue #38): slowloris-resistant read timeouts, bounded
+// idle connections, and a 1 MiB header cap. Used for both the main
+// control-plane server and the metrics sidecar.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 }
 
 func newLogger(level string) (*slog.Logger, error) {

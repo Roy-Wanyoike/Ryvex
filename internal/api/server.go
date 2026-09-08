@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -28,6 +29,14 @@ type Server struct {
 	// bearer-only AuthMiddleware and hides /v1/keys.
 	authorizer *authz.Authorizer
 	keys       *KeyService
+	// version is the plumbed build version (issue #38); it falls
+	// back to the package const when ServerOptions.Version is empty.
+	version string
+	// staticKeys holds sha256 digests of the bootstrap tokens for
+	// constant-time comparison (issue #38); devAuth mirrors
+	// AuthOptions.DevAuth so /healthz probes can be classified.
+	staticKeys staticKeyIndex
+	devAuth    bool
 }
 
 // ServerOptions configures NewServer.
@@ -41,10 +50,14 @@ type ServerOptions struct {
 	// org/project-scoped RBAC (issue #16) and enables the /v1/keys
 	// management face. nil preserves the legacy AuthMiddleware.
 	Authorizer *authz.Authorizer
+	// Version is the build version plumbed from the daemon (issue
+	// #38, stamped via ldflags in cmd/ryvexd). Empty falls back to
+	// the package Version const.
+	Version string
 }
 
 // NewServer builds the full handler stack:
-// RequestID -> Recover -> Log -> CORS -> Auth -> routes.
+// RequestID -> Recover -> SecurityHeaders -> Log -> CORS -> Auth -> routes.
 // With Authorizer set, Auth is enforced by AuthZMiddleware (RBAC);
 // otherwise the legacy AuthMiddleware applies. The store is
 // state.Backend (memory or Postgres, issue #14); the bus is bus.BusI
@@ -54,7 +67,17 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	s := &Server{store: store, bus: b, reconciler: rec, log: o.Logger, mux: http.NewServeMux()}
+	if o.Version == "" {
+		o.Version = Version // const fallback when nothing is plumbed (issue #38)
+	}
+	// Static bootstrap tokens are hashed once at boot (issue #38):
+	// requests compare sha256 digests in constant time instead of
+	// leaking token bytes through map-lookup timing.
+	ix := newStaticKeyIndex(o.Auth.APIKeys)
+	s := &Server{
+		store: store, bus: b, reconciler: rec, log: o.Logger, mux: http.NewServeMux(),
+		version: o.Version, staticKeys: ix, devAuth: o.Auth.DevAuth,
+	}
 	// --- RBAC (issue #16): authorizer + keys service ---
 	if o.Authorizer != nil {
 		s.authorizer = o.Authorizer
@@ -76,11 +99,12 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 	o.Auth.SkipPrefixes = append(o.Auth.SkipPrefixes, "/healthz")
 	authMW := AuthMiddleware(o.Auth, o.Logger)
 	if s.authorizer != nil {
-		authMW = AuthZMiddleware(o.Authorizer, o.Auth.DevAuth, o.Auth.APIKeys)
+		authMW = AuthZMiddleware(o.Authorizer, o.Auth, o.Logger)
 	}
 	stack := Chain(
 		RequestIDMiddleware,
 		RecoverMiddleware(o.Logger),
+		SecurityHeadersMiddleware,
 		LogMiddleware(o.Logger),
 		CORSMiddleware(o.CORSOrigins),
 		authMW,
@@ -98,14 +122,45 @@ func Chain(mws ...func(http.Handler) http.Handler) func(http.Handler) http.Handl
 	}
 }
 
+// handleHealthz serves the liveness probe. Anonymous callers (the
+// common case: load balancers, k8s probes, `ryvex health` without a
+// token) get status + version only — resource counts are operational
+// detail that must not leak without a valid key (issue #38). Probes
+// presenting a valid bearer token additionally get the resource count
+// and the principal they authenticated as.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":    "ok",
-		"service":   "ryvexd",
-		"version":   Version,
-		"resources": s.store.Count(),
-		"time":      nowUTC(),
-	})
+	body := map[string]any{
+		"status":  "ok",
+		"service": "ryvexd",
+		"version": s.version,
+		"time":    nowUTC(),
+	}
+	if actor := s.probeActor(r); actor != "" {
+		body["resources"] = s.store.Count()
+		body["authenticated_as"] = actor
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// probeActor resolves the optional bearer token on a /healthz probe
+// against managed keys, static digests, and dev-auth. "" means
+// anonymous.
+func (s *Server) probeActor(r *http.Request) string {
+	tok, ok := bearerToken(r)
+	if !ok {
+		return ""
+	}
+	if s.authorizer != nil {
+		if p, _, kind := resolveToken(s.authorizer, s.staticKeys, s.devAuth, tok); kind != tokenUnknown {
+			return p
+		}
+		return ""
+	}
+	p, ok := authenticateToken(tok, s.staticKeys, s.devAuth)
+	if !ok {
+		return ""
+	}
+	return p
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +190,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":      "Ryvex Control Plane API",
-		"version":   Version,
+		"version":   s.version, // plumbed build version (issue #38)
 		"endpoints": endpoints,
 		"docs":      "docs/api-contracts.md",
 	})
@@ -175,8 +230,16 @@ func (s *Server) routeV1(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, r, http.MethodGet, http.MethodDelete)
 		}
 	case len(seg) == 2 && seg[1] == "events":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, r, http.MethodGet)
+			return
+		}
 		s.handleEvents(w, r, seg[0])
 	case len(seg) == 2 && seg[1] == "audit":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, r, http.MethodGet)
+			return
+		}
 		s.handleAudit(w, r, seg[0])
 	case len(seg) == 3 && seg[1] == "reconcile":
 		if r.Method != http.MethodPost {
@@ -236,11 +299,21 @@ func methodNotAllowed(w http.ResponseWriter, r *http.Request, allow ...string) {
 
 func nowUTC() string { return timeNow().UTC().Format("2006-01-02T15:04:05Z") }
 
+// maxBodyBytes caps JSON request bodies at 1 MiB.
+const maxBodyBytes = 1 << 20
+
+// errBodyTooLarge marks request bodies over the cap; bodyStatus maps
+// it onto a dedicated 413 instead of a misleading 400 (issue #38).
+var errBodyTooLarge = errors.New("request body exceeds the 1 MiB limit")
+
 // decodeBody parses a JSON object body with a 1 MiB cap.
 func decodeBody(r *http.Request, v any) error {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		return state.ErrBadRequest
+	}
+	if len(body) > maxBodyBytes {
+		return errBodyTooLarge
 	}
 	if len(body) == 0 {
 		return &state.ValidationError{Field: "body", Message: "request body required"}
@@ -249,6 +322,18 @@ func decodeBody(r *http.Request, v any) error {
 		return &state.ValidationError{Field: "body", Message: "invalid JSON: " + err.Error()}
 	}
 	return nil
+}
+
+// bodyStatus writes the response for a decodeBody failure: oversized
+// bodies get a dedicated 413 envelope (issue #38), everything else
+// keeps the state-error mapping.
+func bodyStatus(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, errBodyTooLarge) {
+		writeError(w, r, http.StatusRequestEntityTooLarge, CodePayloadTooLarge,
+			"request body exceeds the 1 MiB limit")
+		return
+	}
+	stateStatus(w, r, err)
 }
 
 func queryInt(r *http.Request, key string, def int) int {

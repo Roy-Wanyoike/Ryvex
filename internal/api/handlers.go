@@ -17,7 +17,7 @@ func timeNow() time.Time { return time.Now() }
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var in state.Resource
 	if err := decodeBody(r, &in); err != nil {
-		stateStatus(w, r, err)
+		bodyStatus(w, r, err)
 		return
 	}
 	in.ID = "" // server-owned
@@ -86,8 +86,12 @@ func (s *Server) handleDeleteByID(w http.ResponseWriter, r *http.Request) {
 
 // ---- scope-addressed resources (/v1/{org}/{project}/{env}/{kind}[/{name}]) ----
 
+// handleScopeList serves GET /v1/{org}/{project}/{env}/{kind}. The
+// store's pagination cursor is propagated to next_cursor (issue #38):
+// clients page through large scopes with the same ?cursor= contract as
+// the filtered /v1/resources listing.
 func (s *Server) handleScopeList(w http.ResponseWriter, r *http.Request, seg []string) {
-	res, _, err := s.store.ListResources(state.ListOptions{
+	res, next, err := s.store.ListResources(state.ListOptions{
 		Org: seg[0], Project: seg[1], Env: seg[2], Kind: matchKind(seg[3]),
 		Limit: queryInt(r, "limit", 50), Cursor: r.URL.Query().Get("cursor"),
 	})
@@ -95,7 +99,7 @@ func (s *Server) handleScopeList(w http.ResponseWriter, r *http.Request, seg []s
 		stateStatus(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": res, "next_cursor": ""})
+	writeJSON(w, http.StatusOK, map[string]any{"items": res, "next_cursor": next})
 }
 
 func (s *Server) handleScopeGet(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +120,7 @@ func (s *Server) handleScopePut(w http.ResponseWriter, r *http.Request) {
 
 	var in state.Resource
 	if err := decodeBody(r, &in); err != nil {
-		stateStatus(w, r, err)
+		bodyStatus(w, r, err)
 		return
 	}
 
