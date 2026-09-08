@@ -3,10 +3,16 @@
 import { useEffect, useState } from "react";
 import {
   LS_API_BASE,
+  LS_ENV,
+  LS_ORG,
+  LS_PROJECT,
   LS_TOKEN,
   getApiBase,
   getApiMode,
   getApiToken,
+  getEnv,
+  getOrg,
+  getProject,
   hydrateApiFromStorage,
   storeConfig,
   testConnection,
@@ -29,22 +35,37 @@ type TestState =
 export function SettingsView({ onConfigChange }: { onConfigChange: () => void }) {
   const [apiBase, setApiBase] = useState("");
   const [token, setToken] = useState("");
+  const [org, setOrg] = useState("");
+  const [project, setProject] = useState("");
+  const [env, setEnv] = useState("");
   const [savedMode, setSavedMode] = useState<"live" | "demo">("demo");
   const [savedBase, setSavedBase] = useState("");
+  const [savedOrg, setSavedOrg] = useState("");
+  const [savedProject, setSavedProject] = useState("");
+  const [savedEnv, setSavedEnv] = useState("");
   const [test, setTest] = useState<TestState>({ phase: "idle" });
 
   useEffect(() => {
     hydrateApiFromStorage();
     setApiBase(getApiBase());
     setToken(getApiToken());
+    setOrg(getOrg());
+    setProject(getProject());
+    setEnv(getEnv());
     setSavedMode(getApiMode());
     setSavedBase(getApiBase());
+    setSavedOrg(getOrg());
+    setSavedProject(getProject());
+    setSavedEnv(getEnv());
   }, []);
 
   const handleSave = () => {
-    storeConfig(apiBase, token);
+    storeConfig(apiBase, token, { org, project, env });
     setSavedMode(getApiMode());
     setSavedBase(getApiBase());
+    setSavedOrg(getOrg());
+    setSavedProject(getProject());
+    setSavedEnv(getEnv());
     onConfigChange();
     toast.success(
       getApiMode() === "live"
@@ -70,8 +91,11 @@ export function SettingsView({ onConfigChange }: { onConfigChange: () => void })
         <SectionTitle>Control plane connection</SectionTitle>
         <p className="mt-2 text-sm text-[var(--muted)]">
           Point the console at a running ryvexd. Settings are stored in this browser
-          (localStorage keys <code className="font-mono text-xs">{LS_API_BASE}</code> and{" "}
-          <code className="font-mono text-xs">{LS_TOKEN}</code>) and override the build-time
+          (localStorage keys <code className="font-mono text-xs">{LS_API_BASE}</code>,{" "}
+          <code className="font-mono text-xs">{LS_TOKEN}</code>,{" "}
+          <code className="font-mono text-xs">{LS_ORG}</code>,{" "}
+          <code className="font-mono text-xs">{LS_PROJECT}</code> and{" "}
+          <code className="font-mono text-xs">{LS_ENV}</code>) and override the build-time
           NEXT_PUBLIC_RYVEX_API value.
         </p>
 
@@ -97,6 +121,38 @@ export function SettingsView({ onConfigChange }: { onConfigChange: () => void })
               className="w-full rounded-lg border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-sm outline-none placeholder:text-[var(--muted)] focus:border-[var(--violet)]"
             />
           </Field>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Field label="Org" hint="scope for events + audit (default: acme)">
+              <input
+                value={org}
+                onChange={(e) => setOrg(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="acme"
+                className="w-full rounded-lg border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-sm outline-none placeholder:text-[var(--muted)] focus:border-[var(--violet)]"
+              />
+            </Field>
+            <Field label="Project" hint="header scope label (default: core)">
+              <input
+                value={project}
+                onChange={(e) => setProject(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="core"
+                className="w-full rounded-lg border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-sm outline-none placeholder:text-[var(--muted)] focus:border-[var(--violet)]"
+              />
+            </Field>
+            <Field label="Environment" hint="header scope label (default: prod)">
+              <input
+                value={env}
+                onChange={(e) => setEnv(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="prod"
+                className="w-full rounded-lg border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-sm outline-none placeholder:text-[var(--muted)] focus:border-[var(--violet)]"
+              />
+            </Field>
+          </div>
         </div>
 
         <div className="mt-5 flex flex-wrap items-center gap-3">
@@ -160,6 +216,10 @@ export function SettingsView({ onConfigChange }: { onConfigChange: () => void })
             <div className="flex items-center justify-between gap-2">
               <span className="text-[var(--muted)]">API base</span>
               <code className="truncate font-mono text-xs">{savedBase || "— not set —"}</code>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[var(--muted)]">Scope</span>
+              <code className="truncate font-mono text-xs">{savedOrg}/{savedProject}/{savedEnv}</code>
             </div>
           </div>
           {savedMode === "demo" ? (

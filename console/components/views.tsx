@@ -13,12 +13,12 @@ export function OverviewView({
   resources: Resource[];
   events: RyvexEvent[];
 }) {
-  const ready = resources.filter((r) => r.status.phase === "Ready").length;
+  const ready = resources.filter((r) => r.status?.phase === "Ready").length;
   const clusters = resources.filter((r) => r.kind === "Cluster").length;
   const apps = resources.filter((r) => r.kind === "Application").length;
   const byPhase = useMemo(() => {
     const m = new Map<string, number>();
-    for (const r of resources) m.set(r.status.phase, (m.get(r.status.phase) ?? 0) + 1);
+    for (const r of resources) m.set(r.status?.phase ?? "Unknown", (m.get(r.status?.phase ?? "Unknown") ?? 0) + 1);
     return [...m.entries()];
   }, [resources]);
 
@@ -170,7 +170,7 @@ export function ResourcesView({
               <td className="px-4 py-3"><KindChip kind={r.kind} /></td>
               <td className="px-4 py-3 font-medium">{r.name}</td>
               <td className="px-4 py-3 text-[var(--muted)]">{r.org}/{r.project}/{r.env}</td>
-              <td className="px-4 py-3"><PhaseBadge phase={r.status.phase} /></td>
+              <td className="px-4 py-3"><PhaseBadge phase={r.status?.phase} /></td>
               <td className="px-4 py-3 text-[var(--muted)]">{r.generation}</td>
               <td className="px-4 py-3 text-[var(--muted)]"><TimeAgo iso={r.updated_at} /></td>
             </tr>
@@ -196,7 +196,7 @@ export function EventStream({ events, compact = false }: { events: RyvexEvent[];
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-bold uppercase text-[var(--cyan)]">{e.type}</span>
               <span className="truncate text-sm font-medium">{e.kind}/{e.name}</span>
-              {e.phase ? <PhaseBadge phase={e.phase as never} /> : null}
+              {e.phase ? <PhaseBadge phase={e.phase} /> : null}
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-x-3 text-xs text-[var(--muted)]">
               <code className="truncate">{e.subject}</code>
@@ -280,7 +280,7 @@ export function TopologyView({ resources }: { resources: Resource[] }) {
         <div key={c.id} className="panel p-5">
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-base font-bold">{c.name}</span>
-            <PhaseBadge phase={c.status.phase} />
+            <PhaseBadge phase={c.status?.phase} />
             <span className="chip">{String(c.spec?.provider ?? "provider")}</span>
             <span className="chip">v{String(c.spec?.version ?? "?")}</span>
             <span className="ml-auto text-xs text-[var(--muted)]">{c.org}/{c.project}/{c.env}</span>
@@ -308,7 +308,7 @@ function TopologyGroup({ title, items }: { title: string; items: Resource[] }) {
         {items.map((i) => (
           <li key={i.id} className="flex items-center justify-between gap-2 text-sm">
             <span className="truncate">{i.name}</span>
-            <PhaseBadge phase={i.status.phase} />
+            <PhaseBadge phase={i.status?.phase} />
           </li>
         ))}
         {items.length === 0 ? <li className="text-xs text-[var(--muted)]">none</li> : null}

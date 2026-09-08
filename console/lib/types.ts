@@ -6,11 +6,18 @@ export type Phase =
   | "Failed"
   | "Terminating";
 
+/**
+ * Server-owned status block.
+ *
+ * Typed loosely on purpose: the console renders untrusted wire data, and a
+ * malformed or truncated document must degrade the UI ("Unknown" phase) —
+ * never crash it. Views access these fields with `?.` + fallbacks.
+ */
 export interface ResourceStatus {
-  phase: Phase;
+  phase?: Phase;
   message?: string;
-  observed_generation: number;
-  updated_at: string;
+  observed_generation?: number;
+  updated_at?: string;
 }
 
 export interface Resource {
@@ -23,7 +30,8 @@ export interface Resource {
   generation: number;
   labels?: Record<string, string>;
   spec?: Record<string, unknown>;
-  status: ResourceStatus;
+  /** Absent on malformed documents — render "Unknown" instead of crashing. */
+  status?: ResourceStatus;
   created_at: string;
   updated_at: string;
 }
