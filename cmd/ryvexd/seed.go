@@ -11,7 +11,7 @@ import (
 // seedDemoData loads a small, realistic demo dataset so a fresh
 // daemon has something interesting to serve: one org, one project,
 // two environments, and the workloads that run in them.
-func seedDemoData(ctx context.Context, store *state.Store, log *slog.Logger) (int, error) {
+func seedDemoData(ctx context.Context, store state.Backend, log *slog.Logger) (int, error) {
 	spec := func(kv map[string]any) map[string]any { return kv }
 	labels := func(kv map[string]string) map[string]string { return kv }
 

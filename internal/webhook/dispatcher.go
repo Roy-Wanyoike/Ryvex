@@ -132,7 +132,7 @@ type Options struct {
 // with NewDispatcher, then Start(ctx) and Stop(timeout) like the
 // reconciler. Safe for concurrent use.
 type Dispatcher struct {
-	store *state.Store
+	store state.Backend
 	bus   *bus.Bus
 	opts  Options
 	log   *slog.Logger
@@ -178,7 +178,7 @@ type deliveryPayload struct {
 
 // NewDispatcher constructs a dispatcher over the store and bus. Call
 // Start to begin delivering.
-func NewDispatcher(store *state.Store, b *bus.Bus, opts Options) *Dispatcher {
+func NewDispatcher(store state.Backend, b *bus.Bus, opts Options) *Dispatcher {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}

@@ -18,7 +18,7 @@ const Version = "v1.0.0"
 
 // Server wires the store, bus and reconciler into an HTTP handler.
 type Server struct {
-	store      *state.Store
+	store      state.Backend
 	bus        *bus.Bus
 	reconciler *reconcile.Reconciler
 	log        *slog.Logger
@@ -36,7 +36,7 @@ type ServerOptions struct {
 
 // NewServer builds the full handler stack:
 // RequestID -> Recover -> Log -> Auth -> routes.
-func NewServer(store *state.Store, b *bus.Bus, rec *reconcile.Reconciler, o ServerOptions) http.Handler {
+func NewServer(store state.Backend, b *bus.Bus, rec *reconcile.Reconciler, o ServerOptions) http.Handler {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}

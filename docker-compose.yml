@@ -1,0 +1,27 @@
+# Local development stack: a Postgres for `ryvexd --store postgres`.
+#
+#   docker compose up -d
+#   ryvexd serve --store postgres \
+#       --dsn postgres://postgres:postgres@127.0.0.1:5432/ryvex?sslmode=disable
+#
+# (Ryvex itself ships as a single Go binary; only the durable state
+# backend needs a server.)
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ryvex
+    ports:
+      - "5432:5432"
+    volumes:
+      - ryvex-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ryvex"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ryvex-pgdata:

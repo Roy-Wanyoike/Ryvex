@@ -17,6 +17,7 @@ import (
 	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 	"github.com/Roy-Wanyoike/Ryvex/internal/reconcile"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
+	"github.com/Roy-Wanyoike/Ryvex/internal/state/pgstore"
 	"github.com/Roy-Wanyoike/Ryvex/internal/webhook"
 )
 
@@ -36,6 +37,8 @@ func runServe(args []string) error {
 	// Metrics sidecar (issue #17): empty disables the endpoint.
 	metricsAddr := fs.String("metrics-addr", envOr("RYVEX_METRICS_ADDR", ""), "dedicated listen address for /metrics and /healthz passthrough (empty disables metrics)")
 	logLevel := fs.String("log-level", "info", "log level")
+	// --- postgres store (issue #14): DSN flag ---
+	dsn := fs.String("dsn", envOr("RYVEX_DATABASE_URL", ""), "Postgres DSN (required when --store=postgres)")
 	// --- webhooks (issue #13): signing-secret flag ---
 	webhookSecret := fs.String("webhook-secret", envOr("RYVEX_WEBHOOK_SECRET", ""), "HMAC key material for webhook signatures (random per boot when unset)")
 	if err := fs.Parse(args); err != nil {
@@ -47,10 +50,30 @@ func runServe(args []string) error {
 		return err
 	}
 
-	if *storeKind != "memory" {
-		return fmt.Errorf("unsupported store %q (only \"memory\" is available in this build)", *storeKind)
+	// --- postgres store (issue #14): backend selection ---
+	var store state.Backend
+	switch *storeKind {
+	case "memory":
+		store = state.NewStore()
+	case "postgres":
+		if *dsn == "" {
+			return fmt.Errorf("--store postgres requires --dsn (or env RYVEX_DATABASE_URL)")
+		}
+		pgs, err := pgstore.NewStore(*dsn)
+		if err != nil {
+			return fmt.Errorf("postgres store: %w", err)
+		}
+		defer pgs.Close()
+		mctx, mcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer mcancel()
+		if err := pgs.Migrate(mctx); err != nil {
+			return fmt.Errorf("postgres migrate: %w", err)
+		}
+		store = pgs
+	default:
+		return fmt.Errorf("unsupported store %q (available: \"memory\", \"postgres\")", *storeKind)
 	}
-	store := state.NewStore()
+	// --- end postgres store (issue #14) ---
 	eventBus := bus.New()
 
 	// Replay recent control-plane events into the log for visibility.
