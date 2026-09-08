@@ -99,7 +99,13 @@ function PhaseDonut({ data, total }: { data: [string, number][]; total: number }
 
 const KIND_FILTERS = ["All", "Application", "Deployment", "Database", "Cluster", "Node", "Policy", "Secret"];
 
-export function ResourcesView({ resources }: { resources: Resource[] }) {
+export function ResourcesView({
+  resources,
+  onOpen,
+}: {
+  resources: Resource[];
+  onOpen: (r: Resource) => void;
+}) {
   const [q, setQ] = useState("");
   const [kind, setKind] = useState("All");
 
@@ -148,7 +154,19 @@ export function ResourcesView({ resources }: { resources: Resource[] }) {
         </thead>
         <tbody>
           {rows.map((r) => (
-            <tr key={r.id} className="border-b border-[var(--line)]/50 transition hover:bg-[var(--panel-2)]">
+            <tr
+              key={r.id}
+              tabIndex={0}
+              aria-label={`Inspect ${r.kind} ${r.name}`}
+              onClick={() => onOpen(r)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onOpen(r);
+                }
+              }}
+              className="cursor-pointer border-b border-[var(--line)]/50 transition hover:bg-[var(--panel-2)] focus:bg-[var(--panel-2)] focus:outline-none"
+            >
               <td className="px-4 py-3"><KindChip kind={r.kind} /></td>
               <td className="px-4 py-3 font-medium">{r.name}</td>
               <td className="px-4 py-3 text-[var(--muted)]">{r.org}/{r.project}/{r.env}</td>
