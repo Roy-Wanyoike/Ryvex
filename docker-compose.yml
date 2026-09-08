@@ -1,27 +1,124 @@
-# Local development stack: a Postgres for `ryvexd --store postgres`.
+# Ryvex self-hosted stack (issue #35).
 #
-#   docker compose up -d
-#   ryvexd serve --store postgres \
-#       --dsn postgres://postgres:postgres@127.0.0.1:5432/ryvex?sslmode=disable
+#   docker compose up -d                   # postgres + ryvexd (memory event bus)
+#   docker compose --profile nats up -d    # additionally enable the NATS JetStream bus
 #
-# (Ryvex itself ships as a single Go binary; only the durable state
-# backend needs a server.)
+# ryvexd ships prebuilt inside the image (see Dockerfile) — no Go
+# toolchain is required on the host.
+#
+# Credentials are env-configurable: compose reads a .env file placed
+# next to this file, or you can export the variables in your shell.
+# The in-file defaults are for local development ONLY — override them
+# before exposing the stack beyond loopback:
+#
+#   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
+#   RYVEX_API_KEYS       comma-separated name=token pairs (see ryvexd below)
+#   RYVEX_WEBHOOK_SECRET / RYVEX_CORS_ORIGINS / RYVEX_NATS_URL
+#
+# Backups (run from the host; the dump lands in your current directory):
+#
+#   docker compose exec postgres pg_dump -U "${POSTGRES_USER:-postgres}" \
+#       "${POSTGRES_DB:-ryvex}" > ryvex-backup.sql
+#
+#   # restore:
+#   docker compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" \
+#       "${POSTGRES_DB:-ryvex}" < ryvex-backup.sql
+#
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ryvex
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ryvex}
     ports:
-      - "5432:5432"
+      # Loopback only: the database must never be reachable off-host by
+      # default. Containers reach it over the compose network as host
+      # "postgres", not via this published port.
+      - "127.0.0.1:5432:5432"
     volumes:
       - ryvex-pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ryvex"]
+      # Interpolated from the same env vars as the credentials above, so
+      # the probe always targets the database that was actually created.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ryvex}"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+  ryvexd:
+    build: .
+    restart: unless-stopped
+    # --store and --bus have no RYVEX_* env equivalents, so they must
+    # live on the command line; every other flag is wired through the
+    # environment block below. To switch to the durable NATS bus once
+    # the "nats" profile is enabled, extend this to:
+    #   ["serve", "--store", "postgres", "--bus", "nats"]
+    # (ryvexd deliberately refuses to fall back to the memory bus when
+    # --bus=nats fails to connect.)
+    command: ["serve", "--store", "postgres"]
+    environment:
+      # In-container host is the compose service name "postgres", not
+      # 127.0.0.1. sslmode=disable is acceptable only because traffic
+      # never leaves the compose network; switch to verify-full with a
+      # managed Postgres.
+      RYVEX_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ryvex}?sslmode=disable
+      # SAMPLE ONLY — replace with long random tokens before real use, e.g.:
+      #   RYVEX_API_KEYS=ops=ryk_$(openssl rand -hex 24),ci=ryk_$(openssl rand -hex 24)
+      RYVEX_API_KEYS: ${RYVEX_API_KEYS:-admin=ryk_REPLACE_ME_with_a_long_random_token}
+      # Empty (default) = webhook signatures use a fresh random secret per
+      # boot; set a fixed value for stable signatures across restarts.
+      RYVEX_WEBHOOK_SECRET: ${RYVEX_WEBHOOK_SECRET:-}
+      # Set to the console origin (e.g. http://localhost:3000) when a
+      # browser client needs to call the API cross-origin.
+      RYVEX_CORS_ORIGINS: ${RYVEX_CORS_ORIGINS:-}
+      # Pre-wired for the optional "nats" profile; harmless while
+      # --bus stays "memory".
+      RYVEX_NATS_URL: ${RYVEX_NATS_URL:-nats://nats:4222}
+      # Uncomment to expose /metrics on a second listener (issue #17):
+      # RYVEX_METRICS_ADDR: ":9090"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The image already defines this probe (wget + /healthz); the
+    # explicit copy keeps compose self-documenting and lets future
+    # services gate on ryvexd health via depends_on.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # Optional durable event bus (NATS JetStream, issue #15). Deliberately
+  # behind a compose profile so plain `docker compose up` stays
+  # lightweight — ryvexd's memory bus is the default and needs no extra
+  # service. Enable with:
+  #
+  #   docker compose --profile nats up -d
+  #
+  # then add "--bus", "nats" to the ryvexd command (see comment above).
+  # -js enables JetStream (required by ryvexd's natsbus); -m 8222 adds
+  # the monitoring endpoint used by the healthcheck.
+  nats:
+    image: nats:2-alpine
+    profiles: ["nats"]
+    restart: unless-stopped
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
 volumes:
   ryvex-pgdata:
+  nats-data:

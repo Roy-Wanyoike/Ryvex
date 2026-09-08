@@ -1,0 +1,29 @@
+# Keep the build context to the Go workspace only: the image builds
+# go.mod + cmd/ + internal/ and nothing else. Smaller context = faster
+# builds and no unrelated files leaking into the builder/cache.
+#
+# Required excludes per issue #35 are called out explicitly.
+
+# Version control / CI metadata
+.git
+.github
+
+# Secrets — never let local env files reach the build context or image layers
+.env
+.env.*
+
+# Web console (covers required excludes console/node_modules, console/.next)
+console/
+
+# Rust agent + its build artifacts (covers required exclude agent/target)
+agent/
+agent/target
+
+# Docs and their binary assets (covers required exclude docs/images)
+docs/
+docs/images
+
+# Local scratch workspaces and OS noise
+work/
+tmp/
+.DS_Store
