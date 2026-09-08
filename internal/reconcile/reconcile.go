@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
+	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
 )
 
@@ -121,8 +122,22 @@ func (r *Reconciler) worker(ctx context.Context, n int) {
 
 // scan queues every resource that has not fully converged yet:
 // pending/provisioning phases, or a spec generation the status has
-// not observed.
+// not observed. It also refreshes the ryvex_resources snapshot gauge
+// and records the scan counter, scan duration and queue depth
+// (issue #17).
 func (r *Reconciler) scan() {
+	start := time.Now()
+	defer func() {
+		metrics.ReconcilerScansTotal.Inc()
+		metrics.ReconcilerScanSeconds.Observe(time.Since(start).Seconds())
+		metrics.ReconcilerQueueDepth.Set(float64(len(r.triggers)))
+	}()
+
+	// Refresh the ryvex_resources gauge from a lightweight store
+	// snapshot so the gauge tracks kind/phase inventory without any
+	// per-mutation bookkeeping.
+	metrics.ReconcileMetrics(r.store)
+
 	resources, _, err := r.store.ListResources(state.ListOptions{Limit: 200})
 	if err != nil {
 		r.log.Error("scan failed", "err", err)
@@ -138,6 +153,9 @@ func (r *Reconciler) scan() {
 }
 
 func (r *Reconciler) reconcileOne(id, cause string) {
+	start := time.Now()
+	defer func() { metrics.ReconcilerConvergeSeconds.Observe(time.Since(start).Seconds()) }()
+
 	res, err := r.store.GetResource(id)
 	if err != nil {
 		return // deleted between scan and reconcile

@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 )
 
 type ctxKey int
@@ -71,24 +74,63 @@ func RecoverMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// LogMiddleware emits one structured line per request.
+// LogMiddleware emits one structured line per request and records
+// the HTTP request counter and duration histogram (issue #17). Route
+// labels are low-cardinality buckets from routeLabel, never raw paths.
 func LogMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
+			route := routeLabel(r.URL.Path)
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r)
+			duration := time.Since(start)
+			metrics.HTTPRequestsTotal.WithLabelValues(route, r.Method, strconv.Itoa(sw.status)).Inc()
+			metrics.HTTPRequestDuration.WithLabelValues(route, r.Method).Observe(duration.Seconds())
 			if log != nil {
 				log.Info("http",
 					"method", r.Method,
 					"path", r.URL.Path,
 					"status", sw.status,
-					"duration_ms", time.Since(start).Milliseconds(),
+					"duration_ms", duration.Milliseconds(),
 					"actor", ActorFrom(r.Context()),
 					"request_id", RequestIDFrom(r.Context()),
 				)
 			}
 		})
+	}
+}
+
+// routeLabel normalizes a request path into a fixed set of route
+// buckets so metrics cardinality stays bounded no matter how many
+// orgs/kinds/ids are addressed. The buckets mirror the routeV1
+// dispatch cases: parameters are replaced by placeholders.
+func routeLabel(path string) string {
+	switch path {
+	case "/healthz":
+		return "healthz"
+	case "/", "/v1", "/v1/":
+		return "index"
+	}
+	trimmed := strings.Trim(strings.TrimPrefix(path, "/v1"), "/")
+	seg := strings.Split(trimmed, "/")
+	switch {
+	case seg[0] == "resources" && len(seg) == 1:
+		return "resources"
+	case seg[0] == "resources" && len(seg) == 2:
+		return "resources/{id}"
+	case len(seg) == 2 && seg[1] == "events":
+		return "org/events"
+	case len(seg) == 2 && seg[1] == "audit":
+		return "org/audit"
+	case len(seg) == 3 && seg[1] == "reconcile":
+		return "org/reconcile/{id}"
+	case len(seg) == 4:
+		return "scope/{kind}"
+	case len(seg) == 5:
+		return "scope/{kind}/{name}"
+	default:
+		return "other"
 	}
 }
 

@@ -271,6 +271,25 @@ func (s *Store) Count() int {
 	return len(s.byID)
 }
 
+// CountByKindPhase returns how many resources exist per kind and
+// lifecycle phase. It backs the ryvex_resources metrics gauge
+// (issue #17): a read-only snapshot with no deep copies, refreshed by
+// the reconciler on each scan.
+func (s *Store) CountByKindPhase() map[string]map[string]int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]map[string]int64, len(s.byID))
+	for _, r := range s.byID {
+		ph := out[r.Kind]
+		if ph == nil {
+			ph = make(map[string]int64, 4)
+			out[r.Kind] = ph
+		}
+		ph[r.Status.Phase]++
+	}
+	return out
+}
+
 // AuditOptions filters the audit log.
 type AuditOptions struct {
 	Org   string

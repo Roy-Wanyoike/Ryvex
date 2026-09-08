@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 )
 
 // SubjectNamespace is the root of every Ryvex event subject.
@@ -116,7 +118,10 @@ func (b *Bus) Subscribe(pattern string, h Handler) *Subscription {
 }
 
 // Publish fans an event out to all matching subscribers and records
-// it in the replay ring. Handler panics are contained.
+// it in the replay ring. Handler panics are contained. Publishes and
+// deliveries are counted on the ryvex_bus_events_* metrics
+// (issue #17); the counters are mutex-guarded and independent of the
+// bus lock, so instrumentation adds no contention.
 func (b *Bus) Publish(e Event) {
 	if e.Subject == "" {
 		e.Subject = Subject(e.Org, e.Kind, e.Type)
@@ -124,6 +129,7 @@ func (b *Bus) Publish(e Event) {
 	if e.Time.IsZero() {
 		e.Time = time.Now().UTC()
 	}
+	metrics.BusEventsPublishedTotal.WithLabelValues(eventTypeLabel(e.Type)).Inc()
 
 	b.mu.Lock()
 	b.next++
@@ -144,8 +150,18 @@ func (b *Bus) Publish(e Event) {
 	b.mu.Unlock()
 
 	for _, h := range handlers {
+		metrics.BusEventsDeliveredTotal.Inc()
 		runHandler(h, e)
 	}
+}
+
+// eventTypeLabel keeps the published-events metric cardinality
+// bounded even when an event is published without an explicit type.
+func eventTypeLabel(t string) string {
+	if t == "" {
+		return "unknown"
+	}
+	return t
 }
 
 func runHandler(h Handler, e Event) {
