@@ -34,6 +34,15 @@ async fn run() -> i32 {
             return 2;
         }
     };
+    // Effective node name (issue #43): logged so operators can see
+    // exactly which resource identity the agent will manage.
+    tracing::info!(
+        node = cfg.node_name(),
+        api = %cfg.api,
+        interval_secs = cfg.interval,
+        spec_refresh_secs = cfg.spec_refresh_secs,
+        "agent starting"
+    );
 
     let agent = match client::ApiClient::new(cfg.clone()) {
         Ok(c) => c,
@@ -88,7 +97,26 @@ async fn run() -> i32 {
                     _ = sigint.recv() => break,
                 }
             }
-            client::Outcome::Conflict { .. } => unreachable!("sync_node resolves conflicts internally"),
+            client::Outcome::Conflict { fresh_generation } => {
+                // Defensive: sync_node resolves CAS conflicts internally
+                // and must never leak this variant. Issue #43: this arm
+                // used to be a reachable `unreachable!()` — under
+                // sustained contention the final retry returned Conflict
+                // and the agent panic-restart-looped. If a future
+                // refactor leaks one anyway, degrade to the transient
+                // path instead of crashing the node.
+                tracing::error!(
+                    fresh_generation,
+                    "sync_node leaked a Conflict outcome (bug); treating as transient"
+                );
+                let wait = bo.advance();
+                tracing::warn!(wait_secs = wait.as_secs(), "backing off after unexpected conflict");
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = sigterm.recv() => break,
+                    _ = sigint.recv() => break,
+                }
+            }
         }
 
         tokio::select! {

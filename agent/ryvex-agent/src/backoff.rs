@@ -3,7 +3,9 @@
 
 use rand::Rng;
 
-/// Backoff sequence: 1s, 2s, 4s, ... capped at 30s, with ±20% jitter.
+/// Backoff sequence: 1s, 2s, 4s, ... capped at 30s, with symmetric
+/// ±20% jitter on top (waits land in [0.8×, 1.2×) of the sequence
+/// value, floored at 1s; at the cap: 24s–35s).
 #[derive(Debug)]
 pub struct Backoff {
     base_secs: u64,
@@ -31,13 +33,21 @@ impl Backoff {
         self.attempt
     }
 
-    /// Advance the sequence and return the wait duration with jitter.
+    /// Advance the sequence and return the wait duration with symmetric
+    /// ±20% jitter: `wait = capped * U(0.8, 1.2)`, floored at 1s.
+    ///
+    /// Issue #43: the jitter used to be downward-only (~-10%) despite
+    /// this doc comment claiming ±20%, so contending agents
+    /// synchronized on the ceiling. Now symmetric, per the contract.
     pub fn advance(&mut self) -> std::time::Duration {
         self.attempt = self.attempt.saturating_add(1);
         let exp = self.base_secs.saturating_mul(1u64 << (self.attempt - 1).min(6));
         let capped = exp.min(self.cap_secs);
-        let jitter = (capped as f64 * 0.2 * rand::thread_rng().r#gen::<f64>()) as u64;
-        std::time::Duration::from_secs(capped.saturating_sub(jitter / 2 + jitter % 2))
+        let span = capped as f64 * 0.2;
+        // thread_rng().r#gen::<f64>() is uniform in [0, 1).
+        let delta = rand::thread_rng().r#gen::<f64>() * 2.0 * span - span;
+        let secs = (capped as f64 + delta).max(1.0) as u64;
+        std::time::Duration::from_secs(secs)
     }
 }
 
