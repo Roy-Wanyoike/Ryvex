@@ -8,7 +8,7 @@ import (
 
 // Version is stamped at build time in CI; the default reflects the
 // current release of the control plane.
-var Version = "v1.0.0"
+var Version = "v1.1.0"
 
 const usage = `ryvexd — the Ryvex control plane daemon
 

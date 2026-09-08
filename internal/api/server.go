@@ -15,7 +15,7 @@ import (
 )
 
 // Version is reported on /healthz and the API index.
-const Version = "v1.0.0"
+const Version = "v1.1.0"
 
 // Server wires the store, bus and reconciler into an HTTP handler.
 type Server struct {
