@@ -20,9 +20,10 @@ interface RecordedRequest {
   method: string;
   headers: Headers;
   body?: string;
+  signal?: AbortSignal;
 }
 
-type Handler = (req: RecordedRequest) => Response | Promise<Response>;
+type Handler = (req: RecordedRequest, init?: RequestInit) => Response | Promise<Response>;
 
 function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -49,9 +50,10 @@ function mockFetch(handler: Handler): { fetch: typeof fetch; requests: RecordedR
       method: init?.method ?? "GET",
       headers,
       body: typeof init?.body === "string" ? init.body : undefined,
+      signal: init?.signal instanceof AbortSignal ? init.signal : undefined,
     };
     requests.push(req);
-    return await handler(req);
+    return await handler(req, init);
   };
   return { fetch: fn as unknown as typeof fetch, requests };
 }
@@ -400,7 +402,7 @@ describe("error envelope parsing", () => {
     expect(err.code).toBe("unauthorized");
   });
 
-  test("transport failures are wrapped in RyvexError with status 0", async () => {
+  test("transport failures are wrapped in RyvexError with status 0 and code 'transport_error'", async () => {
     const { fetch } = mockFetch(() => {
       throw new Error("connection refused");
     });
@@ -408,7 +410,41 @@ describe("error envelope parsing", () => {
     const err = await client.health().catch((e: unknown) => e);
     if (!(err instanceof RyvexError)) throw new Error("expected RyvexError");
     expect(err.status).toBe(0);
+    // Parity with the Python SDK (sdk/ryvex-py/src/ryvex/errors.py):
+    // connection-level failures are "transport_error", not "internal_error".
+    expect(err.code).toBe("transport_error");
     expect(err.message).toContain("connection refused");
+  });
+
+  test("abort-shaped fetch rejections map to code 'timeout'", async () => {
+    const { fetch } = mockFetch(() => {
+      throw new DOMException("The operation was aborted", "AbortError");
+    });
+    const client = new Ryvex({ baseUrl: BASE, token: TOKEN, fetch });
+    const err = await client.health().catch((e: unknown) => e);
+    if (!(err instanceof RyvexError)) throw new Error("expected RyvexError");
+    expect(err.status).toBe(0);
+    expect(err.code).toBe("timeout");
+  });
+
+  test("403 forbidden parses the envelope code", async () => {
+    const { client } = clientWith(() =>
+      errorEnvelope(403, "forbidden", "token lacks scope rbac:read", "f043b1dd3n", ["scope"]),
+    );
+    const err = await client.listResources({ org: "acme" }).catch((e: unknown) => e);
+    if (!(err instanceof RyvexError)) throw new Error("expected RyvexError");
+    expect(err.status).toBe(403);
+    expect(err.code).toBe("forbidden");
+    expect(err.requestId).toBe("f043b1dd3n");
+    expect(err.details).toEqual(["scope"]);
+  });
+
+  test("non-envelope 403 (edge proxy HTML) falls back to code 'forbidden'", async () => {
+    const { client } = clientWith(() => textResponse(403, "<html>denied by edge proxy</html>"));
+    const err = await client.getResource("r-x").catch((e: unknown) => e);
+    if (!(err instanceof RyvexError)) throw new Error("expected RyvexError");
+    expect(err.status).toBe(403);
+    expect(err.code).toBe("forbidden");
   });
 
   test("every request carries Authorization and Content-Type headers", async () => {
@@ -421,6 +457,69 @@ describe("error envelope parsing", () => {
       expect(req.headers.get("Authorization")).toBe(`Bearer ${TOKEN}`);
       expect(req.headers.get("Content-Type")).toBe("application/json");
       expect(req.headers.get("Accept")).toBe("application/json");
+    }
+  });
+});
+
+// ---- timeout & cancellation plumbing (mock fetch, no sockets) ----
+
+describe("timeout & cancellation plumbing", () => {
+  test("defaults timeoutMs to 15000 and validates overrides", () => {
+    expect(new Ryvex({ baseUrl: BASE, token: TOKEN }).timeoutMs).toBe(15_000);
+    expect(new Ryvex({ baseUrl: BASE, token: TOKEN, timeoutMs: 0 }).timeoutMs).toBe(0);
+    expect(() => new Ryvex({ baseUrl: BASE, token: TOKEN, timeoutMs: -1 })).toThrow(TypeError);
+    expect(() => new Ryvex({ baseUrl: BASE, token: TOKEN, timeoutMs: Number.NaN })).toThrow(TypeError);
+    expect(() => new Ryvex({ baseUrl: BASE, token: TOKEN, timeoutMs: Number.POSITIVE_INFINITY })).toThrow(TypeError);
+  });
+
+  test("per-call signal reaches fetch init verbatim when the timeout is disabled", async () => {
+    let seen: RequestInit | undefined;
+    const capture = ((_input: string | URL | Request, init?: RequestInit) => {
+      seen = init;
+      return Promise.resolve(jsonResponse(200, { status: "ok" }));
+    }) as unknown as typeof fetch;
+    const client = new Ryvex({ baseUrl: BASE, token: TOKEN, fetch: capture, timeoutMs: 0 });
+    const ac = new AbortController();
+    await client.health({ signal: ac.signal });
+    expect(seen?.signal).toBe(ac.signal);
+  });
+
+  test("client timeout aborts fetch through init.signal", async () => {
+    const { fetch } = mockFetch(
+      (_req, init) =>
+        new Promise<Response>((_, reject) => {
+          const signal = init?.signal;
+          if (!(signal instanceof AbortSignal)) {
+            reject(new Error("no AbortSignal passed to fetch"));
+            return;
+          }
+          signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted", "AbortError")));
+        }),
+    );
+    const client = new Ryvex({ baseUrl: BASE, token: TOKEN, fetch, timeoutMs: 30 });
+    const err = await client.health().catch((e: unknown) => e);
+    if (!(err instanceof RyvexError)) throw new Error("expected RyvexError");
+    expect(err.status).toBe(0);
+    expect(err.code).toBe("timeout");
+    expect(err.message).toContain("timed out after 30ms");
+  });
+
+  test("listAll forwards the per-call signal to every page request", async () => {
+    const { fetch, requests } = mockFetch((req) =>
+      req.url.endsWith("cursor=c2")
+        ? jsonResponse(200, { items: [], next_cursor: "" })
+        : jsonResponse(200, { items: [sampleResource()], next_cursor: "c2" }),
+    );
+    const client = new Ryvex({ baseUrl: BASE, token: TOKEN, fetch, timeoutMs: 0 });
+    const ac = new AbortController();
+    const seen: string[] = [];
+    for await (const r of client.listAll({ org: "acme" }, { signal: ac.signal })) {
+      seen.push(r.id);
+    }
+    expect(seen).toHaveLength(1);
+    expect(requests).toHaveLength(2);
+    for (const req of requests) {
+      expect(req.signal).toBe(ac.signal);
     }
   });
 });

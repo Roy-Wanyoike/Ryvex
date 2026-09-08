@@ -45,6 +45,18 @@ Every request carries `Authorization: Bearer <token>` and
 `Content-Type: application/json`. Custom runtimes can inject their own
 transport via `new Ryvex({ baseUrl, token, fetch })`.
 
+## Client options
+
+| Option | Type | Default | Description |
+| ------ | ---- | ------- | ----------- |
+| `baseUrl` | `string` | — (required) | Root of the daemon, e.g. `http://127.0.0.1:8080`. The `/v1` prefix is appended per call. |
+| `token` | `string` | — (required) | Bearer token (`ryk_…`). |
+| `fetch` | `typeof fetch` | `globalThis.fetch` | Custom transport (required on Node < 18). |
+| `timeoutMs` | `number` | `15000` | Per-request timeout in milliseconds. Uses `AbortSignal.timeout` with an `AbortController` fallback on older runtimes. `0` disables the client-side timeout. |
+
+Every public method also accepts a trailing `{ signal }` object for
+per-call cancellation — see [Timeouts & cancellation](#timeouts--cancellation).
+
 ## Optimistic concurrency (CAS)
 
 `status` and `generation` are **server-owned**. `generation` increments
@@ -94,6 +106,40 @@ for await (const r of ryvex.listAll({ org: "acme", env: "prod" })) {
 }
 ```
 
+## Timeouts & cancellation
+
+Every request is bounded by the client's `timeoutMs` (default **15 s**
+— Node's fetch can otherwise stall for minutes) and by an optional
+per-call `AbortSignal`; whichever fires first cancels the request.
+Cancellations reject with a `RyvexError` of `code: "timeout"`,
+`status: 0`, distinguishable from connection-level failures
+(`code: "transport_error"`):
+
+```ts
+const ryvex = new Ryvex({ baseUrl, token, timeoutMs: 10_000 }); // per-client default
+
+// per-call cancellation
+const ac = new AbortController();
+const timer = setTimeout(() => ac.abort(), 5_000);   // give up after 5 s
+try {
+  const page = await ryvex.listResources({ org: "acme" }, { signal: ac.signal });
+} catch (err) {
+  if (RyvexError.is(err) && err.code === "timeout") {
+    console.error("cancelled:", err.message);        // "… was aborted by the caller"
+  } else {
+    throw err;
+  }
+} finally {
+  clearTimeout(timer);
+}
+```
+
+Compatibility notes: on runtimes without `AbortSignal.timeout`
+(Node < 17.3, older browsers) the SDK falls back to an
+`AbortController` + timer; where `AbortSignal.any` is missing, the
+caller's signal is relayed with event listeners. No polyfill is needed
+and there are zero runtime dependencies.
+
 ## Error handling
 
 All non-2xx responses throw a `RyvexError` parsed from the frozen
@@ -101,10 +147,12 @@ envelope `{"error":{code,message,request_id,details}}`. If the body
 isn't the envelope (proxy HTML, empty body), the code is inferred from
 the HTTP status so you can always branch on it:
 
-| HTTP | `err.code`             |
-| ---- | ---------------------- |
+| HTTP | `err.code` |
+| ---- | ---------- |
+| 0 (no response) | `timeout` (client timeout / caller abort) or `transport_error` (connection failed) |
 | 400  | `validation_failed` / `bad_request` |
 | 401  | `unauthorized`         |
+| 403  | `forbidden`            |
 | 404  | `not_found`            |
 | 405  | `method_not_allowed`   |
 | 409  | `already_exists` / `conflict` |
@@ -126,8 +174,10 @@ try {
 }
 ```
 
-Transport failures (DNS, refused connections) are wrapped as
-`RyvexError` with `status: 0` — one error type to catch everywhere.
+Transport failures (DNS, refused connections, socket resets) are wrapped
+as `RyvexError` with `status: 0` and `code: "transport_error"` — the
+same code the Python SDK uses. Timeouts and caller-initiated aborts are
+reported as `code: "timeout"`. One error type to catch everywhere.
 
 ## API surface
 
@@ -145,6 +195,9 @@ Transport failures (DNS, refused connections) are wrapped as
 | GET | `/v1/{org}/events?limit=` | `events(org, { limit })` |
 | GET | `/v1/{org}/audit?kind=&limit=` | `audit(org, { kind, limit })` |
 | POST | `/v1/{org}/reconcile/{id}` | `triggerReconcile(org, id)` |
+
+Every method takes an optional trailing `{ signal: AbortSignal }` for
+per-call cancellation.
 
 ## Development
 
