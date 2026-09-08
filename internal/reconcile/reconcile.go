@@ -61,6 +61,11 @@ func New(store state.Backend, b bus.BusI, opts Options) *Reconciler {
 
 // Start launches the scan loop and worker pool; it returns
 // immediately. Cancel ctx (or call Stop) to shut down.
+//
+// Shutdown protocol (issue #28): the triggers channel is NEVER closed
+// — closing it raced with in-flight Trigger() sends (data race /
+// panic: close of closed channel). Workers exit via ctx.Done instead
+// and the buffered channel is simply abandoned at shutdown.
 func (r *Reconciler) Start(ctx context.Context) {
 	go r.loop(ctx)
 	for i := 0; i < r.opts.Concurrency; i++ {
@@ -68,7 +73,6 @@ func (r *Reconciler) Start(ctx context.Context) {
 	}
 	go func() {
 		<-ctx.Done()
-		r.stopOnce.Do(func() { close(r.triggers) })
 		close(r.done)
 	}()
 }

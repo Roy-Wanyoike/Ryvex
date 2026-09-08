@@ -71,7 +71,12 @@ type Status struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
-// DeepCopy returns a defensive copy of the resource.
+// DeepCopy returns a defensive copy of the resource. Both Labels and
+// Spec are deep-copied into FRESH maps: `cp := *r` only copies the map
+// headers, so writing through cp.Spec would alias — and mutate — the
+// stored resource's map (issue #28: data race + in-place corruption
+// found by the race detector via json.Unmarshal reusing the aliased
+// map).
 func (r *Resource) DeepCopy() *Resource {
 	cp := *r
 	if r.Labels != nil {
@@ -81,7 +86,8 @@ func (r *Resource) DeepCopy() *Resource {
 		}
 	}
 	if r.Spec != nil {
-		raw, _ := json.Marshal(r.Spec)
+		raw, _ := json.Marshal(r.Spec) // reads r.Spec: callers hold the store lock
+		cp.Spec = make(map[string]any, len(r.Spec))
 		_ = json.Unmarshal(raw, &cp.Spec)
 	}
 	return &cp
