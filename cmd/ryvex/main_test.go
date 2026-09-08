@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
@@ -305,6 +306,316 @@ func TestRunGetAPIErrorEnvelope(t *testing.T) {
 		t.Fatalf("code = %d, want 1", code)
 	}
 	want := "ryvex: resource not found (code=not_found, request_id=e3b0c44298fc)\n"
+	if errOut != want {
+		t.Fatalf("err = %q, want %q", errOut, want)
+	}
+}
+
+// ---- list: scope parsing and path building ----
+
+func TestParseScope(t *testing.T) {
+	cases := []struct {
+		in   string
+		want scope
+	}{
+		{"", scope{}},
+		{"acme", scope{org: "acme"}},
+		{"acme/core", scope{org: "acme", project: "core"}},
+		{"acme/core/prod", scope{org: "acme", project: "core", env: "prod"}},
+		{"acme/core/prod/Application", scope{org: "acme", project: "core", env: "prod", kind: "Application"}},
+	}
+	for _, c := range cases {
+		sc, err := parseScope(c.in)
+		if err != nil {
+			t.Fatalf("parseScope(%q): %v", c.in, err)
+		}
+		if sc != c.want {
+			t.Errorf("parseScope(%q) = %+v, want %+v", c.in, sc, c.want)
+		}
+	}
+	for _, in := range []string{"a/b/c/d/e", "acme/", "/core", "acme//prod", "acme/core/"} {
+		if sc, err := parseScope(in); err == nil {
+			t.Fatalf("parseScope(%q) = %+v, want error", in, sc)
+		}
+	}
+}
+
+func TestScopeListPathFilteredRoute(t *testing.T) {
+	// Coarser selectors use the filtered /v1/resources route, which
+	// carries real pagination; query values go through url.Values.
+	sc, err := parseScope("acme/core")
+	if err != nil {
+		t.Fatalf("parseScope: %v", err)
+	}
+	if got, want := sc.listPath(5, ""), "/v1/resources?limit=5&org=acme&project=core"; got != want {
+		t.Fatalf("listPath = %q, want %q", got, want)
+	}
+	if got, want := sc.listPath(50, "tok"), "/v1/resources?cursor=tok&limit=50&org=acme&project=core"; got != want {
+		t.Fatalf("listPath = %q, want %q", got, want)
+	}
+	if got, want := (scope{}).listPath(1, ""), "/v1/resources?limit=1"; got != want {
+		t.Fatalf("listPath = %q, want %q", got, want)
+	}
+}
+
+func TestScopeListPathScopeRouteEscapesSegments(t *testing.T) {
+	// A kind pins the 4-segment scope route; segments are escaped
+	// exactly like address.path().
+	sc, err := parseScope("acme/core/prod/Application")
+	if err != nil {
+		t.Fatalf("parseScope: %v", err)
+	}
+	if got, want := sc.listPath(7, "tok"), "/v1/acme/core/prod/Application?cursor=tok&limit=7"; got != want {
+		t.Fatalf("listPath = %q, want %q", got, want)
+	}
+	sc, err = parseScope("ac me/core/pr od/App lication")
+	if err != nil {
+		t.Fatalf("parseScope: %v", err)
+	}
+	if got, want := sc.listPath(50, ""), "/v1/ac%20me/core/pr%20od/App%20lication?limit=50"; got != want {
+		t.Fatalf("listPath = %q, want %q", got, want)
+	}
+}
+
+func TestRunListRejectsBadArgs(t *testing.T) {
+	for _, args := range [][]string{
+		{"list", "acme", "--limit", "0"},
+		{"list", "acme", "--limit", "201"},
+		{"list", "acme", "--limit", "-3"},
+		{"list", "a", "b"},
+		{"list", "a/b/c/d/e"},
+		{"list", "acme//core"},
+	} {
+		code, _, errOut := captureCLI(t, strings.NewReader(""), args...)
+		if code != 2 {
+			t.Fatalf("%v: code = %d, want 2 (err=%q)", args, code, errOut)
+		}
+	}
+}
+
+func TestRunListTableAndCursorHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[` +
+			`{"id":"r-1","kind":"Application","org":"acme","project":"core","env":"prod","name":"checkout","generation":3,"status":{"phase":"Ready"},"created_at":"2026-01-01T00:00:00Z"},` +
+			`{"id":"r-2","kind":"Database","org":"acme","project":"core","env":"prod","name":"orders","generation":1,"status":{"phase":"Pending"},"created_at":"2026-01-01T00:00:00Z"}` +
+			`],"next_cursor":"AA"}`))
+	}))
+	defer srv.Close()
+
+	code, out, errOut := captureCLI(t, strings.NewReader(""), "--api", srv.URL, "--token", "ryk_test", "list", "acme", "--limit", "2")
+	if code != 0 || errOut != "" {
+		t.Fatalf("code=%d err=%q", code, errOut)
+	}
+	for _, want := range []string{"ID", "KIND", "NAME", "ENV", "PHASE", "GEN", "AGE", "r-1", "Application", "checkout", "r-2", "Pending"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("list output %q missing %q", out, want)
+		}
+	}
+	if !strings.Contains(out, "\nnext_cursor: AA\n") {
+		t.Fatalf("list output %q missing next_cursor hint", out)
+	}
+
+	code, out, _ = captureCLI(t, strings.NewReader(""), "--api", srv.URL, "-o", "json", "list", "acme")
+	if code != 0 || !strings.Contains(out, `"next_cursor": "AA"`) || !strings.Contains(out, `"id": "r-1"`) {
+		t.Fatalf("json list: code=%d out=%q", code, out)
+	}
+}
+
+func TestRunListEmptyAndNoHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	code, out, errOut := captureCLI(t, strings.NewReader(""), "--api", srv.URL, "list", "acme")
+	if code != 0 || errOut != "" {
+		t.Fatalf("code=%d err=%q", code, errOut)
+	}
+	if want := "no resources\n"; out != want {
+		t.Fatalf("out = %q, want %q", out, want)
+	}
+}
+
+// ---- apply CAS (--generation) ----
+
+func TestCASRequestBuildsPathAndBody(t *testing.T) {
+	doc := []byte(`{"kind":"Application","org":"acme","project":"core","env":"prod","name":"check out",` +
+		`"spec":{"image":"c:1","replicas":4},"labels":{"team":"payments"},"note":"kept"}`)
+	path, body, err := casRequest(doc, 7)
+	if err != nil {
+		t.Fatalf("casRequest: %v", err)
+	}
+	if got, want := path, "/v1/acme/core/prod/Application/check%20out"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("body: %v", err)
+	}
+	if m["generation"] != float64(7) {
+		t.Fatalf("generation = %v, want 7", m["generation"])
+	}
+	spec, ok := m["spec"].(map[string]any)
+	if !ok || spec["image"] != "c:1" || spec["replicas"] != float64(4) {
+		t.Fatalf("spec not preserved: %v", m["spec"])
+	}
+	labels, ok := m["labels"].(map[string]any)
+	if !ok || labels["team"] != "payments" {
+		t.Fatalf("labels not preserved: %v", m["labels"])
+	}
+	if m["note"] != "kept" {
+		t.Fatalf("unknown fields must survive: %v", m)
+	}
+}
+
+func TestCASRequestRejectsMissingIdentity(t *testing.T) {
+	for _, doc := range []string{
+		`null`,
+		`[]`,
+		`{"kind":"Application","org":"acme","project":"core","env":"prod"}`,
+		`{"kind":"Application","org":"acme","project":"core","env":"prod","name":""}`,
+	} {
+		_, _, err := casRequest([]byte(doc), 1)
+		if err == nil {
+			t.Fatalf("casRequest(%q) = nil error, want usage error", doc)
+		}
+		var ue usageError
+		if !errors.As(err, &ue) {
+			t.Fatalf("casRequest(%q) error %T is not a usageError", doc, err)
+		}
+	}
+}
+
+func TestGenerationFromDetails(t *testing.T) {
+	if n, ok := generationFromDetails([]string{"current_generation=9"}); !ok || n != 9 {
+		t.Fatalf("got %d,%v want 9,true", n, ok)
+	}
+	if _, ok := generationFromDetails([]string{"other", "current_generation=bad"}); ok {
+		t.Fatal("malformed hint must not parse")
+	}
+	if _, ok := generationFromDetails(nil); ok {
+		t.Fatal("empty details must not parse")
+	}
+}
+
+func TestRunApplyCASUpsert(t *testing.T) {
+	t.Run("update returns 200", func(t *testing.T) {
+		var gotMethod, gotPath string
+		var gotBody []byte
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath = r.Method, r.URL.Path
+			gotBody, _ = io.ReadAll(r.Body)
+			_, _ = w.Write([]byte(`{"id":"r-1","kind":"Application","org":"acme","project":"core","env":"prod","name":"checkout","generation":2,"status":{"phase":"Ready"}}`))
+		}))
+		defer srv.Close()
+
+		doc := `{"kind":"Application","org":"acme","project":"core","env":"prod","name":"checkout","spec":{"image":"c:2"}}`
+		code, out, errOut := captureCLI(t, strings.NewReader(doc), "--api", srv.URL, "--token", "ryk_test", "apply", "--generation", "1", "-f", "-")
+		if code != 0 || errOut != "" {
+			t.Fatalf("code=%d err=%q", code, errOut)
+		}
+		if gotMethod != http.MethodPut {
+			t.Fatalf("method = %q, want PUT", gotMethod)
+		}
+		if gotPath != "/v1/acme/core/prod/Application/checkout" {
+			t.Fatalf("path = %q", gotPath)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(gotBody, &m); err != nil || m["generation"] != float64(1) {
+			t.Fatalf("CAS body = %s (err=%v)", gotBody, err)
+		}
+		if want := "updated r-1 (generation 2)\n"; out != want {
+			t.Fatalf("out = %q, want %q", out, want)
+		}
+	})
+
+	t.Run("create returns 201", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"r-9","kind":"Cache","org":"acme","project":"core","env":"prod","name":"sessions","generation":1}`))
+		}))
+		defer srv.Close()
+
+		doc := `{"kind":"Cache","org":"acme","project":"core","env":"prod","name":"sessions","spec":{"engine":"redis"}}`
+		code, out, errOut := captureCLI(t, strings.NewReader(doc), "--api", srv.URL, "--token", "ryk_test", "apply", "--generation", "1", "-f", "-")
+		if code != 0 || errOut != "" {
+			t.Fatalf("code=%d err=%q", code, errOut)
+		}
+		if want := "created r-9 (acme/core/prod/Cache/sessions)\n"; out != want {
+			t.Fatalf("out = %q, want %q", out, want)
+		}
+	})
+}
+
+func TestRunApplyCASConflictFetchesCurrentGeneration(t *testing.T) {
+	var gets int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"conflict","message":"generation conflict: resource was modified concurrently","request_id":"abc123","details":[]}}`))
+		case http.MethodGet:
+			gets++
+			_, _ = w.Write([]byte(`{"id":"r-1","kind":"Application","org":"acme","project":"core","env":"prod","name":"checkout","generation":5}`))
+		}
+	}))
+	defer srv.Close()
+
+	doc := `{"kind":"Application","org":"acme","project":"core","env":"prod","name":"checkout","spec":{"image":"c:2"}}`
+	code, _, errOut := captureCLI(t, strings.NewReader(doc), "--api", srv.URL, "--token", "ryk_test", "apply", "--generation", "2", "-f", "-")
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if gets != 1 {
+		t.Fatalf("conflict must re-read the resource once, got %d GETs", gets)
+	}
+	want := "ryvex: generation conflict: resource is at generation 5, not 2; re-fetch and retry with --generation 5 (code=conflict, request_id=abc123)\n"
+	if errOut != want {
+		t.Fatalf("err = %q, want %q", errOut, want)
+	}
+}
+
+func TestRunApplyCASConflictUsesDetailsHint(t *testing.T) {
+	// When the envelope carries a current_generation detail the CLI
+	// must not spend a round trip re-reading the resource.
+	var gets int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			gets++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"conflict","message":"generation conflict: resource was modified concurrently","request_id":"xyz","details":["current_generation=9"]}}`))
+	}))
+	defer srv.Close()
+
+	doc := `{"kind":"Application","org":"acme","project":"core","env":"prod","name":"checkout","spec":{"image":"c:2"}}`
+	code, _, errOut := captureCLI(t, strings.NewReader(doc), "--api", srv.URL, "--token", "ryk_test", "apply", "--generation", "4", "-f", "-")
+	if code != 1 || gets != 0 {
+		t.Fatalf("code=%d gets=%d, want 1 and 0", code, gets)
+	}
+	if !strings.Contains(errOut, "resource is at generation 9, not 4") || !strings.Contains(errOut, "(code=conflict, request_id=xyz)") {
+		t.Fatalf("err = %q", errOut)
+	}
+}
+
+func TestRunApplyCASConflictUnreadableResourceKeepsEnvelope(t *testing.T) {
+	// If the follow-up GET also fails, the original 409 envelope is
+	// surfaced unchanged rather than swallowed.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"conflict","message":"generation conflict: resource was modified concurrently","request_id":"abc123","details":[]}}`))
+	}))
+	defer srv.Close()
+
+	doc := `{"kind":"Application","org":"acme","project":"core","env":"prod","name":"checkout","spec":{"image":"c:2"}}`
+	code, _, errOut := captureCLI(t, strings.NewReader(doc), "--api", srv.URL, "--token", "ryk_test", "apply", "--generation", "2", "-f", "-")
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	want := "ryvex: generation conflict: resource was modified concurrently (code=conflict, request_id=abc123)\n"
 	if errOut != want {
 		t.Fatalf("err = %q, want %q", errOut, want)
 	}

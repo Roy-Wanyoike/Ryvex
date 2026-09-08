@@ -36,6 +36,7 @@ type ApiError struct {
 	Code      string
 	Message   string
 	RequestID string
+	Details   []string
 }
 
 func (e *ApiError) Error() string {
@@ -61,6 +62,15 @@ type errorEnvelope struct {
 // responses are decoded into *ApiError; transport failures surface as
 // the underlying net/http error.
 func (c *Client) Do(method, path string, body []byte) ([]byte, error) {
+	_, raw, err := c.DoStatus(method, path, body)
+	return raw, err
+}
+
+// DoStatus is Do plus the response status code, which the CAS upsert
+// needs to tell a 201 create from a 200 update. Non-2xx responses are
+// decoded into *ApiError exactly like Do; transport failures surface
+// as the underlying net/http error.
+func (c *Client) DoStatus(method, path string, body []byte) (int, []byte, error) {
 	endpoint := strings.TrimRight(c.Base, "/") + path
 	var payload io.Reader
 	if body != nil {
@@ -68,7 +78,7 @@ func (c *Client) Do(method, path string, body []byte) ([]byte, error) {
 	}
 	req, err := http.NewRequest(method, endpoint, payload)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -83,17 +93,17 @@ func (c *Client) Do(method, path string, body []byte) ([]byte, error) {
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, err
+		return resp.StatusCode, nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, decodeApiError(resp.StatusCode, raw)
+		return resp.StatusCode, nil, decodeApiError(resp.StatusCode, raw)
 	}
-	return raw, nil
+	return resp.StatusCode, raw, nil
 }
 
 // decodeApiError parses the frozen error envelope; a non-envelope
@@ -107,6 +117,7 @@ func decodeApiError(status int, raw []byte) error {
 			Code:      env.Error.Code,
 			Message:   env.Error.Message,
 			RequestID: env.Error.RequestID,
+			Details:   env.Error.Details,
 		}
 	}
 	return &ApiError{
@@ -154,6 +165,15 @@ type resourceDoc struct {
 // address is the logical scope address of the resource.
 func (r resourceDoc) address() string {
 	return strings.Join([]string{r.Org, r.Project, r.Env, r.Kind, r.Name}, "/")
+}
+
+// listPage is the wire shape of the list endpoints (the filtered
+// /v1/resources route and the 4-segment scope route): a page of
+// resource documents plus the opaque resume token, "" when this was
+// the last page.
+type listPage struct {
+	Items      []resourceDoc `json:"items"`
+	NextCursor string        `json:"next_cursor"`
 }
 
 // eventsPage is the wire shape of GET /v1/{org}/events.

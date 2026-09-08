@@ -36,7 +36,9 @@ Usage:
   ryvex [global flags] <command> [args]
 
 Commands:
-  apply        create a resource from a JSON file (POST /v1/resources)
+  apply        create a resource from a JSON file (POST /v1/resources),
+               or CAS-upsert it at its scope address (--generation, PUT)
+  list         list resources by scope: [org[/project/env[/kind]]]
   get          fetch a resource by <id> or <org>/<project>/<env>/<kind>/<name>
   delete       delete a resource by <id> or scope address
   events       recent bus events for an org
@@ -51,6 +53,9 @@ Global flags (before the command):
 
 Command flags:
   apply -f file            resource JSON file, or - for stdin
+  apply --generation n     CAS upsert: PUT at the doc's scope address, 409 if stale
+  list [org[/project/env[/kind]]]
+                           --limit n (default 50, max 200), --cursor tok
   events <org>             --limit n (default: server default)
   audit <org>              --limit n, --kind k
   reconcile <org> <id>     trigger an immediate reconcile
@@ -60,6 +65,9 @@ Examples:
   ryvex --api http://127.0.0.1:18202 --token ryk_local_dev apply -f app.json
   ryvex --token ryk_local_dev get acme/core/prod/Application/checkout
   ryvex --token ryk_local_dev -o json get r-00b52b6eb859f432
+  ryvex list acme/core
+  ryvex list acme/core/prod/applications --limit 100
+  ryvex --token ryk_local_dev apply --generation 2 -f app.json
   ryvex events acme --limit 10
 
 Exit codes:
@@ -125,6 +133,7 @@ func run(args []string) int {
 
 	commands := map[string]func(io.Writer, globals, []string) error{
 		"apply":     runApply,
+		"list":      runList,
 		"get":       runGet,
 		"delete":    runDelete,
 		"events":    runEvents,
