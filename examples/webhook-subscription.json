@@ -1,0 +1,19 @@
+{
+  "kind": "Subscription",
+  "org": "acme",
+  "project": "core",
+  "env": "prod",
+  "name": "release-notifications",
+  "labels": {
+    "managed-by": "ryvex"
+  },
+  "spec": {
+    "url": "https://hooks.example.test/ryvex",
+    "subjects": [
+      "ryvex.resource.acme.>",
+      "ryvex.resource.acme.*.created"
+    ],
+    "active": true,
+    "max_retries": 5
+  }
+}

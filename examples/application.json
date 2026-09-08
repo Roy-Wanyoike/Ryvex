@@ -1,0 +1,16 @@
+{
+  "kind": "Application",
+  "org": "acme",
+  "project": "core",
+  "env": "prod",
+  "name": "checkout",
+  "labels": {
+    "managed-by": "ryvex",
+    "team": "payments"
+  },
+  "spec": {
+    "image": "registry.acme.io/checkout:1.42.0",
+    "replicas": 4,
+    "port": 8080
+  }
+}
