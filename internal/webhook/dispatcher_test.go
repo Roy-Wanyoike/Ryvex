@@ -293,6 +293,11 @@ func TestRetryThenSuccessAuditsAttempts(t *testing.T) {
 
 	publishCreated(b, "acme", "payments")
 	waitUntil(t, "3 delivery attempts", 5*time.Second, func() bool { return calls.Load() == 3 })
+	// Issue #65: the dispatcher writes the "delivered" audit entry after
+	// the third response is classified, which can lag the call landing
+	// at the mock server (deterministic failure under -race). Wait for
+	// the audit trail itself instead of asserting it racing the write.
+	waitUntil(t, "3 audit entries", 5*time.Second, func() bool { return len(webhookAudit(st)) == 3 })
 
 	entries := webhookAudit(st)
 	if len(entries) != 3 {
