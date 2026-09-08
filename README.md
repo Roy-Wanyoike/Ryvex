@@ -70,6 +70,34 @@ curl -s localhost:8080/v1/acme/core/prod/applications/payments \
 cd console && bun install && bun run dev   # → http://localhost:3100
 ```
 
+### Durable quickstart (Postgres state)
+
+State that survives restarts — bring up Postgres and point `ryvexd` at
+it (`docker-compose.yml` ships with matching credentials). Static
+`--api-keys` are bootstrapped as admin keys, so no dev-auth is needed
+here (and `--dev-auth` + a durable backend is refused at boot unless
+you set `RYVEX_ALLOW_DEV_AUTH=1` — the guard keeps dev credentials
+from accidentally meeting persistent state):
+
+```bash
+docker compose up -d
+
+ryvexd serve --http :8080 --seed --store postgres \
+  --api-keys ops=ryk_local_dev \
+  --dsn postgres://postgres:postgres@127.0.0.1:5432/ryvex?sslmode=disable
+
+curl -s localhost:8080/healthz -H "Authorization: Bearer ryk_local_dev"
+```
+
+(Run with `go run ./cmd/ryvexd serve …` like the basic quickstart, or
+build the binary once with `go build -o ryvexd ./cmd/ryvexd`.)
+
+The schema migrates itself on boot (embedded, transactional, recorded
+in `schema_migrations`). Env equivalent:
+`RYVEX_DATABASE_URL=postgres://… ryvexd serve --store postgres ...`.
+See [`docs/architecture.md`](docs/architecture.md) for the full
+flag/env reference.
+
 ## Architecture
 
 ```
@@ -94,26 +122,41 @@ cd console && bun install && bun run dev   # → http://localhost:3100
                      └───────────────────────────────┘
 ```
 
-One Go binary, four components, clean interfaces. `state.Store` and
-`bus.Bus` are contracts — in-memory today, Postgres/NATS tomorrow,
-without touching the API or reconciler. Full write-up in
+One Go binary, four components, clean interfaces. `state.Backend` and
+`bus.BusI` are contracts — in-memory by default, with durable backends
+shipped and parity-tested: **Postgres for state**, **NATS JetStream
+for events** — without touching the API or reconciler. Full write-up in
 [`docs/architecture.md`](docs/architecture.md).
 
 ## Feature highlights
 
-- **Declarative resource model** — 12 kinds, schema-validated,
+- **Declarative resource model** — 13 kinds, schema-validated,
   generation-tracked, `spec`/`status` separation
 - **Compare-and-swap concurrency** — optimistic locking via
   `generation`, `409 conflict` on stale writers
 - **Continuous reconciliation** — scan loop + manual triggers, bounded
   worker pool, observed-generation stamping
+- **Durable backends** — Postgres state store (embedded, transactional
+  migrations) and NATS JetStream event bus, both parity-tested against
+  their in-memory twins
 - **Immutable audit trail** — who changed what, when, and why
 - **Real-time event bus** — subject-based pub/sub with wildcard
-  matching and a replay ring
-- **Production-grade REST API** — bearer auth, request IDs, frozen
+  matching: in-memory replay ring or durable JetStream replay with a
+  sequence cursor (`?from=` / `last_seq`)
+- **Org/project-scoped RBAC** — managed `ryk_` keys minted, updated
+  and revoked over `/v1/keys`
+- **Signed webhook subscriptions** — retried, audited deliveries with
+  an SSRF egress guard (`RYVEX_ALLOW_PRIVATE_WEBHOOKS=1` opt-in)
+- **Production-grade REST API** — bearer auth + RBAC, request IDs,
+  security headers, server timeouts, 1 MiB body cap (`413`), frozen
   error envelope, pagination, CORS, graceful shutdown
-- **Real-time web console** — five views, live and demo modes,
-  dark control-room aesthetic
+- **Prometheus metrics** — dependency-free exposition sidecar
+- **Operator tooling** — `ryvex` CLI (apply with CAS, list, get,
+  delete, events, audit, reconcile, health), TypeScript + Python SDKs,
+  Rust data-plane node agent
+- **Real-time web console** — five views plus settings, read + write
+  with CAS-aware saves, live and demo modes, dark control-room
+  aesthetic
 
 ## The console
 
@@ -123,15 +166,18 @@ without touching the API or reconciler. Full write-up in
 
 The console talks to `ryvexd` over the same public REST API everything
 else uses — 15s refresh loop, bearer `ryk_` auth, and a demo snapshot
-mode so it renders beautifully even with no daemon running.
+mode so it renders beautifully even with no daemon running. It reads
+and writes: the resource drawer edits specs and labels with CAS-aware
+saves (a stale `generation` comes back as `409` with an inline
+reload), and resources can be deleted.
 
 ## Project layout
 
 ```
 Ryvex/
 ├── cmd/
-│   ├── ryvexd/          # control plane daemon (serve, seed)
-│   └── ryvex/           # operator CLI (apply/get/events/audit/…)
+│   ├── ryvexd/          # control plane daemon (serve)
+│   └── ryvex/           # operator CLI (apply/list/get/delete/events/audit/…)
 ├── internal/
 │   ├── state/           # resource model, validation, store backends (memory + Postgres), audit
 │   ├── bus/             # event buses (in-memory + NATS JetStream)
@@ -162,7 +208,7 @@ go build ./... && go vet ./... && go test ./...   # control plane + CLI + SDKs' 
 RYVEX_TEST_PG_DSN=… go test ./internal/state/...  # Postgres parity suite vs live PG
 RYVEX_TEST_NATS_URL=… go test ./internal/bus/...  # NATS JetStream parity suite
 cd console && bun run build                        # console: lint + types + build
-cd sdk/ryvex-ts && bun test                        # TS SDK suite (28 unit + live integration)
+cd sdk/ryvex-ts && bun test                        # TS SDK suite (unit + live integration)
 cd sdk/ryvex-py && pytest                          # Python SDK suite (50 unit + live integration)
 cd agent/ryvex-agent && cargo test                 # Rust agent suite + clippy -D warnings
 ```
@@ -174,10 +220,14 @@ merge only when built, tested, and verified end-to-end.
 ## Roadmap
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the living, issue-linked
-map. Highlights on deck: **TypeScript / Python / Go SDKs**, the
-**`ryvex` CLI**, **webhook subscriptions**, **durable Postgres state**
-and **NATS event streaming**, real **controllers**, **RBAC**, and a
-**Rust data-plane agent**.
+map. **Shipped:** TypeScript & Python SDKs, the `ryvex` CLI (with
+pagination and CAS apply), signed webhook subscriptions with an SSRF
+egress guard, durable **Postgres** state and **NATS JetStream** event
+streaming, org/project-scoped **RBAC** with managed keys, a Prometheus
+metrics sidecar, and a Rust data-plane agent. **Next up:** a
+server-side agent-heartbeat endpoint, key rotation UX, a real
+deployment controller, and agent-side drift detection — with a Go SDK
+further out.
 
 ## License
 
