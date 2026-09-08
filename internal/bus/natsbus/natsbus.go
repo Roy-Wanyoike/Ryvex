@@ -160,8 +160,11 @@ func ensureStream(js nats.JetStreamContext, opts Options) error {
 
 // Publish marshals the event to JSON and publishes it on its subject.
 // The JetStream publish waits for the server ack (persisted) before
-// returning; failures are logged and counted against delivery, never
-// panic — Publish keeps the bus.BusI signature of the memory bus.
+// returning, and only that confirmed success advances the
+// ryvex_bus_events_published_total counter (issue #40) — failed
+// publishes must not pollute publish-rate alerting or SLOs. Failures
+// are logged and never panic — Publish keeps the bus.BusI signature
+// of the memory bus.
 func (b *Bus) Publish(e bus.Event) {
 	if e.Subject == "" {
 		e.Subject = bus.Subject(e.Org, e.Kind, e.Type)
@@ -172,7 +175,6 @@ func (b *Bus) Publish(e bus.Event) {
 	if e.ID == "" {
 		e.ID = fmt.Sprintf("evt-%d", b.seq.Add(1))
 	}
-	metrics.BusEventsPublishedTotal.WithLabelValues(eventTypeLabel(e.Type)).Inc()
 
 	data, err := json.Marshal(e)
 	if err != nil {
@@ -180,8 +182,14 @@ func (b *Bus) Publish(e bus.Event) {
 		return
 	}
 	if _, err := b.js.Publish(e.Subject, data, nats.AckWait(publishTimeout)); err != nil {
+		// Nothing was persisted, so the published counter must not
+		// move. No publish-failure instrument exists in
+		// internal/metrics yet; the error log below is the failure
+		// signal until one is added (gap noted on issue #40).
 		b.log.Error("natsbus: publish failed", "subject", e.Subject, "err", err)
+		return
 	}
+	metrics.BusEventsPublishedTotal.WithLabelValues(eventTypeLabel(e.Type)).Inc()
 }
 
 // eventTypeLabel bounds metric cardinality for typeless events.

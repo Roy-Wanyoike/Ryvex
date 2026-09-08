@@ -1,14 +1,22 @@
 package natsbus
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
+
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus/bustest"
+	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 )
 
 // testURL returns the live nats-server URL or skips. The full parity
@@ -193,5 +201,73 @@ func TestRecentFromSemantics(t *testing.T) {
 	}
 	if seq != last { // the globex publish is newer but filtered out
 		t.Fatalf("acme last_seq = %d, want %d (filtered events must not move the cursor)", seq, last)
+	}
+}
+
+// stubJS stands in for nats.JetStreamContext in Publish-path unit
+// tests. Only Publish is wired up; the embedded nil interface makes
+// any other JetStream call panic loudly instead of silently passing,
+// so a test fails fast if natsbus ever uses an unstubbed method.
+type stubJS struct {
+	nats.JetStreamContext
+	pub func(subject string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error)
+}
+
+func (s *stubJS) Publish(subject string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
+	return s.pub(subject, data, opts...)
+}
+
+// TestPublishMetricCountsOnlyConfirmedSuccess pins issue #40: the
+// ryvex_bus_events_published_total counter advances only after the
+// JetStream publish is acknowledged by the server. A failed publish
+// must leave the counter untouched (the metric feeds publish-rate
+// alerting and SLOs) and must surface in the error log.
+func TestPublishMetricCountsOnlyConfirmedSuccess(t *testing.T) {
+	label := eventTypeLabel(bus.EventCreated)
+	published := metrics.BusEventsPublishedTotal.WithLabelValues(label)
+	before := published.Value()
+
+	// Success path: server acks -> counter increments exactly once.
+	var gotSubject string
+	var gotData []byte
+	okBus := &Bus{
+		js: &stubJS{pub: func(subject string, data []byte, _ ...nats.PubOpt) (*nats.PubAck, error) {
+			gotSubject, gotData = subject, data
+			return &nats.PubAck{Stream: StreamName, Sequence: 1}, nil
+		}},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	okBus.Publish(bus.Event{Org: "acme", Kind: "Node", Type: bus.EventCreated, Name: "n1"})
+
+	if want := before + 1; published.Value() != want {
+		t.Fatalf("after acked publish, ryvex_bus_events_published_total{type=%q} = %v, want %v", label, published.Value(), want)
+	}
+	if want := bus.Subject("acme", "Node", bus.EventCreated); gotSubject != want {
+		t.Fatalf("published subject = %q, want %q", gotSubject, want)
+	}
+	if len(gotData) == 0 {
+		t.Fatal("published payload is empty")
+	}
+
+	// Failure path: server refuses the publish -> counter unchanged,
+	// failure logged (the only failure signal until internal/metrics
+	// grows a publish-failure instrument).
+	var logBuf bytes.Buffer
+	failBus := &Bus{
+		js: &stubJS{pub: func(string, []byte, ...nats.PubOpt) (*nats.PubAck, error) {
+			return nil, errors.New("nats: no responders")
+		}},
+		log: slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+	failBus.Publish(bus.Event{Org: "acme", Kind: "Node", Type: bus.EventCreated, Name: "n2"})
+
+	if want := before + 1; published.Value() != want {
+		t.Fatalf("failed publish moved ryvex_bus_events_published_total{type=%q}: %v, want %v", label, published.Value(), want)
+	}
+	logs := logBuf.String()
+	for _, want := range []string{"natsbus: publish failed", "subject=", "nats: no responders"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("failed-publish log missing %q; got:\n%s", want, logs)
+		}
 	}
 }
