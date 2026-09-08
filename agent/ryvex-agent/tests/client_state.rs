@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 use ryvex_agent::client::{next_last_seen, ApiClient, Outcome};
 use ryvex_agent::config::Config;
 
+use clap::Parser as _; // trait required for Config::try_parse_from (review fix)
+
 const NODE_PATH: &str = "/v1/acme/core/prod/nodes/mock-node";
 
 // ---- mock server ----
