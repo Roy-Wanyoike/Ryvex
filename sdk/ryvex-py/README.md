@@ -107,13 +107,16 @@ envelope `{"error":{code,message,request_id,details}}`. If the body
 isn't the envelope (proxy HTML, empty body), the code is inferred from
 the HTTP status so you can always branch on it. Transport failures
 (DNS, refused connections, timeouts) raise the same type with
-`status = 0` — one error type to catch everywhere.
+`status = 0` — one error type to catch everywhere. `transport_error`
+is the cross-SDK standard: the TypeScript SDK aligned to the same code
+(also with `status: 0`) in v0.2.0.
 
 | HTTP | `err.code`             |
 | ---- | ---------------------- |
 | 0 (transport) | `transport_error` |
 | 400  | `validation_failed` / `bad_request` |
 | 401  | `unauthorized`         |
+| 403  | `forbidden`            |
 | 404  | `not_found`            |
 | 405  | `method_not_allowed`   |
 | 409  | `already_exists` / `conflict` |

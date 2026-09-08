@@ -11,7 +11,9 @@ plain text), the error still constructs with a code inferred from the
 HTTP status, so callers can always branch on ``code`` / ``status``.
 Transport-level failures (DNS, connection refused, timeout) raise the
 same type with ``status=0`` and ``code="transport_error"`` — one error
-type to catch everywhere.
+type to catch everywhere. ``transport_error`` is the cross-SDK
+standard: the TypeScript SDK aligned to the same code (also with
+``status=0``) in v0.2.0.
 """
 
 from __future__ import annotations
@@ -22,6 +24,9 @@ from typing import Any, Union
 __all__ = ["DEFAULT_CODE_BY_STATUS", "TRANSPORT_ERROR", "RyvexError"]
 
 #: Code used for transport-level failures (no HTTP status involved).
+#: Cross-SDK standard: the TypeScript SDK (sdk/ryvex-ts) normalized its
+#: transport failures to this same code (with ``status=0``) in v0.2.0 —
+#: keep both SDKs in lockstep when touching this value.
 TRANSPORT_ERROR = "transport_error"
 
 #: Default error code for a given HTTP status, used when the response
@@ -29,6 +34,7 @@ TRANSPORT_ERROR = "transport_error"
 DEFAULT_CODE_BY_STATUS: dict[int, str] = {
     400: "bad_request",
     401: "unauthorized",
+    403: "forbidden",
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
@@ -40,6 +46,7 @@ def _fallback_message(status: int) -> str:
     return {
         400: "bad request",
         401: "unauthorized: missing or invalid bearer token",
+        403: "forbidden: token lacks permission for this operation",
         404: "not found",
         405: "method not allowed",
         409: "conflict",
