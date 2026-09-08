@@ -14,6 +14,7 @@ import (
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/api"
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
+	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 	"github.com/Roy-Wanyoike/Ryvex/internal/reconcile"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
 	"github.com/Roy-Wanyoike/Ryvex/internal/webhook"
@@ -32,6 +33,8 @@ func runServe(args []string) error {
 	apiKeys := fs.String("api-keys", envOr("RYVEX_API_KEYS", ""), "static API keys as name=token,comma-separated")
 	corsOrigins := fs.String("cors-origins", envOr("RYVEX_CORS_ORIGINS", ""), "browser origins allowed to call the API, comma-separated")
 	seed := fs.Bool("seed", false, "load the demo dataset on boot")
+	// Metrics sidecar (issue #17): empty disables the endpoint.
+	metricsAddr := fs.String("metrics-addr", envOr("RYVEX_METRICS_ADDR", ""), "dedicated listen address for /metrics and /healthz passthrough (empty disables metrics)")
 	logLevel := fs.String("log-level", "info", "log level")
 	// --- webhooks (issue #13): signing-secret flag ---
 	webhookSecret := fs.String("webhook-secret", envOr("RYVEX_WEBHOOK_SECRET", ""), "HMAC key material for webhook signatures (random per boot when unset)")
@@ -110,6 +113,33 @@ func runServe(args []string) error {
 		log.Info("demo dataset loaded", "resources", n)
 	}
 
+	// ---- metrics sidecar (issue #17) ----
+	// A tiny separate server on --metrics-addr exposing /metrics (the
+	// default Prometheus registry in text exposition format v0.0.4)
+	// plus a status-only /healthz passthrough. It never touches the
+	// main mux; bind failures are logged and non-fatal.
+	var metricsSrv *http.Server
+	if *metricsAddr != "" {
+		mmux := http.NewServeMux()
+		mmux.Handle("/metrics", metrics.Handler())
+		mmux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		})
+		metricsSrv = &http.Server{
+			Addr:              *metricsAddr,
+			Handler:           mmux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			log.Info("metrics endpoint listening", "addr", *metricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("metrics endpoint failed", "err", err)
+			}
+		}()
+	}
+	// ---- end metrics sidecar ----
+
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("ryvexd listening", "addr", *httpAddr, "version", Version, "dev_auth", *devAuth)
@@ -128,6 +158,9 @@ func runServe(args []string) error {
 	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shCtx)
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shCtx) // metrics sidecar shuts down alongside the main server
+	}
 	recCancel()
 	reconciler.Stop(3 * time.Second)
 	dispatcher.Stop(3 * time.Second) // --- webhooks (issue #13) ---
