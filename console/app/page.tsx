@@ -1,11 +1,21 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { apiMode, fetchAudit, fetchEvents, fetchResources } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
+import {
+  fetchAudit,
+  fetchEvents,
+  fetchResources,
+  getApiBase,
+  getApiMode,
+  hydrateApiFromStorage,
+} from "@/lib/api";
 import type { AuditEntry, Resource, RyvexEvent } from "@/lib/types";
+import { ResourceDrawer } from "@/components/drawer";
+import { SettingsView } from "@/components/settings";
+import { Toasts } from "@/components/toasts";
 import { AuditView, EventsView, OverviewView, ResourcesView, TopologyView } from "@/components/views";
 
-type ViewKey = "overview" | "resources" | "topology" | "events" | "audit";
+type ViewKey = "overview" | "resources" | "topology" | "events" | "audit" | "settings";
 
 const NAV: { key: ViewKey; label: string; glyph: string }[] = [
   { key: "overview", label: "Overview", glyph: "◱" },
@@ -13,6 +23,7 @@ const NAV: { key: ViewKey; label: string; glyph: string }[] = [
   { key: "topology", label: "Topology", glyph: "◈" },
   { key: "events", label: "Events", glyph: "⚡" },
   { key: "audit", label: "Audit", glyph: "☰" },
+  { key: "settings", label: "Settings", glyph: "⚙" },
 ];
 
 export default function Home() {
@@ -21,24 +32,32 @@ export default function Home() {
   const [events, setEvents] = useState<RyvexEvent[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [selected, setSelected] = useState<Resource | null>(null);
+  const [conn, setConn] = useState<{ mode: "live" | "demo"; base: string }>({ mode: "demo", base: "" });
+  // Bumping this re-hydrates runtime config from localStorage and reloads data.
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const loadAll = useCallback(async () => {
+    const [res, evs, aud] = await Promise.all([fetchResources(), fetchEvents(), fetchAudit()]);
+    setResources(res.items ?? []);
+    setEvents(evs.events ?? []);
+    setAudit(aud.entries ?? []);
+    setLoaded(true);
+  }, []);
 
   useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      const [res, evs, aud] = await Promise.all([fetchResources(), fetchEvents(), fetchAudit()]);
-      if (!alive) return;
-      setResources(res.items ?? []);
-      setEvents(evs.events ?? []);
-      setAudit(aud.entries ?? []);
-      setLoaded(true);
-    };
-    load();
-    const t = setInterval(load, 15_000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, []);
+    hydrateApiFromStorage();
+    setConn({ mode: getApiMode(), base: getApiBase() });
+    void loadAll();
+    const t = setInterval(() => void loadAll(), 15_000);
+    return () => clearInterval(t);
+  }, [reloadKey, loadAll]);
+
+  const handleConfigChange = () => setReloadKey((k) => k + 1);
+
+  const handleMutated = () => {
+    void loadAll();
+  };
 
   return (
     <div className="grid-bg min-h-screen lg:grid lg:grid-cols-[240px_1fr]">
@@ -72,15 +91,15 @@ export default function Home() {
         <div className="mt-auto hidden pt-6 lg:block">
           <div className="rounded-xl border border-[var(--line)] bg-[var(--panel-2)] p-3 text-xs text-[var(--muted)]">
             <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 rounded-full ${apiMode === "live" ? "bg-emerald-400" : "bg-amber-400"}`} />
+              <span className={`h-2 w-2 rounded-full ${conn.mode === "live" ? "bg-emerald-400" : "bg-amber-400"}`} />
               <span className="font-semibold text-[var(--text)]">
-                {apiMode === "live" ? "Live control plane" : "Demo snapshot"}
+                {conn.mode === "live" ? "Live control plane" : "Demo snapshot"}
               </span>
             </div>
             <p className="mt-1.5 leading-relaxed">
-              {apiMode === "live"
-                ? `Connected to ${process.env.NEXT_PUBLIC_RYVEX_API}`
-                : "Set NEXT_PUBLIC_RYVEX_API to connect a running ryvexd."}
+              {conn.mode === "live"
+                ? `Connected to ${conn.base}`
+                : "Connect a control plane in Settings."}
             </p>
           </div>
         </div>
@@ -96,6 +115,17 @@ export default function Home() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            <span
+              className={`chip ${
+                conn.mode === "live"
+                  ? "border-emerald-400/40 text-emerald-300"
+                  : "border-amber-400/40 text-amber-300"
+              }`}
+              title={conn.mode === "live" ? conn.base : "Demo mode — configure an API base in Settings"}
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+              {conn.mode === "live" ? `Live · ${conn.base}` : "Demo mode"}
+            </span>
             <span className="chip">v1.0.0</span>
             <span className="chip border-[var(--violet)]/40 text-[var(--violet)]">ryvexd</span>
           </div>
@@ -108,13 +138,26 @@ export default function Home() {
         ) : (
           <>
             {view === "overview" && <OverviewView resources={resources} events={events} />}
-            {view === "resources" && <ResourcesView resources={resources} />}
+            {view === "resources" && <ResourcesView resources={resources} onOpen={setSelected} />}
             {view === "topology" && <TopologyView resources={resources} />}
             {view === "events" && <EventsView events={events} />}
             {view === "audit" && <AuditView entries={audit} />}
+            {view === "settings" && <SettingsView onConfigChange={handleConfigChange} />}
           </>
         )}
       </main>
+
+      {/* resource detail drawer */}
+      {selected ? (
+        <ResourceDrawer
+          key={selected.id}
+          resource={selected}
+          onClose={() => setSelected(null)}
+          onMutated={handleMutated}
+        />
+      ) : null}
+
+      <Toasts />
     </div>
   );
 }
