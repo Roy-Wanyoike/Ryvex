@@ -1,0 +1,40 @@
+# Dependabot: one entry per real package manifest in this repository.
+# Weekly cadence across all ecosystems.
+version: 2
+updates:
+  # Go control plane + CLI (root go.mod)
+  - package-ecosystem: "go_modules"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Web console
+  - package-ecosystem: "npm"
+    directory: "/console"
+    schedule:
+      interval: "weekly"
+
+  # TypeScript SDK
+  - package-ecosystem: "npm"
+    directory: "/sdk/ryvex-ts"
+    schedule:
+      interval: "weekly"
+
+  # Python SDK (pytest dev dependency)
+  - package-ecosystem: "pip"
+    directory: "/sdk/ryvex-py"
+    schedule:
+      interval: "weekly"
+
+  # Rust node agent
+  - package-ecosystem: "cargo"
+    directory: "/agent/ryvex-agent"
+    schedule:
+      interval: "weekly"
+
+  # GitHub Actions (once CI workflows land — they are owned by a
+  # separate track; Dependabot will simply have nothing to scan until then)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

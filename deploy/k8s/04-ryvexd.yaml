@@ -1,0 +1,126 @@
+# ryvexd control plane: Deployment + Service.
+#
+# - Probes hit /healthz (unauthenticated per docs/api-contracts.md).
+# - State: --store postgres, DSN assembled from the postgres credentials in
+#   ryvexd-secret (RYVEX_DATABASE_URL references $(POSTGRES_PASSWORD), which
+#   Kubernetes expands from the env entry defined above it).
+# - Bus: memory by default. To move to durable JetStream replay add
+#   "--bus", "nats" to args and deploy a NATS service reachable at the
+#   RYVEX_NATS_URL from 02-ryvexd-configmap.yaml.
+# - Image: built from this repository (container packaging is owned by the
+#   SRE track). Adjust the tag to match your registry.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ryvexd
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: ryvexd
+    app.kubernetes.io/part-of: ryvex
+spec:
+  # One control-plane replica today; HA/federation is on the roadmap.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ryvexd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ryvexd
+        app.kubernetes.io/part-of: ryvex
+    spec:
+      containers:
+        - name: ryvexd
+          image: ghcr.io/roy-wanyoike/ryvexd:v1.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--store", "postgres"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: RYVEX_HTTP_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvexd-config
+                  key: RYVEX_HTTP_ADDR
+            - name: RYVEX_METRICS_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvexd-config
+                  key: RYVEX_METRICS_ADDR
+            - name: RYVEX_CORS_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvexd-config
+                  key: RYVEX_CORS_ORIGINS
+            - name: RYVEX_NATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvexd-config
+                  key: RYVEX_NATS_URL
+            - name: RYVEX_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: ryvexd-secret
+                  key: api-keys
+            - name: RYVEX_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ryvexd-secret
+                  key: webhook-secret
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ryvexd-secret
+                  key: postgres-password
+            - name: RYVEX_DATABASE_URL
+              value: "postgres://ryvex:$(POSTGRES_PASSWORD)@ryvex-postgres.ryvex.svc.cluster.local:5432/ryvex?sslmode=disable"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ryvexd
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: ryvexd
+    app.kubernetes.io/part-of: ryvex
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ryvexd
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: metrics
+      port: 9090
+      targetPort: metrics

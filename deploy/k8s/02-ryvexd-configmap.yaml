@@ -1,0 +1,23 @@
+# Non-secret ryvexd configuration (plain flags/env). Secrets live in
+# 03-ryvexd-secret.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ryvexd-config
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: ryvexd
+    app.kubernetes.io/part-of: ryvex
+data:
+  # API + health endpoints.
+  RYVEX_HTTP_ADDR: ":8080"
+  # Prometheus metrics sidecar (/metrics + /healthz passthrough).
+  # Empty string would disable it.
+  RYVEX_METRICS_ADDR: ":9090"
+  # Browser origins allowed by CORS. Point this at wherever the console
+  # is served from (see console/lib/api.ts for how the console resolves
+  # its API base).
+  RYVEX_CORS_ORIGINS: "http://localhost:3100"
+  # Used only when the container args add "--bus", "nats" (JetStream).
+  # Memory bus is the default and requires no extra service.
+  RYVEX_NATS_URL: "nats://nats.ryvex.svc.cluster.local:4222"

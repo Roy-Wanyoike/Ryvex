@@ -10,10 +10,13 @@
 /.toolchain/
 
 # Node / Next.js
+# The console is bun-first: bun is the mandated console toolchain (bun
+# install / bun run build), so console/bun.lock IS tracked — this is an
+# application repo and builds are pinned. npm is not used for the
+# console; package-lock.json stays ignored.
 node_modules/
 .next/
 out/
-bun.lock
 package-lock.json
 
 # Environment & secrets

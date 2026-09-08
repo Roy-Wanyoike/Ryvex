@@ -1,0 +1,93 @@
+# Durable state backend for ryvexd --store postgres.
+# Headless Service (stable DNS for the StatefulSet pod) + StatefulSet with
+# a PVC template so resource generations and audit history survive restarts.
+#
+# The Postgres credentials come from the ryvexd-secret template
+# (03-ryvexd-secret.yaml): key postgres-password.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ryvex-postgres
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: ryvex
+spec:
+  clusterIP: None # headless: stable per-pod DNS for the StatefulSet
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ryvex-postgres
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: ryvex
+spec:
+  serviceName: ryvex-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: ryvex
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: pg
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: ryvex
+            - name: POSTGRES_DB
+              value: ryvex
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ryvexd-secret
+                  key: postgres-password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata # keep the PVC mount root clean
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ryvex", "-d", "ryvex"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ryvex", "-d", "ryvex"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

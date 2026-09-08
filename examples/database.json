@@ -1,0 +1,17 @@
+{
+  "kind": "Database",
+  "org": "acme",
+  "project": "core",
+  "env": "prod",
+  "name": "orders-postgres",
+  "labels": {
+    "managed-by": "ryvex",
+    "team": "payments"
+  },
+  "spec": {
+    "engine": "postgres",
+    "version": "16",
+    "size": "db.m6g.large",
+    "ha": true
+  }
+}

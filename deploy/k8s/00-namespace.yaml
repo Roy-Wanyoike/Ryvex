@@ -1,0 +1,8 @@
+# Ryvex control plane namespace.
+# Apply first:  kubectl apply -f deploy/k8s/00-namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ryvex
+  labels:
+    app.kubernetes.io/part-of: ryvex
