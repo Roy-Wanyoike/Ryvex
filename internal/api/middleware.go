@@ -117,6 +117,33 @@ type AuthOptions struct {
 	SkipPrefixes []string
 }
 
+// CORSMiddleware enables cross-origin browser clients (the web
+// console) to call the API. Only explicitly allowed origins get
+// headers; preflight requests short-circuit before auth.
+func CORSMiddleware(allowed []string) func(http.Handler) http.Handler {
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, o := range allowed {
+		allowedSet[strings.TrimSpace(o)] = true
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			if origin != "" && allowedSet[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Add("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "600")
+			}
+			if r.Method == http.MethodOptions && origin != "" {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // AuthMiddleware enforces bearer authentication.
 func AuthMiddleware(opts AuthOptions, log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

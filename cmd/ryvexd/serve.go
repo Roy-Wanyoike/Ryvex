@@ -29,6 +29,7 @@ func runServe(args []string) error {
 	storeKind := fs.String("store", "memory", "state backend (memory)")
 	devAuth := fs.Bool("dev-auth", false, "accept any ryk_ bearer token (development only)")
 	apiKeys := fs.String("api-keys", envOr("RYVEX_API_KEYS", ""), "static API keys as name=token,comma-separated")
+	corsOrigins := fs.String("cors-origins", envOr("RYVEX_CORS_ORIGINS", ""), "browser origins allowed to call the API, comma-separated")
 	seed := fs.Bool("seed", false, "load the demo dataset on boot")
 	logLevel := fs.String("log-level", "info", "log level")
 	if err := fs.Parse(args); err != nil {
@@ -73,7 +74,11 @@ func runServe(args []string) error {
 		log.Warn("no API keys configured and --dev-auth is off; all /v1 requests will be rejected")
 	}
 
-	handler := api.NewServer(store, eventBus, reconciler, api.ServerOptions{Auth: auth, Logger: log})
+	handler := api.NewServer(store, eventBus, reconciler, api.ServerOptions{
+		Auth:        auth,
+		Logger:      log,
+		CORSOrigins: splitCommaList(*corsOrigins),
+	})
 	srv := &http.Server{
 		Addr:              *httpAddr,
 		Handler:           handler,
@@ -142,4 +147,18 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitCommaList parses "a,b,c" into clean parts, dropping empties.
+func splitCommaList(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
