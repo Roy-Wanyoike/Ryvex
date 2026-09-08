@@ -18,6 +18,7 @@ import pytest
 
 import ryvex.client as ryvex_client
 from ryvex import Ryvex, RyvexError
+from ryvex.errors import TRANSPORT_ERROR
 from ryvex.types import AuditEntry, Page, Resource, ResourceStatus, RyvexEvent
 
 BASE = "http://ryvex.test:8080"
@@ -581,6 +582,33 @@ class TestErrors:
         assert err.details == []
         assert "generation conflict" in str(err)
 
+    def test_envelope_403_forbidden(self, client: Ryvex, transport: FakeTransport) -> None:
+        transport.responses = [
+            http_error(
+                403,
+                json.dumps(
+                    {
+                        "error": {
+                            "code": "forbidden",
+                            "message": "token lacks 'resources:write' in org acme",
+                            "request_id": "req-403",
+                            "details": ["resources:write"],
+                        }
+                    }
+                ).encode(),
+            )
+        ]
+        with pytest.raises(RyvexError) as excinfo:
+            client.create_resource({"kind": "Application"})
+        err = excinfo.value
+        assert err.status == 403
+        assert err.code == "forbidden"
+        assert err.message == "token lacks 'resources:write' in org acme"
+        assert err.request_id == "req-403"
+        assert err.details == ["resources:write"]
+        assert "status=403" in str(err)
+        assert "code=forbidden" in str(err)
+
     def test_non_json_body_falls_back_to_status_code(
         self, client: Ryvex, transport: FakeTransport
     ) -> None:
@@ -602,6 +630,17 @@ class TestErrors:
         assert excinfo.value.status == 404
         assert excinfo.value.code == "not_found"
         assert excinfo.value.message == "not found"
+
+    def test_empty_403_body_falls_back_to_forbidden(
+        self, client: Ryvex, transport: FakeTransport
+    ) -> None:
+        transport.responses = [http_error(403, b"")]
+        with pytest.raises(RyvexError) as excinfo:
+            client.list_resources(org="acme")
+        err = excinfo.value
+        assert err.status == 403
+        assert err.code == "forbidden"  # status-derived fallback, not internal_error
+        assert err.message == "forbidden: token lacks permission for this operation"
 
     def test_plain_text_body_snippet_included(
         self, client: Ryvex, transport: FakeTransport
@@ -664,6 +703,12 @@ class TestErrors:
     def test_transport_error_str(self) -> None:
         err = RyvexError.from_transport(OSError("no route"), "http://x/healthz")
         assert str(err) == "ryvex: request to http://x/healthz failed: no route (status=0, code=transport_error)"
+
+    def test_transport_error_is_cross_sdk_standard(self) -> None:
+        # Wire contract shared with the TypeScript SDK (status 0 + this
+        # code); TS aligned to "transport_error" in v0.2.0. Pin it here
+        # so the two SDKs cannot drift apart silently.
+        assert TRANSPORT_ERROR == "transport_error"
 
 
 # ---- types ----
