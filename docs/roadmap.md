@@ -6,43 +6,44 @@ issue tracker is the truth.
 
 ## ✅ Shipped
 
-| Feature | Where |
-|---------|-------|
-| Control plane core: state store (CAS + audit), event bus, reconciler, REST API, `ryvexd` daemon | `internal/*`, `cmd/ryvexd` |
-| Web console: Overview / Resources / Topology / Events / Audit, live + demo modes | `console/` |
-| Frozen API contract + architecture docs | `docs/` |
-| Demo dataset (`ryvexd --seed`): 15 realistic resources | `cmd/ryvexd/seed.go` |
+| Feature | Where | Issue |
+|---------|-------|-------|
+| Control plane core: state store (CAS + audit), event bus, reconciler, REST API, `ryvexd` daemon | `internal/*`, `cmd/ryvexd` | #1 |
+| Web console: Overview / Resources / Topology / Events / Audit, live + demo modes | `console/` | #3 |
+| Frozen API contract + architecture docs | `docs/` | #5 |
+| Recruiter README + Apache-2.0 | `README.md` | #7 |
+| TypeScript SDK (ESM+CJS, typed, zero runtime deps) | `sdk/ryvex-ts` | #10 |
+| Python SDK (dataclasses, stdlib-only runtime) | `sdk/ryvex-py` | #11 |
+| `ryvex` CLI (apply/get/delete/events/audit/reconcile/health) | `cmd/ryvex` | #12 |
+| Webhook subscriptions (signed, retried, audited deliveries) | `internal/webhook` | #13 |
+| Postgres state backend (parity-tested suite, restart persistence) | `internal/state/pgstore` | #14 |
+| NATS JetStream event bus (durable replay across restarts) | `internal/bus/natsbus` | #15 |
+| Org/project-scoped RBAC with managed `ryk_` keys | `internal/authz`, `internal/api` | #16 |
+| Prometheus metrics sidecar (HTTP, reconciler, bus, resources) | `internal/metrics` | #17 |
+| Console writes: resource editor, CAS-aware saves, settings | `console/` | #18 |
+| Rust data-plane node agent (enroll, heartbeat, self-heal) | `agent/ryvex-agent` | #19 |
+| Race-hardening: reconciler shutdown + DeepCopy aliasing fix | `internal/*` | #28 |
 
 ## 🔜 Active
 
-- [ ] **TypeScript SDK** (`sdk/ryvex-ts`) — typed client for the full `/v1` face, works in Node & browsers, published to npm
-- [ ] **Python SDK** (`sdk/ryvex-py`) — same contract, typed with dataclasses/pydantic, on PyPI
-- [ ] **Go SDK** (`sdk/ryvex-go`) — idiomatic client with resource builders
+- [ ] **Key rotation UX** — rotate `ryk_` keys without downtime; overlap windows; console management view for keys
+- [ ] **Deployment controller** — real rollout strategies (rolling / blue-green) for Application kind, plugging into `reconcile.evaluate`
+- [ ] **Drift detection** — agents compare declared spec vs live machine state; drift surfaced as events + console badges
 
 ## 🧭 Next
 
-- [ ] **`ryvex` CLI** — `apply/get/desc/delete/events/audit` against `/v1`, scriptable, completions
-- [ ] **Webhook subscriptions** — durable subscriptions to `ryvex.resource.*` subjects with retries and signing
-- [ ] **Durable state backend** — Postgres implementation of `state.Store` behind the existing interface
-- [ ] **Durable event stream** — NATS JetStream behind `bus.Bus`, replay for any offset
-- [ ] **Real controllers** — Application rollout controller (rolling/blue-green) and Database provisioning controller plugging into `reconcile.evaluate`
-- [ ] **RBAC** — org/project-scoped roles bound to `ryk_` keys; audit every authorization decision
-- [ ] **Metrics & health** — Prometheus `/metrics` on ryvexd (API latency, reconciler lag, bus throughput)
-- [ ] **Drift detection** — compare declared spec against live infrastructure, surface + reconcile drift events
-
-## 🌌 Later
-
-- [ ] **Rust data-plane agent** (`agent/`) — node agent enrolling clusters, executing reconciler decisions, streaming heartbeats
 - [ ] **Terraform / OpenTofu provider** — manage Ryvex resources from HCL
 - [ ] **Policy-as-code packs** — reusable governance bundles (CIS, cost guardrails) evaluated at admission
 - [ ] **Multi-region control planes** — federation + failover between ryvexd instances
 - [ ] **Cost intelligence** — per-resource cost attribution and budgets wired into the console
+- [ ] **Agent exec hooks** — reconcile decisions executed as local actions on nodes
 
 ## Contributing
 
 1. Pick (or create) an issue and claim it.
-2. Branch from `main` as `feat/<slug>` or `fix/<slug>`.
+2. Branch from `main` as `feat/<slug>`, `fix/<slug>` or `chore/<slug>`.
 3. Every PR must close an issue (`Fixes #N`) and keep CI green:
-   `go build ./... && go vet ./... && go test ./...` for Go,
-   `bun run build && bun run lint` for the console.
+   - Go: `go build ./... && go vet ./... && go test ./...` (durable backends: parity suites against Postgres/NATS when the DSNs are provided)
+   - Console: `bun run build && bun run lint`
+   - Agent: `cargo build --release && cargo test && cargo clippy -- -D warnings`
 4. Ship complete, tested features only — a PR is a promise kept.

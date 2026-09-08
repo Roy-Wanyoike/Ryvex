@@ -101,7 +101,7 @@ without touching the API or reconciler. Full write-up in
 
 ## Feature highlights
 
-- **Declarative resource model** — 11 kinds, schema-validated,
+- **Declarative resource model** — 12 kinds, schema-validated,
   generation-tracked, `spec`/`status` separation
 - **Compare-and-swap concurrency** — optimistic locking via
   `generation`, `409 conflict` on stale writers
@@ -129,16 +129,26 @@ mode so it renders beautifully even with no daemon running.
 
 ```
 Ryvex/
-├── cmd/ryvexd/          # control plane daemon (serve, seed)
+├── cmd/
+│   ├── ryvexd/          # control plane daemon (serve, seed)
+│   └── ryvex/           # operator CLI (apply/get/events/audit/…)
 ├── internal/
-│   ├── state/           # resource model, validation, store, audit
-│   ├── bus/             # event bus (subjects, wildcards, replay)
+│   ├── state/           # resource model, validation, store backends (memory + Postgres), audit
+│   ├── bus/             # event buses (in-memory + NATS JetStream)
+│   ├── webhook/         # signed webhook subscriptions with retries
+│   ├── authz/           # org/project-scoped RBAC
+│   ├── metrics/         # dependency-free Prometheus exposition
 │   ├── reconcile/       # convergence loop
 │   └── api/             # REST /v1 (routing, auth, handlers)
-├── console/             # Next.js 15 web console
+├── console/             # Next.js 15 web console (read + write)
+├── sdk/
+│   ├── ryvex-ts/        # TypeScript client (ESM + CJS)
+│   └── ryvex-py/        # Python client (stdlib-only runtime)
+├── agent/ryvex-agent/   # Rust data-plane node agent
 ├── docs/
 │   ├── architecture.md  # system design
 │   ├── api-contracts.md # frozen REST contract
+│   ├── metrics.md       # metric families reference
 │   └── roadmap.md       # issue-linked feature map
 └── go.mod
 ```
@@ -148,8 +158,13 @@ Ryvex/
 Every feature lands with tests and a live smoke check:
 
 ```bash
-go build ./... && go vet ./... && go test ./...   # control plane: all green
+go build ./... && go vet ./... && go test ./...   # control plane + CLI + SDKs' Go surface
+RYVEX_TEST_PG_DSN=… go test ./internal/state/...  # Postgres parity suite vs live PG
+RYVEX_TEST_NATS_URL=… go test ./internal/bus/...  # NATS JetStream parity suite
 cd console && bun run build                        # console: lint + types + build
+cd sdk/ryvex-ts && bun test                        # TS SDK suite (28 unit + live integration)
+cd sdk/ryvex-py && pytest                          # Python SDK suite (50 unit + live integration)
+cd agent/ryvex-agent && cargo test                 # Rust agent suite + clippy -D warnings
 ```
 
 The repository follows a strict **issue → PR** workflow: no direct
