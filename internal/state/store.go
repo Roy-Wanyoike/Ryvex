@@ -314,6 +314,25 @@ func (s *Store) appendAuditLocked(actor, action string, r *Resource) {
 	})
 }
 
+// AppendAudit records a caller-built audit entry for outcomes that are
+// not resource mutations — e.g. webhook delivery attempts reported by
+// the webhook dispatcher. Missing ID and Time are filled in; the
+// completed entry is returned. Filterable via ListAudit like any
+// other entry (org filtering keys off LogicalKey).
+func (s *Store) AppendAudit(e AuditEntry) AuditEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seq++
+	if e.ID == "" {
+		e.ID = newAuditID()
+	}
+	if e.Time.IsZero() {
+		e.Time = time.Now().UTC()
+	}
+	s.audit = append(s.audit, e)
+	return e
+}
+
 func logical(org, project, env, kind, name string) string {
 	return strings.Join([]string{org, project, env, kind, name}, "/")
 }

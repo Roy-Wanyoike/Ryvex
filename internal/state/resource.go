@@ -12,17 +12,18 @@ import (
 // small and closed: it models the primitive building blocks of the
 // Ryvex platform. New kinds must be added here and in Kinds below.
 const (
-	KindProject     = "Project"
-	KindEnvironment = "Environment"
-	KindApplication = "Application"
-	KindDeployment  = "Deployment"
-	KindCluster     = "Cluster"
-	KindNode        = "Node"
-	KindDatabase    = "Database"
-	KindCache       = "Cache"
-	KindBucket      = "Bucket"
-	KindPolicy      = "Policy"
-	KindSecret      = "Secret"
+	KindProject      = "Project"
+	KindEnvironment  = "Environment"
+	KindApplication  = "Application"
+	KindDeployment   = "Deployment"
+	KindCluster      = "Cluster"
+	KindNode         = "Node"
+	KindDatabase     = "Database"
+	KindCache        = "Cache"
+	KindBucket       = "Bucket"
+	KindPolicy       = "Policy"
+	KindSecret       = "Secret"
+	KindSubscription = "Subscription"
 )
 
 // Kinds is the authoritative set of supported resource kinds.
@@ -30,7 +31,7 @@ var Kinds = map[string]bool{
 	KindProject: true, KindEnvironment: true, KindApplication: true,
 	KindDeployment: true, KindCluster: true, KindNode: true,
 	KindDatabase: true, KindCache: true, KindBucket: true,
-	KindPolicy: true, KindSecret: true,
+	KindPolicy: true, KindSecret: true, KindSubscription: true,
 }
 
 // Phases of the reconciliation lifecycle.
@@ -126,6 +127,12 @@ func (r *Resource) Validate() error {
 	}
 	if len(raw) > maxSpecB {
 		return &ValidationError{Field: "spec", Message: fmt.Sprintf("spec exceeds %d bytes", maxSpecB)}
+	}
+	// Kind-specific spec schemas.
+	if r.Kind == KindSubscription {
+		if _, err := ParseSubscriptionSpec(r.Spec); err != nil {
+			return err
+		}
 	}
 	return nil
 }

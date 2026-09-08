@@ -153,10 +153,14 @@ func runHandler(h Handler, e Event) {
 	h(e)
 }
 
-// match reports whether subject satisfies pattern. Both are
+// Match reports whether subject satisfies pattern. Both are
 // dot-separated; "*" matches exactly one segment and a trailing ">"
 // matches one or more remaining segments (NATS-style).
-func match(pattern, subject string) bool {
+//
+// Exported so components that filter events without a bus
+// subscription (e.g. the webhook dispatcher) reuse the exact same
+// grammar as Subscribe/Publish.
+func Match(pattern, subject string) bool {
 	pt := strings.Split(pattern, ".")
 	st := strings.Split(subject, ".")
 	for i := 0; i < len(pt); i++ {
@@ -171,6 +175,12 @@ func match(pattern, subject string) bool {
 		}
 	}
 	return len(pt) == len(st)
+}
+
+// match is the internal alias kept for readability at the Publish
+// call site; it delegates to the exported Match.
+func match(pattern, subject string) bool {
+	return Match(pattern, subject)
 }
 
 // Recent returns up to limit most recent events, newest first,
