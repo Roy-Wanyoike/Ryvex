@@ -29,6 +29,9 @@ type Server struct {
 type ServerOptions struct {
 	Auth   AuthOptions
 	Logger *slog.Logger
+	// CORSOrigins lists browser origins allowed to call the API
+	// (e.g. "http://localhost:3100"). Empty disables CORS.
+	CORSOrigins []string
 }
 
 // NewServer builds the full handler stack:
@@ -56,6 +59,7 @@ func NewServer(store *state.Store, b *bus.Bus, rec *reconcile.Reconciler, o Serv
 		RequestIDMiddleware,
 		RecoverMiddleware(o.Logger),
 		LogMiddleware(o.Logger),
+		CORSMiddleware(o.CORSOrigins),
 		AuthMiddleware(o.Auth, o.Logger),
 	)
 	return stack(s.mux)
