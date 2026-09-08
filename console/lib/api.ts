@@ -5,11 +5,14 @@ import type { AuditEntry, Resource, RyvexEvent } from "./types";
  * The console talks to the Ryvex control plane API (ryvexd).
  *
  * Configuration resolution order (strongest first):
- *   1. localStorage  ryvex.apiBase / ryvex.token / ryvex.org / ryvex.project / ryvex.env
- *                      (set from the Settings view)
+ *   1. localStorage  ryvex.apiBase / ryvex.org / ryvex.project / ryvex.env (Settings view)
+ *      sessionStorage ryvex.token — only when the operator opts in with
+ *      "remember in this browser"; otherwise the token lives in memory alone
  *   2. build-time env  NEXT_PUBLIC_RYVEX_API / NEXT_PUBLIC_RYVEX_TOKEN /
  *                      NEXT_PUBLIC_RYVEX_ORG / NEXT_PUBLIC_RYVEX_PROJECT / NEXT_PUBLIC_RYVEX_ENV
- *   3. defaults        no base (demo mode) + "ryk_console_dev" + scope acme/core/prod
+ *   3. defaults        no base (demo mode) + NO token (requests go out
+ *                      unauthenticated and fail with an explicit 401 —
+ *                      nothing is baked into the bundle, issue #42) + scope acme/core/prod
  *
  * TRUST RULE (issue #41): demo data is served ONLY when no API base is
  * configured. In live mode a failed read never masquerades as demo data —
@@ -25,18 +28,25 @@ import type { AuditEntry, Resource, RyvexEvent } from "./types";
  */
 
 const ENV_API_BASE = process.env.NEXT_PUBLIC_RYVEX_API ?? "";
-const ENV_TOKEN = process.env.NEXT_PUBLIC_RYVEX_TOKEN ?? "ryk_console_dev";
+// No default token: an unconfigured console sends NO Authorization header so
+// the control plane answers with an explicit 401 instead of silently riding
+// a shared dev credential baked into the bundle (issue #42).
+const ENV_TOKEN = process.env.NEXT_PUBLIC_RYVEX_TOKEN ?? "";
 const ENV_ORG = process.env.NEXT_PUBLIC_RYVEX_ORG ?? "acme";
 const ENV_PROJECT = process.env.NEXT_PUBLIC_RYVEX_PROJECT ?? "core";
 const ENV_ENV = process.env.NEXT_PUBLIC_RYVEX_ENV ?? "prod";
 
 export const LS_API_BASE = "ryvex.apiBase";
-export const LS_TOKEN = "ryvex.token";
+/**
+ * Token storage key, now in sessionStorage (per-tab, gone when the tab
+ * closes). The same key used to exist in localStorage — hydrateApiFromStorage
+ * scrubs that legacy copy on load (issue #42).
+ */
+export const SS_TOKEN = "ryvex.token";
 export const LS_ORG = "ryvex.org";
 export const LS_PROJECT = "ryvex.project";
 export const LS_ENV = "ryvex.env";
 
-const DEFAULT_TOKEN = "ryk_console_dev";
 const DEFAULT_ORG = "acme";
 const DEFAULT_PROJECT = "core";
 const DEFAULT_ENV = "prod";
@@ -91,8 +101,19 @@ export function getApiBase(): string {
   return runtimeApiBase;
 }
 
+/** Current bearer token. Empty string = send no Authorization header. */
 export function getApiToken(): string {
   return runtimeToken;
+}
+
+/**
+ * Authorization header only when a token is actually configured. An
+ * unconfigured console must fail loudly (401) rather than authenticate with
+ * an implicit shared credential.
+ */
+function authHeader(token: string): Record<string, string> {
+  const t = token.trim();
+  return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
 export function getOrg(): string {
@@ -137,14 +158,17 @@ export function loadStoredConfig(): {
     return { apiBase: "", token: "", org: "", project: "", env: "", hasBase: false, hasToken: false, hasOrg: false, hasProject: false, hasEnv: false };
   }
   const raw = (key: string) => window.localStorage.getItem(key);
+  // The token is the one credential that never touches localStorage —
+  // sessionStorage only (opt-in), so it dies with the tab.
+  const rawSession = (key: string) => window.sessionStorage.getItem(key);
   return {
     apiBase: raw(LS_API_BASE) ?? "",
-    token: raw(LS_TOKEN) ?? "",
+    token: rawSession(SS_TOKEN) ?? "",
     org: raw(LS_ORG) ?? "",
     project: raw(LS_PROJECT) ?? "",
     env: raw(LS_ENV) ?? "",
     hasBase: raw(LS_API_BASE) !== null,
-    hasToken: raw(LS_TOKEN) !== null,
+    hasToken: rawSession(SS_TOKEN) !== null,
     hasOrg: raw(LS_ORG) !== null,
     hasProject: raw(LS_PROJECT) !== null,
     hasEnv: raw(LS_ENV) !== null,
@@ -152,24 +176,47 @@ export function loadStoredConfig(): {
 }
 
 /**
- * Apply persisted localStorage settings over the build-time env defaults.
- * Keys that were explicitly stored (even as "") win; unset keys defer to env.
+ * Apply persisted settings over the build-time env defaults: base/scope from
+ * localStorage, token from sessionStorage (opt-in "remember"). Keys that were
+ * explicitly stored (even as "") win; unset keys defer to env.
  */
 export function hydrateApiFromStorage(): void {
   const stored = loadStoredConfig();
   if (stored.hasBase) runtimeApiBase = normalizeBase(stored.apiBase);
+  // Token: sessionStorage copy (when remembered) wins over the build-time env
+  // value; with neither, the runtime token stays empty and requests go out
+  // unauthenticated. The old "fall back to a dev token" behavior is gone.
   if (stored.hasToken) runtimeToken = stored.token.trim();
-  else if (!runtimeToken) runtimeToken = DEFAULT_TOKEN;
+  // Scrub the legacy localStorage token written by earlier consoles (#42).
+  if (typeof window !== "undefined") window.localStorage.removeItem(SS_TOKEN);
   if (stored.hasOrg) runtimeOrg = stored.org.trim() || DEFAULT_ORG;
   if (stored.hasProject) runtimeProject = stored.project.trim() || DEFAULT_PROJECT;
   if (stored.hasEnv) runtimeEnv = stored.env.trim() || DEFAULT_ENV;
 }
 
+export interface StoreConfigOptions {
+  /**
+   * Opt-in persistence for the bearer token: sessionStorage for this tab
+   * only. When false the token is applied to the in-memory runtime store and
+   * nothing is written to any storage.
+   */
+  rememberToken?: boolean;
+}
+
 /** Persist the given settings; also applies them to the runtime store. */
-export function storeConfig(apiBase: string, token: string, scope?: Partial<ScopeConfig>): void {
+export function storeConfig(
+  apiBase: string,
+  token: string,
+  scope?: Partial<ScopeConfig>,
+  opts?: StoreConfigOptions,
+): void {
   if (typeof window !== "undefined") {
     window.localStorage.setItem(LS_API_BASE, normalizeBase(apiBase));
-    window.localStorage.setItem(LS_TOKEN, token.trim());
+    if (opts?.rememberToken && token.trim()) {
+      window.sessionStorage.setItem(SS_TOKEN, token.trim());
+    } else {
+      window.sessionStorage.removeItem(SS_TOKEN);
+    }
     if (scope?.org !== undefined) window.localStorage.setItem(LS_ORG, scope.org.trim());
     if (scope?.project !== undefined) window.localStorage.setItem(LS_PROJECT, scope.project.trim());
     if (scope?.env !== undefined) window.localStorage.setItem(LS_ENV, scope.env.trim());
@@ -281,7 +328,7 @@ async function apiRequest<T>(method: string, path: string, body?: unknown): Prom
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
-        Authorization: `Bearer ${getApiToken()}`,
+        ...authHeader(getApiToken()),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store",
@@ -408,7 +455,7 @@ export async function testConnection(rawBase: string, token: string): Promise<Co
   }
   try {
     const res = await fetch(`${base}/healthz`, {
-      headers: token.trim() ? { Authorization: `Bearer ${token.trim()}` } : {},
+      headers: authHeader(token),
       cache: "no-store",
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -475,7 +522,7 @@ async function listAllResources(into: Resource[], signal?: AbortSignal): Promise
     const qs = new URLSearchParams({ limit: String(RESOURCE_PAGE_LIMIT) });
     if (cursor) qs.set("cursor", cursor);
     const res = await fetch(`${base}/v1/resources?${qs.toString()}`, {
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${getApiToken()}` },
+      headers: { "Content-Type": "application/json", ...authHeader(getApiToken()) },
       cache: "no-store",
       signal: requestSignal(signal),
     });
@@ -506,7 +553,7 @@ async function fetchFeed<T>(
   const base = getApiBase();
   try {
     const res = await fetch(`${base}${path}`, {
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${getApiToken()}` },
+      headers: { "Content-Type": "application/json", ...authHeader(getApiToken()) },
       cache: "no-store",
       signal: requestSignal(opts?.signal),
     });

@@ -144,7 +144,9 @@ export default function Home() {
           {NAV.map((n) => (
             <button
               key={n.key}
+              type="button"
               onClick={() => setView(n.key)}
+              aria-current={view === n.key ? "page" : undefined}
               className={`flex items-center gap-2.5 whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition ${
                 view === n.key
                   ? "bg-[var(--violet)]/15 text-[var(--violet)]"
@@ -239,14 +241,14 @@ export default function Home() {
             Connecting to control plane…
           </div>
         ) : (
-          <>
+          <div aria-live="polite">
             {view === "overview" && <OverviewView resources={resources} events={events} />}
             {view === "resources" && <ResourcesView resources={resources} onOpen={setSelected} />}
             {view === "topology" && <TopologyView resources={resources} />}
             {view === "events" && <EventsView events={events} />}
             {view === "audit" && <AuditView entries={audit} />}
             {view === "settings" && <SettingsView onConfigChange={handleConfigChange} />}
-          </>
+          </div>
         )}
       </main>
 

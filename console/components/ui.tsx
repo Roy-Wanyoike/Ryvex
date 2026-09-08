@@ -1,6 +1,8 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import type { Phase } from "@/lib/types";
+import { toast } from "@/lib/toast";
 
 export const PHASE_STYLES: Record<Phase, string> = {
   Pending: "text-amber-300 border-amber-400/30 bg-amber-400/10",
@@ -11,19 +13,22 @@ export const PHASE_STYLES: Record<Phase, string> = {
   Terminating: "text-zinc-300 border-zinc-400/30 bg-zinc-400/10",
 };
 
+/** Neutral zinc treatment for unknown/missing phase labels (#42). */
+const UNKNOWN_PHASE_STYLE = "text-zinc-300 border-zinc-400/30 bg-zinc-400/10";
+
 /**
- * Style for any wire-supplied phase label. Unknown/missing phases fall back
- * to the Pending (amber) treatment instead of crashing — malformed status is
- * rendered as "Unknown", never dereferenced blindly (issue #41).
+ * Style for any wire-supplied phase label. Known phases get their own color;
+ * unknown/missing phases render neutral zinc — never amber Pending, which
+ * would misreport malformed status as a real state (issue #41, tuned in #42).
  */
 export function phaseStyleFor(phase: string | null | undefined): string {
   if (typeof phase === "string" && phase in PHASE_STYLES) return PHASE_STYLES[phase as Phase];
-  return PHASE_STYLES.Pending;
+  return UNKNOWN_PHASE_STYLE;
 }
 
 /**
  * Phase badge tolerant of untrusted wire data: accepts any string (or
- * absence) and degrades to an amber "Unknown" chip.
+ * absence) and degrades to a neutral zinc "Unknown" chip.
  */
 export function PhaseBadge({ phase }: { phase?: Phase | string | null }) {
   const label = phase || "Unknown";
@@ -71,12 +76,9 @@ export function KindChip({ kind }: { kind: string }) {
   return <span className="chip uppercase">{kind}</span>;
 }
 
-const PULSE_KEY = "ryvex-pulse-interval";
-
 /** Relative time that re-renders on a shared 30s clock. */
 export function TimeAgo({ iso }: { iso: string }) {
   const label = relTime(iso);
-  void PULSE_KEY;
   return <span title={new Date(iso).toLocaleString()}>{label}</span>;
 }
 
@@ -88,4 +90,73 @@ function relTime(iso: string): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
+}
+
+/**
+ * Copy text to the clipboard, falling back to a hidden-textarea execCommand
+ * on engines/pl origins where the async Clipboard API is unavailable.
+ * Returns false only when every path failed, so callers can toast the error.
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the legacy path (permission denied, insecure origin, …)
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Small inline copy affordance for machine values (resource IDs, logical
+ * keys, event subjects). Uses the shared toast store for feedback (#42).
+ */
+export function CopyButton({ value, label = "value" }: { value: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(t);
+  }, [copied]);
+
+  const handleCopy = () => {
+    void copyToClipboard(value).then((ok) => {
+      if (ok) {
+        setCopied(true);
+        toast.success(`${label} copied to clipboard`);
+      } else {
+        toast.error(`Could not copy ${label} — clipboard access was blocked`);
+      }
+    });
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      aria-label={`Copy ${label}`}
+      title={`Copy ${label}`}
+      className={`shrink-0 rounded p-0.5 text-xs leading-none transition hover:text-[var(--text)] ${
+        copied ? "text-emerald-300" : "text-[var(--muted)]"
+      }`}
+    >
+      {copied ? "✓" : "⧉"}
+    </button>
+  );
 }

@@ -5,6 +5,7 @@ export const metadata: Metadata = {
   title: "Ryvex Console",
   description:
     "Ryvex — the programmable operating system for infrastructure. Control surface for the Ryvex cloud control plane.",
+  icons: { icon: "/favicon.ico" },
 };
 
 export default function RootLayout({
