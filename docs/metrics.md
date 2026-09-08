@@ -116,6 +116,10 @@ trigger burst). Kind/phase pairs that disappear from the snapshot are set to
 | `ryvex_bus_events_published_total` | counter | `type` | Events published, by type (`created`, `updated`, `deleted`, `status_changed`; `unknown` when a publish omits the type). |
 | `ryvex_bus_events_delivered_total` | counter | — | Handler invocations: one increment per event handed to a subscriber. Publishes without matching subscribers do not increment it. |
 
+Both bus counters are fed by whichever backend is active: the in-memory bus
+and the JetStream bus (`--bus nats`, issue #15) increment the same families,
+so dashboards do not change when durability is switched on.
+
 ## Instrumentation notes
 
 - **Zero overhead when idle.** Updates are a mutex-guarded float op per

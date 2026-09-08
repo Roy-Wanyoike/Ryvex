@@ -19,7 +19,7 @@ const Version = "v1.0.0"
 // Server wires the store, bus and reconciler into an HTTP handler.
 type Server struct {
 	store      state.Backend
-	bus        *bus.Bus
+	bus        bus.BusI
 	reconciler *reconcile.Reconciler
 	log        *slog.Logger
 	mux        *http.ServeMux
@@ -36,7 +36,10 @@ type ServerOptions struct {
 
 // NewServer builds the full handler stack:
 // RequestID -> Recover -> Log -> Auth -> routes.
-func NewServer(store state.Backend, b *bus.Bus, rec *reconcile.Reconciler, o ServerOptions) http.Handler {
+// The store is state.Backend (memory or Postgres, issue #14); the bus
+// is bus.BusI so both the in-memory bus and the JetStream bus
+// (issue #15) can serve the same handler.
+func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o ServerOptions) http.Handler {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}

@@ -29,7 +29,7 @@ type Options struct {
 // resource phases. It is safe for concurrent use.
 type Reconciler struct {
 	store state.Backend
-	bus   *bus.Bus
+	bus   bus.BusI
 	opts  Options
 	log   *slog.Logger
 
@@ -39,7 +39,7 @@ type Reconciler struct {
 }
 
 // New constructs a reconciler. Call Start to begin the loop.
-func New(store state.Backend, b *bus.Bus, opts Options) *Reconciler {
+func New(store state.Backend, b bus.BusI, opts Options) *Reconciler {
 	if opts.Interval <= 0 {
 		opts.Interval = 30 * time.Second
 	}
