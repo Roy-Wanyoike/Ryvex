@@ -124,11 +124,27 @@ func (r *Reconciler) worker(ctx context.Context, n int) {
 	}
 }
 
+// scanPageLimit pins the page size to the store's hard clamp: both the
+// reference memory store and pgstore silently reduce any Limit > 200
+// to 50, so requesting more would not reduce round trips.
+const scanPageLimit = 200
+
+// maxScanPages is a hard bound on one scan's page walk. The primary
+// guard against a pathological backend is the seen-cursor set below
+// (mirroring the TS SDK listAll pattern); this bound is defense in
+// depth against a backend that keeps minting fresh, never-repeating
+// cursors. At 200 resources per page it allows two million resources
+// per scan before deferring the rest to the next interval.
+const maxScanPages = 10000
+
 // scan queues every resource that has not fully converged yet:
 // pending/provisioning phases, or a spec generation the status has
-// not observed. It also refreshes the ryvex_resources snapshot gauge
-// and records the scan counter, scan duration and queue depth
-// (issue #17).
+// not observed. The list is paged with the backend's next cursor
+// until exhaustion (issue #37): the store clamps Limit to 200, so a
+// single page silently capped the scan at the first 200 resources and
+// anything beyond sat Pending forever. It also refreshes the
+// ryvex_resources snapshot gauge and records the scan counter, scan
+// duration and queue depth (issue #17).
 func (r *Reconciler) scan() {
 	start := time.Now()
 	defer func() {
@@ -142,18 +158,40 @@ func (r *Reconciler) scan() {
 	// per-mutation bookkeeping.
 	metrics.ReconcileMetrics(r.store)
 
-	resources, _, err := r.store.ListResources(state.ListOptions{Limit: 200})
-	if err != nil {
-		r.log.Error("scan failed", "err", err)
-		return
-	}
-	for _, res := range resources {
-		if res.Status.ObservedGen < res.Generation ||
-			res.Status.Phase == state.PhasePending ||
-			res.Status.Phase == state.PhaseProvisioning {
-			r.Trigger(res.ID)
+	// Walk every page, following the cursor chain until it is
+	// exhausted (""). Guarded like the TS SDK listAll: a cursor we
+	// have already followed means the backend is stuck, and the page
+	// bound caps a walk that would otherwise never end. Behavior for
+	// stores with <=200 resources is unchanged (a single page, next
+	// cursor empty).
+	seen := make(map[string]struct{}, 64)
+	cursor := ""
+	for page := 0; page < maxScanPages; page++ {
+		resources, next, err := r.store.ListResources(state.ListOptions{Limit: scanPageLimit, Cursor: cursor})
+		if err != nil {
+			r.log.Error("scan failed", "err", err)
+			return
 		}
+		for _, res := range resources {
+			if res.Status.ObservedGen < res.Generation ||
+				res.Status.Phase == state.PhasePending ||
+				res.Status.Phase == state.PhaseProvisioning {
+				r.Trigger(res.ID)
+			}
+		}
+		if next == "" {
+			return
+		}
+		if _, stuck := seen[next]; stuck {
+			r.log.Warn("scan pagination stuck: backend returned a repeated cursor; deferring the rest to the next scan",
+				"pages", page+1)
+			return
+		}
+		seen[next] = struct{}{}
+		cursor = next
 	}
+	r.log.Warn("scan hit the page bound; remaining resources are deferred to the next scan",
+		"pages", maxScanPages, "page_size", scanPageLimit)
 }
 
 func (r *Reconciler) reconcileOne(id, cause string) {
