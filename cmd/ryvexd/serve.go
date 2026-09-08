@@ -14,6 +14,7 @@ import (
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/api"
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
+	"github.com/Roy-Wanyoike/Ryvex/internal/bus/natsbus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 	"github.com/Roy-Wanyoike/Ryvex/internal/reconcile"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
@@ -41,6 +42,10 @@ func runServe(args []string) error {
 	dsn := fs.String("dsn", envOr("RYVEX_DATABASE_URL", ""), "Postgres DSN (required when --store=postgres)")
 	// --- webhooks (issue #13): signing-secret flag ---
 	webhookSecret := fs.String("webhook-secret", envOr("RYVEX_WEBHOOK_SECRET", ""), "HMAC key material for webhook signatures (random per boot when unset)")
+	// --- nats bus (issue #15): durable event bus flags ---
+	busKind := fs.String("bus", "memory", "event bus backend: memory (default) or nats (JetStream)")
+	natsURL := fs.String("nats-url", envOr("RYVEX_NATS_URL", "nats://127.0.0.1:4222"), "NATS server URL used when --bus=nats")
+	// --- end nats bus flags ---
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -74,7 +79,26 @@ func runServe(args []string) error {
 		return fmt.Errorf("unsupported store %q (available: \"memory\", \"postgres\")", *storeKind)
 	}
 	// --- end postgres store (issue #14) ---
-	eventBus := bus.New()
+	// --- nats bus (issue #15): backend selection ---
+	// Memory is the default. --bus=nats dials JetStream and fails AT
+	// BOOT on connect errors: once durability was explicitly requested
+	// there is never a silent fallback to the in-memory bus.
+	var eventBus bus.BusI
+	switch *busKind {
+	case "memory", "":
+		eventBus = bus.New()
+	case "nats":
+		nb, err := natsbus.New(*natsURL, natsbus.Options{Logger: log})
+		if err != nil {
+			return fmt.Errorf("nats event bus: %w (check --nats-url / RYVEX_NATS_URL; refusing to fall back to the memory bus)", err)
+		}
+		defer nb.Close()
+		eventBus = nb
+		log.Info("event bus: NATS JetStream", "url", *natsURL, "stream", natsbus.StreamName)
+	default:
+		return fmt.Errorf("unsupported bus %q (want \"memory\" or \"nats\")", *busKind)
+	}
+	// --- end nats bus ---
 
 	// Replay recent control-plane events into the log for visibility.
 	eventBus.Subscribe("ryvex.resource.>", func(e bus.Event) {
@@ -187,6 +211,11 @@ func runServe(args []string) error {
 	recCancel()
 	reconciler.Stop(3 * time.Second)
 	dispatcher.Stop(3 * time.Second) // --- webhooks (issue #13) ---
+	// --- nats bus (issue #15): drain subscriptions + connection ---
+	if closer, ok := eventBus.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
+	// --- end nats bus ---
 	log.Info("ryvexd stopped cleanly")
 	return nil
 }

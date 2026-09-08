@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -216,7 +217,44 @@ func matchKind(raw string) string {
 // ---- observability ----
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, org string) {
-	evts := s.bus.Recent(org, queryInt(r, "limit", 100))
+	limit := queryInt(r, "limit", 100)
+
+	// --- durable events (issue #15): optional `from` sequence replay ---
+	// When the bus supports sequence replay (the JetStream backend
+	// implements bus.Replayer) and the caller passes from=<stream
+	// sequence>, return events after that sequence together with
+	// last_seq so callers can resume the stream. Additive: the
+	// in-memory bus does not implement bus.Replayer, so from is
+	// ignored and the frozen wire shape is unchanged there.
+	if replay, ok := s.bus.(bus.Replayer); ok && r.URL.Query().Has("from") {
+		from, err := strconv.ParseUint(r.URL.Query().Get("from"), 10, 64)
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, CodeValidation,
+				"invalid from: must be an unsigned integer (event stream sequence)")
+			return
+		}
+		evts, last, err := replay.RecentFrom(org, limit, from)
+		if err != nil {
+			s.log.Error("event replay failed", "org", org, "err", err)
+			writeError(w, r, http.StatusInternalServerError, CodeInternal, "event replay failed")
+			return
+		}
+		if evts == nil {
+			evts = []bus.Event{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"events": evts, "count": len(evts), "last_seq": last,
+		})
+		return
+	}
+	// --- end durable events ---
+
+	evts, err := s.bus.Recent(org, limit)
+	if err != nil {
+		s.log.Error("event query failed", "org", org, "err", err)
+		writeError(w, r, http.StatusInternalServerError, CodeInternal, "event query failed")
+		return
+	}
 	if evts == nil {
 		evts = []bus.Event{}
 	}

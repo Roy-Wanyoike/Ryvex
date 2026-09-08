@@ -133,14 +133,14 @@ type Options struct {
 // reconciler. Safe for concurrent use.
 type Dispatcher struct {
 	store state.Backend
-	bus   *bus.Bus
+	bus   bus.BusI
 	opts  Options
 	log   *slog.Logger
 
 	mu   sync.RWMutex
 	subs map[string]*subHandle
 
-	busSub   *bus.Subscription
+	busSub   bus.Sub
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
@@ -177,8 +177,10 @@ type deliveryPayload struct {
 }
 
 // NewDispatcher constructs a dispatcher over the store and bus. Call
-// Start to begin delivering.
-func NewDispatcher(store state.Backend, b *bus.Bus, opts Options) *Dispatcher {
+// Start to begin delivering. The store is state.Backend (issue #14);
+// the bus is bus.BusI so the JetStream backend (issue #15) can drive
+// webhooks too.
+func NewDispatcher(store state.Backend, b bus.BusI, opts Options) *Dispatcher {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}

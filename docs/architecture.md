@@ -129,3 +129,48 @@ Overview, Resources, Topology, Events, Audit.
    seams for durable backends.
 5. **Frozen wire contracts.** Error envelope, status codes and subjects
    are versioned and never broken casually.
+
+## Durable events (NATS JetStream)
+
+The event bus is swappable. `internal/bus` defines the contract and the
+in-memory implementation (ring replay, 1024 events); `internal/bus/natsbus`
+implements the same `bus.BusI` surface on NATS JetStream so the event log
+survives daemon restarts (issue #15). Both backends pass the same parity
+suite (`internal/bus/bustest`) — subject grammar, wildcards, cancel, panic
+containment and `Recent` semantics are identical.
+
+```
+ryvexd serve --bus nats --nats-url nats://127.0.0.1:4222
+RYVEX_NATS_URL=nats://127.0.0.1:4222 ryvexd serve --bus nats ...
+```
+
+| Flag | Env | Meaning |
+|------|-----|---------|
+| `--bus` | | Event bus backend: `memory` (default) or `nats` |
+| `--nats-url` | `RYVEX_NATS_URL` | NATS server URL when `--bus=nats` (default `nats://127.0.0.1:4222`) |
+
+How it works:
+
+- **Stream.** A JetStream stream `RYVEX` captures `ryvex.resource.>` with a
+  24h max-age retention (file storage by default, so events also survive a
+  nats-server restart). The stream is created on boot if missing; an existing
+  stream is reused untouched. Subject grammar is shared 1:1 with the memory
+  bus (`*` = one segment, trailing `>` = tail).
+- **Publish.** Events are JSON-marshalled onto their canonical subject; the
+  publish is acknowledged by the server before `Publish` returns
+  (at-least-once). Failures are logged, never fatal to the request path.
+- **Subscribe.** Live deliveries ride core NATS subscriptions (no replay on
+  subscribe, matching memory-bus semantics). Handler panics are contained and
+  `Cancel()` stops delivery immediately.
+- **Recent / RecentFrom.** `Recent(org, limit)` replays the newest events from
+  the stream (server-side filtered per org, newest first, scans capped at 5000
+  messages for safety). `RecentFrom(org, limit, from)` is the sequence-cursor
+  replay exposed on `GET /v1/{org}/events?from=<seq>`: it returns events after
+  `from` together with `last_seq` so callers can resume without gaps or
+  duplicates. The in-memory bus does not implement the cursor (the `from`
+  parameter is simply ignored there); `last_seq` appears in the response only
+  on the JetStream backend.
+
+Boot semantics: with `--bus nats` a failed connection is a fatal boot error —
+the daemon refuses to silently degrade to the in-memory bus. The memory bus
+is used when `--bus` is unset (or `--bus memory`).

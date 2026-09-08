@@ -51,6 +51,40 @@ func Subject(org, kind, eventType string) string {
 // Handler processes events synchronously inside Publish.
 type Handler func(Event)
 
+// Sub is a live bus subscription handle; Cancel removes it so no
+// further events are delivered. *Bus.Subscription and
+// *natsbus.Subscription both satisfy it.
+type Sub interface {
+	Cancel()
+}
+
+// BusI is the minimal event-bus surface control-plane components
+// depend on. The in-memory *Bus and the durable *natsbus.Bus
+// (JetStream, issue #15) both satisfy it, so callers (API handlers,
+// reconciler, webhook dispatcher, daemon wiring) stay backend-agnostic.
+type BusI interface {
+	// Publish fans an event out to matching subscribers.
+	Publish(e Event)
+	// Recent returns up to limit recent events for org (empty = all
+	// orgs), newest first.
+	Recent(org string, limit int) ([]Event, error)
+	// Subscribe registers a handler for a subject pattern
+	// ("*" = one segment, trailing ">" = tail). Subscriptions created
+	// after a Publish see only later events; use Recent/RecentFrom for
+	// history.
+	Subscribe(pattern string, h Handler) Sub
+}
+
+// Replayer is the optional capability of a bus that can replay by
+// stream sequence (issue #15). The in-memory bus does not implement
+// it; *natsbus.Bus does. Callers detect it with a type assertion.
+type Replayer interface {
+	// RecentFrom returns up to limit events for org with stream
+	// sequence greater than from, newest first, plus the highest
+	// sequence observed so callers can resume with from=last_seq.
+	RecentFrom(org string, limit int, from uint64) ([]Event, uint64, error)
+}
+
 // Subscription ties a handler to a subject pattern.
 type Subscription struct {
 	ID      string
@@ -100,7 +134,11 @@ func New() *Bus {
 // "*" to match exactly one segment, e.g.
 //
 //	ryvex.resource.acme.*.created
-func (b *Bus) Subscribe(pattern string, h Handler) *Subscription {
+//
+// The declared return type is the bus.Sub interface so *Bus and
+// *natsbus.Bus share the bus.BusI surface (issue #15); the returned
+// value is always this bus's *Subscription.
+func (b *Bus) Subscribe(pattern string, h Handler) Sub {
 	if h == nil {
 		return nil
 	}
@@ -200,8 +238,10 @@ func match(pattern, subject string) bool {
 }
 
 // Recent returns up to limit most recent events, newest first,
-// optionally filtered by org.
-func (b *Bus) Recent(org string, limit int) []Event {
+// optionally filtered by org. limit <= 0 falls back to 100. The
+// error is always nil; it exists so the in-memory bus and the
+// JetStream bus (issue #15) share the BusI signature.
+func (b *Bus) Recent(org string, limit int) ([]Event, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if limit <= 0 || limit > RingSize {
@@ -214,5 +254,5 @@ func (b *Bus) Recent(org string, limit int) []Event {
 			out = append(out, e)
 		}
 	}
-	return out
+	return out, nil
 }

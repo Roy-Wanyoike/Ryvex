@@ -68,14 +68,14 @@ func TestRecentRing(t *testing.T) {
 	for i := 0; i < RingSize+50; i++ {
 		b.Publish(Event{Org: "acme", Kind: "Node", Type: EventUpdated})
 	}
-	evts := b.Recent("acme", 10)
+	evts, _ := b.Recent("acme", 10)
 	if len(evts) != 10 {
 		t.Fatalf("want 10 events, got %d", len(evts))
 	}
 	if len(b.ring) > RingSize {
 		t.Fatalf("ring overflowed: %d", len(b.ring))
 	}
-	none := b.Recent("globex", 10)
+	none, _ := b.Recent("globex", 10)
 	if len(none) != 0 {
 		t.Fatalf("org filter failed: %d", len(none))
 	}
