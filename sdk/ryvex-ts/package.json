@@ -1,6 +1,6 @@
 {
   "name": "ryvex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript client for the Ryvex control plane REST API (/v1 face)",
   "license": "Apache-2.0",
   "type": "module",
@@ -11,7 +11,10 @@
     ".": {
       "types": "./dist/esm/index.d.ts",
       "import": "./dist/esm/index.js",
-      "require": "./dist/cjs/index.js"
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
     }
   },
   "files": [
