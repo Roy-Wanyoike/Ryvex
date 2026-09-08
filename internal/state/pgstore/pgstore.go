@@ -17,6 +17,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +35,54 @@ type Store struct {
 	db *sql.DB
 }
 
+// Pool bounds (issue #39): with no limits database/sql opens a new
+// connection for every concurrent statement and never retires idle
+// ones, so a burst — or a database that starts accepting connections
+// but not queries — can exhaust Postgres max_connections and take the
+// whole control plane down.
+//
+// Defaults: 25 open / 10 idle, connections recycled after 30 minutes
+// of any use, idle connections closed after 5 minutes idle. The two
+// size knobs are overridable via RYVEX_PG_MAX_OPEN_CONNS and
+// RYVEX_PG_MAX_IDLE_CONNS (positive integers; anything else — unset,
+// empty, garbage, zero or negative — keeps the default, see
+// poolLimitsFromEnv). The lifetimes are constants; promote them to
+// env vars if an operator ever needs to tune them.
+const (
+	defaultMaxOpenConns = 25
+	defaultMaxIdleConns = 10
+	connMaxLifetime     = 30 * time.Minute
+	connMaxIdleTime     = 5 * time.Minute
+)
+
+// poolLimitsFromEnv resolves the pool size knobs from the environment,
+// defensively: a bad value must never take the control plane down at
+// boot, so only positive integers are honoured. The idle cap is
+// clamped to the open cap — an idle pool larger than the open cap is
+// nonsensical and the order the knobs are set in would otherwise leak.
+func poolLimitsFromEnv() (maxOpen, maxIdle int) {
+	maxOpen = envPositiveInt(os.Getenv("RYVEX_PG_MAX_OPEN_CONNS"), defaultMaxOpenConns)
+	maxIdle = envPositiveInt(os.Getenv("RYVEX_PG_MAX_IDLE_CONNS"), defaultMaxIdleConns)
+	if maxIdle > maxOpen {
+		maxIdle = maxOpen
+	}
+	return maxOpen, maxIdle
+}
+
+// envPositiveInt parses v as a positive integer, falling back to def
+// for anything else (unset, empty, non-numeric, zero, negative).
+func envPositiveInt(v string, def int) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
 // NewStore opens a connection pool against dsn and verifies
 // connectivity (fail fast at boot). The caller owns schema setup via
 // Migrate and must call Close on shutdown.
@@ -43,6 +94,11 @@ func NewStore(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: open: %w", err)
 	}
+	maxOpen, maxIdle := poolLimitsFromEnv()
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(connMaxLifetime)
+	db.SetConnMaxIdleTime(connMaxIdleTime)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
@@ -262,7 +318,8 @@ func (s *Store) ListResources(o state.ListOptions) ([]*state.Resource, string, e
 		if err != nil {
 			return nil, "", err
 		}
-		offset = n
+		// state.DecodeCursor bounds n so the uint64 fits an int.
+		offset = int(n)
 	}
 	limit := o.Limit
 	if limit <= 0 || limit > 200 {
@@ -315,7 +372,7 @@ func (s *Store) ListResources(o state.ListOptions) ([]*state.Resource, string, e
 	}
 	next := ""
 	if len(page) > limit {
-		next = state.EncodeCursor(offset + limit)
+		next = state.EncodeCursor(uint64(offset + limit))
 		page = page[:limit]
 	}
 	return page, next, nil
@@ -546,6 +603,9 @@ func (s *Store) CountByKindPhase() map[string]map[string]int64 {
 
 // ListAudit returns audit entries newest-first. The org filter is a
 // prefix match on the logical key, mirroring the reference store.
+// With no filters at all the WHERE clause is omitted entirely —
+// emitting a bare "WHERE" rendered invalid SQL (issue #39) and every
+// unfiltered call failed.
 func (s *Store) ListAudit(o state.AuditOptions) []state.AuditEntry {
 	limit := o.Limit
 	if limit <= 0 || limit > 500 {
@@ -564,13 +624,21 @@ func (s *Store) ListAudit(o state.AuditOptions) []state.AuditEntry {
 	}
 	args = append(args, limit)
 	query := `SELECT id, ts, actor, action, resource_id, kind, logical_key, generation, reason
-                FROM audit WHERE ` + strings.Join(where, " AND ") +
-		fmt.Sprintf(` ORDER BY seq DESC LIMIT $%d`, len(args))
+                FROM audit`
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, " AND ")
+	}
+	query += fmt.Sprintf(` ORDER BY seq DESC LIMIT $%d`, len(args))
 
 	ctx, cancel := s.ctx()
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
+		// The state.Backend signature carries no error return, so
+		// the failure cannot reach the API layer; it must at least
+		// not be silent (issue #39). A signature change is tracked
+		// as a follow-up — see the #39 PR notes.
+		log.Printf("pgstore: ListAudit query failed, returning empty audit log: %v", err)
 		return nil
 	}
 	defer rows.Close()
@@ -580,11 +648,13 @@ func (s *Store) ListAudit(o state.AuditOptions) []state.AuditEntry {
 		var e state.AuditEntry
 		if err := rows.Scan(&e.ID, &e.Time, &e.Actor, &e.Action, &e.ResourceID,
 			&e.Kind, &e.LogicalKey, &e.Generation, &e.Reason); err != nil {
+			log.Printf("pgstore: ListAudit scan failed, returning empty audit log: %v", err)
 			return nil
 		}
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
+		log.Printf("pgstore: ListAudit iteration failed, returning empty audit log: %v", err)
 		return nil
 	}
 	return out
@@ -592,8 +662,10 @@ func (s *Store) ListAudit(o state.AuditOptions) []state.AuditEntry {
 
 // AppendAudit records a caller-built entry (e.g. webhook delivery
 // outcomes), filling in ID and Time when empty. The completed entry is
-// returned; database failures are swallowed to honour the reference
-// signature (no error return).
+// returned. The state.Backend signature has no error return, so insert
+// failures cannot be threaded to the caller; they are logged loudly
+// instead of being silently dropped (issue #39 — a signature change is
+// tracked as a follow-up, see the #39 PR notes).
 func (s *Store) AppendAudit(e state.AuditEntry) state.AuditEntry {
 	if e.ID == "" {
 		e.ID = newAuditID()
@@ -604,7 +676,8 @@ func (s *Store) AppendAudit(e state.AuditEntry) state.AuditEntry {
 	ctx, cancel := s.ctx()
 	defer cancel()
 	if err := insertAudit(ctx, s.db, e); err != nil {
-		return e
+		log.Printf("pgstore: AppendAudit insert failed, audit entry %s (%s by %s) NOT persisted: %v",
+			e.ID, e.Action, e.Actor, err)
 	}
 	return e
 }

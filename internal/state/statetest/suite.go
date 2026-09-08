@@ -6,6 +6,7 @@ package statetest
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"testing"
 
@@ -49,11 +50,13 @@ func RunSuite(t *testing.T, newStore func(t *testing.T) Store) {
 	t.Run("ListOrderStable", func(t *testing.T) { testListOrderStable(t, newStore(t)) })
 	t.Run("ListLimitClamp", func(t *testing.T) { testListLimitClamp(t, newStore(t)) })
 	t.Run("ListCursorPastEnd", func(t *testing.T) { testListCursorPastEnd(t, newStore(t)) })
+	t.Run("ListPaginationBeyondMaxLimit", func(t *testing.T) { testListPaginationBeyondMaxLimit(t, newStore(t)) })
 	t.Run("Delete", func(t *testing.T) { testDelete(t, newStore(t)) })
 	t.Run("DeleteMissingID", func(t *testing.T) { testDeleteMissingID(t, newStore(t)) })
 	t.Run("AuditTrail", func(t *testing.T) { testAuditTrail(t, newStore(t)) })
 	t.Run("AuditReasonNotRecorded", func(t *testing.T) { testAuditReasonNotRecorded(t, newStore(t)) })
 	t.Run("AppendAudit", func(t *testing.T) { testAppendAudit(t, newStore(t)) })
+	t.Run("AuditListEmptyOptions", func(t *testing.T) { testAuditListEmptyOptions(t, newStore(t)) })
 	t.Run("Count", func(t *testing.T) { testCount(t, newStore(t)) })
 	t.Run("CountByKindPhase", func(t *testing.T) { testCountByKindPhase(t, newStore(t)) })
 }
@@ -475,6 +478,41 @@ func testListCursorPastEnd(t *testing.T, s Store) {
 	}
 }
 
+// testListPaginationBeyondMaxLimit: paging across the 200 max page
+// size boundary (issue #39) — 205 seeded resources, pages of 200 + 5,
+// every seeded ID returned exactly once and no cursor confusion at
+// the boundary.
+func testListPaginationBeyondMaxLimit(t *testing.T, s Store) {
+	t.Helper()
+	want := make(map[string]bool, 205)
+	for i := 0; i < 205; i++ {
+		r, err := s.CreateResource(mkRes("Cache", "acme", "core", "prod", fmt.Sprintf("bulk-%03d", i)), state.WriteOptions{Actor: "t"})
+		if err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+		want[r.ID] = true
+	}
+
+	seen := make(map[string]bool, len(want))
+	items, next, err := s.ListResources(state.ListOptions{Limit: 200})
+	if err != nil || len(items) != 200 || next == "" {
+		t.Fatalf("page 1: %d items next=%q err %v", len(items), next, err)
+	}
+	for _, r := range items {
+		seen[r.ID] = true
+	}
+	items, next, err = s.ListResources(state.ListOptions{Limit: 200, Cursor: next})
+	if err != nil || len(items) != 5 || next != "" {
+		t.Fatalf("page 2: %d items next=%q err %v", len(items), next, err)
+	}
+	for _, r := range items {
+		seen[r.ID] = true
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("pagination returned %d distinct IDs for %d seeded resources (gaps or duplicates)", len(seen), len(want))
+	}
+}
+
 // testDelete covers the original TestDelete: deletion removes the
 // resource, frees the logical address, and is audited.
 func testDelete(t *testing.T, s Store) {
@@ -592,6 +630,37 @@ func testAppendAudit(t *testing.T, s Store) {
 	}
 	if got := s.ListAudit(state.AuditOptions{Kind: "Subscription"}); len(got) != 1 {
 		t.Fatalf("kind filter must include appended entry: %+v", got)
+	}
+}
+
+// testAuditListEmptyOptions: ListAudit with completely empty options
+// (no org, no kind, zero limit) must return the log with default-limit
+// semantics and newest-first order. On the Postgres backend this exact
+// call used to render `WHERE  ORDER BY` — invalid SQL — and come back
+// empty (issue #39).
+func testAuditListEmptyOptions(t *testing.T, s Store) {
+	t.Helper()
+	r1, err := s.CreateResource(mkRes("Application", "acme", "core", "prod", "first"), state.WriteOptions{Actor: "alice"})
+	if err != nil {
+		t.Fatalf("seed 1: %v", err)
+	}
+	r2, err := s.CreateResource(mkRes("Node", "globex", "core", "prod", "second"), state.WriteOptions{Actor: "bob"})
+	if err != nil {
+		t.Fatalf("seed 2: %v", err)
+	}
+
+	entries := s.ListAudit(state.AuditOptions{})
+	if len(entries) != 2 {
+		t.Fatalf("empty options must list every entry (default limit), got %d: %+v", len(entries), entries)
+	}
+	if entries[0].ResourceID != r2.ID || entries[1].ResourceID != r1.ID {
+		t.Fatalf("empty options must stay newest-first: %+v", entries)
+	}
+	if n := s.ListAudit(state.AuditOptions{Limit: -5}); len(n) != 2 {
+		t.Fatalf("non-positive limit must clamp to the default, got %d entries", len(n))
+	}
+	if n := s.ListAudit(state.AuditOptions{Limit: 1}); len(n) != 1 || n[0].ResourceID != r2.ID {
+		t.Fatalf("limit 1 must keep only the newest entry: %+v", n)
 	}
 }
 

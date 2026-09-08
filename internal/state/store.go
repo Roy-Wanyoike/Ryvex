@@ -3,8 +3,10 @@ package state
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -131,7 +133,9 @@ func (s *Store) ListResources(o ListOptions) ([]*Resource, string, error) {
 		if err != nil {
 			return nil, "", ErrBadRequest
 		}
-		offset = n
+		// decodeCursor bounds n to maxCursorOffset, so the uint64
+		// fits an int on every platform.
+		offset = int(n)
 	}
 
 	all := make([]*Resource, 0, len(s.byID))
@@ -161,10 +165,12 @@ func (s *Store) ListResources(o ListOptions) ([]*Resource, string, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	end := offset + limit
+	// Clamp the offset BEFORE computing end: a hostile or stale
+	// cursor near the int ceiling must not overflow offset+limit.
 	if offset > len(all) {
 		offset = len(all)
 	}
+	end := offset + limit
 	if end > len(all) {
 		end = len(all)
 	}
@@ -174,7 +180,7 @@ func (s *Store) ListResources(o ListOptions) ([]*Resource, string, error) {
 	}
 	next := ""
 	if end < len(all) {
-		next = encodeCursor(end)
+		next = encodeCursor(uint64(end))
 	}
 	return page, next, nil
 }
@@ -376,14 +382,45 @@ func specLabelsEqual(a, b *Resource) bool {
 	return string(r1) == string(r2)
 }
 
-func encodeCursor(n int) string {
-	return base64.RawURLEncoding.EncodeToString([]byte{byte(n >> 8), byte(n)})
+// Cursor format (issue #39):
+//
+//      v2 (current):  8 bytes, big-endian uint64 offset, base64url
+//      v1 (legacy):   2 bytes, big-endian offset, base64url
+//
+// The v1 cursor wrapped at 65,535: larger offsets silently truncated
+// and decodeCursor handed back a small WRONG offset, so pages
+// duplicated. v2 encodes the full 64-bit offset; decode still accepts
+// the legacy 2-byte form (same offset semantics) so tokens issued
+// before the upgrade keep working.
+
+// maxCursorOffset is the decode bound. No legitimate list page can
+// produce an offset beyond it (that would need >2^31 rows), and
+// keeping offsets within int32 range makes the uint64->int conversion
+// and offset+limit arithmetic safe on every platform. Offsets past it
+// are rejected with ErrBadRequest instead of wrapping silently.
+const maxCursorOffset = math.MaxInt32
+
+func encodeCursor(n uint64) string {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], n)
+	return base64.RawURLEncoding.EncodeToString(b[:])
 }
 
-func decodeCursor(c string) (int, error) {
+func decodeCursor(c string) (uint64, error) {
 	b, err := base64.RawURLEncoding.DecodeString(c)
-	if err != nil || len(b) != 2 {
+	if err != nil {
 		return 0, ErrBadRequest
 	}
-	return int(b[0])<<8 | int(b[1]), nil
+	switch len(b) {
+	case 8: // v2
+		n := binary.BigEndian.Uint64(b)
+		if n > maxCursorOffset {
+			return 0, ErrBadRequest
+		}
+		return n, nil
+	case 2: // v1 legacy: offset semantics unchanged
+		return uint64(b[0])<<8 | uint64(b[1]), nil
+	default:
+		return 0, ErrBadRequest
+	}
 }
