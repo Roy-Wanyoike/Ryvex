@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Roy-Wanyoike/Ryvex/internal/authz"
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/reconcile"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
@@ -23,6 +24,10 @@ type Server struct {
 	reconciler *reconcile.Reconciler
 	log        *slog.Logger
 	mux        *http.ServeMux
+	// authorizer enables RBAC (issue #16). nil keeps the legacy
+	// bearer-only AuthMiddleware and hides /v1/keys.
+	authorizer *authz.Authorizer
+	keys       *KeyService
 }
 
 // ServerOptions configures NewServer.
@@ -32,18 +37,29 @@ type ServerOptions struct {
 	// CORSOrigins lists browser origins allowed to call the API
 	// (e.g. "http://localhost:3100"). Empty disables CORS.
 	CORSOrigins []string
+	// Authorizer, when set, replaces bearer-only auth with
+	// org/project-scoped RBAC (issue #16) and enables the /v1/keys
+	// management face. nil preserves the legacy AuthMiddleware.
+	Authorizer *authz.Authorizer
 }
 
 // NewServer builds the full handler stack:
-// RequestID -> Recover -> Log -> Auth -> routes.
-// The store is state.Backend (memory or Postgres, issue #14); the bus
-// is bus.BusI so both the in-memory bus and the JetStream bus
-// (issue #15) can serve the same handler.
+// RequestID -> Recover -> Log -> CORS -> Auth -> routes.
+// With Authorizer set, Auth is enforced by AuthZMiddleware (RBAC);
+// otherwise the legacy AuthMiddleware applies. The store is
+// state.Backend (memory or Postgres, issue #14); the bus is bus.BusI
+// so both the in-memory bus and the JetStream bus (issue #15) can
+// serve the same handler.
 func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o ServerOptions) http.Handler {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
 	s := &Server{store: store, bus: b, reconciler: rec, log: o.Logger, mux: http.NewServeMux()}
+	// --- RBAC (issue #16): authorizer + keys service ---
+	if o.Authorizer != nil {
+		s.authorizer = o.Authorizer
+		s.keys = NewKeyService(store, o.Logger)
+	}
 
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/v1/", s.routeV1)
@@ -58,12 +74,16 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 
 	// /healthz stays open; everything under /v1 requires a key.
 	o.Auth.SkipPrefixes = append(o.Auth.SkipPrefixes, "/healthz")
+	authMW := AuthMiddleware(o.Auth, o.Logger)
+	if s.authorizer != nil {
+		authMW = AuthZMiddleware(o.Authorizer, o.Auth.DevAuth, o.Auth.APIKeys)
+	}
 	stack := Chain(
 		RequestIDMiddleware,
 		RecoverMiddleware(o.Logger),
 		LogMiddleware(o.Logger),
 		CORSMiddleware(o.CORSOrigins),
-		AuthMiddleware(o.Auth, o.Logger),
+		authMW,
 	)
 	return stack(s.mux)
 }
@@ -89,25 +109,35 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	endpoints := []string{
+		"GET    /healthz",
+		"GET    /v1",
+		"POST   /v1/resources",
+		"GET    /v1/resources?org=&project=&env=&kind=&limit=&cursor=",
+		"GET    /v1/resources/{id}",
+		"DELETE /v1/resources/{id}",
+		"GET    /v1/{org}/events?limit=",
+		"GET    /v1/{org}/audit?kind=&limit=",
+		"POST   /v1/{org}/reconcile/{id}",
+		"GET    /v1/{org}/{project}/{env}/{kind}",
+		"GET    /v1/{org}/{project}/{env}/{kind}/{name}",
+		"PUT    /v1/{org}/{project}/{env}/{kind}/{name}",
+		"DELETE /v1/{org}/{project}/{env}/{kind}/{name}",
+	}
+	// --- RBAC (issue #16): key management face ---
+	if s.authorizer != nil {
+		endpoints = append(endpoints,
+			"POST   /v1/keys",
+			"GET    /v1/keys",
+			"PUT    /v1/keys/{id}",
+			"DELETE /v1/keys/{id}",
+		)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name":    "Ryvex Control Plane API",
-		"version": Version,
-		"endpoints": []string{
-			"GET    /healthz",
-			"GET    /v1",
-			"POST   /v1/resources",
-			"GET    /v1/resources?org=&project=&env=&kind=&limit=&cursor=",
-			"GET    /v1/resources/{id}",
-			"DELETE /v1/resources/{id}",
-			"GET    /v1/{org}/events?limit=",
-			"GET    /v1/{org}/audit?kind=&limit=",
-			"POST   /v1/{org}/reconcile/{id}",
-			"GET    /v1/{org}/{project}/{env}/{kind}",
-			"GET    /v1/{org}/{project}/{env}/{kind}/{name}",
-			"PUT    /v1/{org}/{project}/{env}/{kind}/{name}",
-			"DELETE /v1/{org}/{project}/{env}/{kind}/{name}",
-		},
-		"docs": "docs/api-contracts.md",
+		"name":      "Ryvex Control Plane API",
+		"version":   Version,
+		"endpoints": endpoints,
+		"docs":      "docs/api-contracts.md",
 	})
 }
 
@@ -156,6 +186,26 @@ func (s *Server) routeV1(w http.ResponseWriter, r *http.Request) {
 		r.SetPathValue("org", seg[0])
 		r.SetPathValue("id", seg[2])
 		s.handleReconcile(w, r)
+	// --- RBAC (issue #16): managed API keys (admin-only handlers) ---
+	case seg[0] == "keys" && len(seg) == 1 && s.authorizer != nil:
+		switch r.Method {
+		case http.MethodGet:
+			s.handleKeysList(w, r)
+		case http.MethodPost:
+			s.handleKeysCreate(w, r)
+		default:
+			methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
+		}
+	case seg[0] == "keys" && len(seg) == 2 && s.authorizer != nil:
+		r.SetPathValue("id", seg[1])
+		switch r.Method {
+		case http.MethodPut:
+			s.handleKeysUpdate(w, r)
+		case http.MethodDelete:
+			s.handleKeysDelete(w, r)
+		default:
+			methodNotAllowed(w, r, http.MethodPut, http.MethodDelete)
+		}
 	case len(seg) == 4:
 		s.handleScopeList(w, r, seg)
 	case len(seg) == 5:
