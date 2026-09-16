@@ -496,6 +496,8 @@ type TracerProviderIface interface {
 //     (default 1.0 = always sample when enabled).
 //   - transport: OTLP/HTTP (otlptracehttp); TLS unless --otlp-insecure
 //     or an http:// --otlp-endpoint, which forces plain HTTP.
+//   - endpoint forms: the documented host:port (e.g. localhost:4318)
+//     plus explicit http:// and https:// URLs (issue #123).
 //   - an unreachable collector does NOT fail the boot: the exporter
 //     creates no connection here and batches spans in memory, so a
 //     missing collector degrades observability, never availability.
@@ -503,18 +505,9 @@ func setupTracing(ctx context.Context, log *slog.Logger, endpoint string, insecu
 	if endpoint == "" {
 		return nil, nil // true interface nil: never a typed *sdktrace.TracerProvider (issue #122)
 	}
-	if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" {
-		switch u.Scheme {
-		case "http":
-			insecure = true
-		case "https":
-			// TLS is the default; nothing to override.
-		default:
-			return nil, fmt.Errorf("invalid --otlp-endpoint %q: want host:port, http:// or https://", endpoint)
-		}
-		if u.Host != "" {
-			endpoint = u.Host
-		}
+	endpoint, insecure, err := normalizeOTLPEndpoint(endpoint, insecure)
+	if err != nil {
+		return nil, err
 	}
 	if ratio < 0 {
 		ratio = 0
@@ -548,6 +541,54 @@ func setupTracing(ctx context.Context, log *slog.Logger, endpoint string, insecu
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	log.Info("tracing enabled", "endpoint", endpoint, "insecure", insecure, "sample_ratio", ratio, "propagator", "W3C tracecontext")
 	return tp, nil
+}
+
+// normalizeOTLPEndpoint accepts every --otlp-endpoint form the flag
+// help, main's usage text and .env.example document (issue #123):
+//
+//   - host:port, e.g. "localhost:4318" — the advertised form; TLS
+//     unless --otlp-insecure. url.Parse misreads it as scheme
+//     "localhost" + opaque "4318" and rejects it, so it is validated
+//     structurally with net.SplitHostPort instead.
+//   - http://host:port — forces plain HTTP (no TLS).
+//   - https://host:port — TLS (the default).
+//
+// It returns the bare host:port the OTLP exporter expects plus the
+// resolved insecure flag. Anything else — unknown schemes, bare
+// hostnames without a port, hostless or non-numeric ports, prose — is
+// a boot error.
+func normalizeOTLPEndpoint(endpoint string, insecure bool) (string, bool, error) {
+	invalid := fmt.Errorf("invalid --otlp-endpoint %q: want host:port, http:// or https://", endpoint)
+	if strings.Contains(endpoint, "://") {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			return "", false, invalid
+		}
+		switch u.Scheme {
+		case "http":
+			insecure = true
+		case "https":
+			// TLS is the default; nothing to override.
+		default:
+			return "", false, invalid
+		}
+		if u.Host == "" {
+			return "", false, invalid // "http://" alone has no destination
+		}
+		return u.Host, insecure, nil
+	}
+	// No scheme: the documented host:port form (issue #123).
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", false, invalid
+	}
+	if host == "" {
+		return "", false, invalid // ":4318" has no destination
+	}
+	if n, perr := strconv.Atoi(port); perr != nil || n < 1 || n > 65535 {
+		return "", false, invalid
+	}
+	return endpoint, insecure, nil
 }
 
 func newLogger(level string) (*slog.Logger, error) {
