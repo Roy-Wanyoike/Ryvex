@@ -16,6 +16,15 @@ const (
 	ReservedEnv     = "system"
 )
 
+// IsReservedOrg reports whether org is a reserved control-plane
+// namespace (currently only "ryvex", home of the managed-key namespace).
+// Issue #118: the authorization layer treats reserved orgs as
+// admin-only for WRITES — extend this predicate if a new reserved org
+// is ever introduced, and every non-admin write into it is refused.
+func IsReservedOrg(org string) bool {
+	return org == ReservedOrg
+}
+
 // RBAC roles a key may hold (issue #16).
 const (
 	RoleAdmin    = "admin"

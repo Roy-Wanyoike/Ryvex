@@ -2,6 +2,7 @@ package authz
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
@@ -112,6 +113,42 @@ func TestAuthenticateAndRoleMatrix(t *testing.T) {
 	}
 	if d := az.Authorize("nobody", "acme", "", false); d.Allowed {
 		t.Fatalf("unknown principal allowed")
+	}
+}
+
+// Issue #118: the reserved org is admin-write-only at the authority
+// layer, regardless of kind. A non-admin key scoped org/ryvex (however
+// it came to exist) must not write there — the generic routes would
+// otherwise let it mint an admin APIKey (roles + key_hash) and
+// self-elevate on the next refresh. Reads are deliberately untouched:
+// scope policy still governs them.
+func TestAuthorizeReservedOrgWriteGuard(t *testing.T) {
+	az, _ := newAuthz(t,
+		keyRes("root", []string{state.RoleAdmin}, []string{"org/*"}, true),
+		keyRes("ryvex-ops", []string{state.RoleOperator}, []string{"org/" + state.ReservedOrg}, true),
+	)
+
+	cases := []struct {
+		name         string
+		principal    string
+		org, project string
+		write        bool
+		want         bool
+	}{
+		{"operator write reserved org", "ryvex-ops", state.ReservedOrg, state.ReservedProject, true, false},
+		{"operator org-wide write reserved org", "ryvex-ops", state.ReservedOrg, "", true, false},
+		{"operator read reserved org (scope-governed, unchanged)", "ryvex-ops", state.ReservedOrg, state.ReservedProject, false, true},
+		{"admin write reserved org (key management)", "root", state.ReservedOrg, state.ReservedProject, true, true},
+	}
+	for _, tc := range cases {
+		if got := az.Authorize(tc.principal, tc.org, tc.project, tc.write).Allowed; got != tc.want {
+			t.Errorf("%s: allowed=%v want %v", tc.name, got, tc.want)
+		}
+	}
+	// The denial names the reservation, not a scope miss — the guard
+	// fires even though the caller's scope DOES cover the target.
+	if d := az.Authorize("ryvex-ops", state.ReservedOrg, state.ReservedProject, true); d.Allowed || !strings.Contains(d.Reason, "reserved") {
+		t.Fatalf("reserved-org denial reason unexpected: %+v", d)
 	}
 }
 

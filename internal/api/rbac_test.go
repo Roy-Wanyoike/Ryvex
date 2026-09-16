@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -235,6 +236,100 @@ func TestRBACCrossOrgBodyScope(t *testing.T) {
 	// scope-path write outside project: denied
 	if w := doAuth(t, h, http.MethodPut, "/v1/acme/billing/prod/applications/x", tok, appBodyAcme); w.Code != http.StatusForbidden {
 		t.Fatalf("scope-path write outside project: want 403, got %d", w.Code)
+	}
+}
+
+// ---- issue #118: the reserved org is admin-write-only at the authz layer ----
+
+// reservedAPIKeyBody builds a syntactically valid admin APIKey resource
+// body for the reserved namespace — exactly what a self-elevation
+// attempt carries: roles [admin] plus a key_hash.
+func reservedAPIKeyBody(t *testing.T, principal string) string {
+	t.Helper()
+	return fmt.Sprintf(`{"kind":"APIKey","org":%q,"project":%q,"env":%q,"name":%q,`+
+		`"spec":{"principal":%q,"roles":["admin"],"key_hash":%q,"scopes":["org/*"],"active":true}}`,
+		state.ReservedOrg, state.ReservedProject, state.ReservedEnv, principal,
+		principal, authz.HashToken("ryk_"+principal))
+}
+
+// TestRBACReservedOrgWriteGuard pins the #118 fix: a non-admin key
+// scoped org/ryvex must get 403 + an audited authz_denied on BOTH
+// generic write routes into the reserved org (body-scoped POST and the
+// 5-segment scope PUT), regardless of kind — while admin key management
+// there and non-reserved-org writes stay untouched.
+func TestRBACReservedOrgWriteGuard(t *testing.T) {
+	admin := "ryk_admin_res_0001"
+	h, store := newRBACServer(t, admin)
+	// The threat premise of #118: a non-admin key scoped to the reserved
+	// org. Mintable today via /v1/keys (ValidScope still accepts org/ryvex
+	// for non-admin keys), so the guard must not depend on how the scope
+	// got there. A normal acme operator isolates the guard's blast radius.
+	ops, _ := mintKey(t, h, admin, "ryvex-ops", "operator", state.ReservedOrg, "")
+	acme, _ := mintKey(t, h, admin, "acme-ops", "operator", "acme", "")
+
+	// Route 1: POST /v1/resources, body-scoped org=ryvex, kind=APIKey,
+	// roles [admin]. Used to pass authz on the org/ryvex scope and mint
+	// an admin key. Now refused at the authorization layer with the
+	// frozen 403 envelope.
+	body := reservedAPIKeyBody(t, "elevated")
+	w := doAuth(t, h, http.MethodPost, "/v1/resources", ops, body)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("reserved-org APIKey mint via POST /v1/resources: want 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), CodeForbidden) {
+		t.Fatalf("403 must use the frozen envelope code: %s", w.Body.String())
+	}
+
+	// Route 2: the 5-segment scope route PUT /v1/ryvex/system/system/
+	// apikey/<name> (upsert semantics would create the resource).
+	w = doAuth(t, h, http.MethodPut, "/v1/ryvex/system/system/apikey/elevated", ops, body)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("reserved-org APIKey mint via scope PUT: want 403, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Regardless of kind: the guard keys off the TARGET org, not the
+	// payload — a plain Application write into the reserved org is
+	// refused at the same layer (it used to pass authz and only die
+	// later in Validate).
+	w = doAuth(t, h, http.MethodPost, "/v1/resources", ops,
+		`{"kind":"Application","org":"ryvex","project":"system","env":"prod","name":"nope","spec":{"image":"demo:1"}}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("reserved-org non-APIKey write: want 403, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// End state: the reserved namespace gained nothing.
+	if _, err := store.GetByLogicalKey(state.ReservedOrg, state.ReservedProject, state.ReservedEnv, state.KindAPIKey, "elevated"); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("elevated key must not exist: err=%v", err)
+	}
+
+	// Every denial is audited as authz_denied under the reserved org,
+	// attributed to the caller.
+	entries, err := store.ListAudit(state.AuditOptions{Org: state.ReservedOrg, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	audited := 0
+	for _, e := range entries {
+		if e.Action == "authz_denied" && e.Actor == "ryvex-ops" {
+			audited++
+		}
+	}
+	if audited < 3 {
+		t.Fatalf("want >=3 audited authz_denied entries for ryvex-ops, got %d in %+v", audited, entries)
+	}
+
+	// Existing behavior preserved: the admin can still manage APIKey
+	// resources in the reserved org through the generic routes.
+	if w := doAuth(t, h, http.MethodPost, "/v1/resources", admin, reservedAPIKeyBody(t, "elevated")); w.Code != http.StatusCreated {
+		t.Fatalf("admin APIKey create in reserved org: want 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if w := doAuth(t, h, http.MethodPut, "/v1/ryvex/system/system/apikey/elevated2", admin, reservedAPIKeyBody(t, "elevated2")); w.Code != http.StatusCreated {
+		t.Fatalf("admin APIKey upsert via scope PUT: want 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Non-reserved org writes are unaffected by the guard.
+	if w := doAuth(t, h, http.MethodPost, "/v1/resources", acme, appBodyAcme); w.Code != http.StatusCreated {
+		t.Fatalf("non-reserved org write: want 201, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

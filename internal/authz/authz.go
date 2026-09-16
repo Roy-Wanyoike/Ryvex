@@ -11,7 +11,9 @@
 // viewer (read-only inside its scopes). Scope "org/<org>" covers all
 // projects in the org; "org/<org>/project/<project>" covers exactly
 // that project. No matching scope → deny. Inactive keys never
-// authenticate.
+// authenticate. Reserved orgs (state.IsReservedOrg, issue #118) are
+// admin-write-only: a non-admin write targeting them is denied before
+// scope matching, regardless of kind.
 package authz
 
 import (
@@ -202,6 +204,32 @@ func (a *Authorizer) Authorize(principal, org, project string, write bool) Decis
 	}
 	if hasRole(info.Roles, state.RoleAdmin) {
 		return allow("admin role")
+	}
+	// Issue #118 (defense in depth): the reserved org hosts the
+	// managed-key namespace, and the state layer cannot defend it —
+	// Validate only guards KIND there (resource.go), because KindAPIKey
+	// is REQUIRED to live in the reserved org. So a non-admin key scoped
+	// org/ryvex could otherwise mint an APIKey resource carrying
+	// roles:[admin] + key_hash through the generic write routes
+	// (POST /v1/resources with a body-scoped org, or PUT
+	// /v1/ryvex/system/system/apikey/<name>) and self-elevate on the
+	// next authorizer refresh.
+	//
+	// Choke-point choice (documented per the issue): authority is
+	// enforced HERE, in Authorize — the single gate every scope-derived
+	// request passes through (api.AuthZMiddleware) — rather than in
+	// state.ValidScope. ValidScope is an actor-agnostic spec validator
+	// consulted only when a key spec is created or updated: it never
+	// sees a request, so it cannot cover the generic write paths, and
+	// refusing org/ryvex there would retroactively strand EXISTING
+	// org/ryvex-scoped keys (Refresh skips unparseable specs, so they
+	// would stop authenticating outright). Guarding Authorize instead
+	// refuses every non-admin WRITE into a reserved org, regardless of
+	// kind, with no migration hazard. Admin keys short-circuit above, so
+	// reserved-org key management is unchanged; the /v1/keys routes
+	// self-enforce admin upstream and never reach this check.
+	if write && state.IsReservedOrg(org) {
+		return deny("org " + org + " is reserved for managed keys; writes require the admin role")
 	}
 	if write && hasRole(info.Roles, state.RoleViewer) {
 		return deny("viewer role is read-only")
