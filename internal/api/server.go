@@ -15,6 +15,11 @@ import (
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/reconcile"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Version is reported on /healthz and the API index.
@@ -34,6 +39,11 @@ type Server struct {
 	// version is the plumbed build version (issue #38); it falls
 	// back to the package const when ServerOptions.Version is empty.
 	version string
+	// tracer mints the server span (via TracingMiddleware) and the
+	// store-write child spans issued by handlers (issue #83). With
+	// ServerOptions.TracerProvider nil it is the global default
+	// provider — the no-op — so every span call is near-free.
+	tracer trace.Tracer
 	// staticKeys holds sha256 digests of the bootstrap tokens for
 	// constant-time comparison in the LEGACY bearer-only mode
 	// (issue #38). In RBAC mode it stays empty: authentication is
@@ -58,15 +68,25 @@ type ServerOptions struct {
 	// #38, stamped via ldflags in cmd/ryvexd). Empty falls back to
 	// the package Version const.
 	Version string
+	// TracerProvider, when non-nil, enables OpenTelemetry tracing
+	// (issue #83): a W3C tracecontext server span per request
+	// (route-labeled, status recorded, X-Ryvex-Trace-Id echoed) and
+	// nested store-write child spans. nil — the default — disables
+	// tracing outright: TracingMiddleware is not installed and the
+	// global no-op provider serves every remaining span call. The
+	// daemon wires the SDK provider here when --otlp-endpoint is set.
+	TracerProvider trace.TracerProvider
 }
 
 // NewServer builds the full handler stack:
-// RequestID -> Recover -> SecurityHeaders -> Log -> CORS -> Auth -> routes.
-// With Authorizer set, Auth is enforced by AuthZMiddleware (RBAC);
-// otherwise the legacy AuthMiddleware applies. The store is
-// state.Backend (memory or Postgres, issue #14); the bus is bus.BusI
-// so both the in-memory bus and the JetStream bus (issue #15) can
-// serve the same handler.
+// RequestID -> Tracing -> Recover -> SecurityHeaders -> Log -> CORS ->
+// Auth -> routes. The Tracing element is present only when
+// ServerOptions.TracerProvider is set (issue #83); when tracing is
+// disabled the chain is exactly the pre-#83 stack. With Authorizer
+// set, Auth is enforced by AuthZMiddleware (RBAC); otherwise the
+// legacy AuthMiddleware applies. The store is state.Backend (memory
+// or Postgres, issue #14); the bus is bus.BusI so both the in-memory
+// bus and the JetStream bus (issue #15) can serve the same handler.
 func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o ServerOptions) http.Handler {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -86,6 +106,13 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 		store: store, bus: b, reconciler: rec, log: o.Logger, mux: http.NewServeMux(),
 		version: o.Version, staticKeys: ix, devAuth: o.Auth.DevAuth,
 	}
+	// --- OpenTelemetry (issue #83): tracer for the server span and
+	// handler-issued store spans. nil provider = the global default
+	// (no-op): spans are minted but cost nothing and export nothing.
+	if o.TracerProvider == nil {
+		o.TracerProvider = otel.GetTracerProvider()
+	}
+	s.tracer = o.TracerProvider.Tracer("github.com/Roy-Wanyoike/Ryvex/internal/api")
 	// --- RBAC (issue #16): authorizer + keys service ---
 	if o.Authorizer != nil {
 		s.authorizer = o.Authorizer
@@ -112,6 +139,7 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 	}
 	stack := Chain(
 		RequestIDMiddleware,
+		TracingMiddleware(o.TracerProvider), // nil = disabled: element forwards unchanged (issue #83)
 		RecoverMiddleware(o.Logger),
 		SecurityHeadersMiddleware,
 		LogMiddleware(o.Logger),
@@ -135,6 +163,29 @@ func Chain(mws ...func(http.Handler) http.Handler) func(http.Handler) http.Handl
 // /readyz so a wedged dependency cannot stall a probe past the k8s
 // probe timeout (deploy/k8s/04-ryvexd.yaml allows 3s).
 const probeTimeout = 2 * time.Second
+
+// startStoreSpan opens a child span for one store mutation issued
+// from an API handler (issue #83). It nests under the request's
+// server span (the request context carries it) and is named for the
+// operation — "store.create" / "store.update" / "store.delete" — so a
+// write request reads as server span -> store span in any trace
+// backend. Store READS are deliberately not spanned, and the span
+// lives at the handler call site rather than inside the store package:
+// every API write issues exactly one store write, so this yields
+// handler-call-site granularity without coupling the store seam (and
+// its parallel work, issue #115) to OpenTelemetry.
+func (s *Server) startStoreSpan(ctx context.Context, op string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	return s.tracer.Start(ctx, op, trace.WithAttributes(attrs...))
+}
+
+// endStoreSpan records the store error (if any) and closes the span.
+func endStoreSpan(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+}
 
 // handleHealthz serves the liveness probe. It stays HTTP 200 even
 // when dependencies are down (a restart cannot fix a dead Postgres —

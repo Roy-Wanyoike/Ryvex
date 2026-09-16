@@ -65,6 +65,17 @@ Entries are reconstructed from the git history and the shipped ledger in
   (`docs/audit/`) (PR #88)
 - Console test harness: `bun test` suite guarding the truth-in-UI
   logic (live vs demo states, health reporting) (#77)
+- OpenTelemetry traces across the `/v1` face (issue #83): OTLP/HTTP
+  exporter via `--otlp-endpoint` / `RYVEX_OTLP_ENDPOINT` (+
+  `--otlp-insecure`, `--tracing-sample-ratio`; off by default — the
+  no-op provider costs nothing when unset), W3C tracecontext
+  propagation with parent-based sampling, route-labeled server spans
+  per request (`X-Ryvex-Trace-Id` echoed only when tracing is on),
+  `store.*` child spans for API store writes, `reconcile.scan` /
+  `reconcile.resource` spans for reconcile passes, `webhook.deliver`
+  spans with an outgoing W3C `traceparent` on deliveries, and the
+  request-ID audit bridge: `request_id` rides the server span as a
+  span attribute and the access log carries both IDs
 
 ### Changed
 

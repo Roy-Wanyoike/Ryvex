@@ -24,6 +24,13 @@ import (
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state/pgstore"
 	"github.com/Roy-Wanyoike/Ryvex/internal/webhook"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 // runServe boots the full control plane stack:
@@ -40,6 +47,17 @@ func runServe(args []string) error {
 	devAuth := fs.Bool("dev-auth", false, "accept any ryk_ bearer token (development only)")
 	apiKeys := fs.String("api-keys", envOr("RYVEX_API_KEYS", ""), "static API keys as name=token,comma-separated")
 	corsOrigins := fs.String("cors-origins", envOr("RYVEX_CORS_ORIGINS", ""), "browser origins allowed to call the API, comma-separated")
+	// --- OpenTelemetry traces (issue #83): tracing is OFF by default.
+	// With no endpoint the SDK never boots and the global tracer
+	// provider stays the no-op default, so every span in the codebase
+	// degenerates to a no-op: the overhead is a nil-check per request.
+	otlpEndpoint := fs.String("otlp-endpoint", envOr("RYVEX_OTLP_ENDPOINT", ""),
+		"OTLP/HTTP trace export endpoint as host:port (e.g. localhost:4318); empty disables tracing. An http:// prefix forces plain HTTP (no TLS)")
+	otlpInsecure := fs.Bool("otlp-insecure", envBoolOr("RYVEX_OTLP_INSECURE", false),
+		"export traces over plain http:// (no TLS); also implied by an http:// --otlp-endpoint")
+	sampleRatio := fs.Float64("tracing-sample-ratio", envFloatOr("RYVEX_TRACING_SAMPLE_RATIO", 1.0),
+		"trace sample ratio when tracing is enabled (0.0-1.0; parent-based: spans of a sampled upstream trace always follow it)")
+	// --- end tracing flags ---
 	seed := fs.Bool("seed", false, "load the demo dataset on boot")
 	// Metrics sidecar (issue #17): empty disables the endpoint.
 	metricsAddr := fs.String("metrics-addr", envOr("RYVEX_METRICS_ADDR", ""), "dedicated listen address for /metrics and /healthz passthrough (empty disables metrics)")
@@ -66,6 +84,15 @@ func runServe(args []string) error {
 	}
 
 	log, err := newLogger(*logLevel)
+	if err != nil {
+		return err
+	}
+
+	// --- OpenTelemetry traces (issue #83): SDK boot + global wiring.
+	// tracerProvider is nil when tracing is disabled; every consumer
+	// (API server, reconciler, webhook dispatcher) falls back to the
+	// global no-op provider in that case.
+	tracerProvider, err := setupTracing(context.Background(), log, *otlpEndpoint, *otlpInsecure, *sampleRatio)
 	if err != nil {
 		return err
 	}
@@ -148,17 +175,19 @@ func runServe(args []string) error {
 	}
 
 	reconciler := reconcile.New(store, eventBus, reconcile.Options{
-		Interval:      30 * time.Second,
-		Concurrency:   4,
-		Logger:        log,
-		Actuators:     acts,
-		DriftInterval: *driftInterval,
+		Interval:       30 * time.Second,
+		Concurrency:    4,
+		Logger:         log,
+		Actuators:      acts,
+		DriftInterval:  *driftInterval,
+		TracerProvider: tracerProvider, // nil = no-op spans (issue #83)
 	})
 
 	// --- webhooks (issue #13): event dispatcher ---
 	dispatcher := webhook.NewDispatcher(store, eventBus, webhook.Options{
-		ServerSecret: *webhookSecret,
-		Logger:       log,
+		ServerSecret:   *webhookSecret,
+		Logger:         log,
+		TracerProvider: tracerProvider, // nil = no-op spans (issue #83)
 	})
 
 	auth := api.AuthOptions{DevAuth: *devAuth, APIKeys: map[string]string{}}
@@ -194,11 +223,12 @@ func runServe(args []string) error {
 	// --- end RBAC (issue #16) ---
 
 	handler := api.NewServer(store, eventBus, reconciler, api.ServerOptions{
-		Auth:        auth,
-		Logger:      log,
-		CORSOrigins: splitCommaList(*corsOrigins),
-		Authorizer:  authorizer,
-		Version:     Version, // plumbed to /healthz and the /v1 index (issue #38)
+		Auth:           auth,
+		Logger:         log,
+		CORSOrigins:    splitCommaList(*corsOrigins),
+		Authorizer:     authorizer,
+		Version:        Version,        // plumbed to /healthz and the /v1 index (issue #38)
+		TracerProvider: tracerProvider, // nil = tracing disabled (issue #83)
 	})
 	srv := newHTTPServer(*httpAddr, handler)
 
@@ -266,6 +296,16 @@ func runServe(args []string) error {
 	recCancel()
 	reconciler.Stop(3 * time.Second)
 	dispatcher.Stop(3 * time.Second) // --- webhooks (issue #13) ---
+	// --- OpenTelemetry traces (issue #83): flush the exporter before
+	// exit — the last chance to ship the spans recorded during drain
+	// (final reconcile passes, delivery attempts, the shutdown log).
+	if tracerProvider != nil {
+		fctx, fcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer fcancel()
+		if err := tracerProvider.Shutdown(fctx); err != nil {
+			log.Warn("trace exporter shutdown", "err", err)
+		}
+	}
 	// --- nats bus (issue #15): drain subscriptions + connection ---
 	if closer, ok := eventBus.(interface{ Close() error }); ok {
 		_ = closer.Close()
@@ -418,6 +458,74 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
+// setupTracing boots the OpenTelemetry SDK when an OTLP endpoint is
+// configured (issue #83). It returns the started provider — whose
+// Shutdown flushes the exporter on the graceful-shutdown path — or nil
+// when tracing is disabled (the default posture: the global tracer
+// provider stays the no-op default and every span in the codebase
+// degenerates to a no-op).
+//
+// Semantics:
+//   - propagation: W3C tracecontext, registered globally; an upstream
+//     traceparent continues its trace (parent-based sampling).
+//   - sampling: parentbased_traceidratio with --tracing-sample-ratio
+//     (default 1.0 = always sample when enabled).
+//   - transport: OTLP/HTTP (otlptracehttp); TLS unless --otlp-insecure
+//     or an http:// --otlp-endpoint, which forces plain HTTP.
+//   - an unreachable collector does NOT fail the boot: the exporter
+//     creates no connection here and batches spans in memory, so a
+//     missing collector degrades observability, never availability.
+func setupTracing(ctx context.Context, log *slog.Logger, endpoint string, insecure bool, ratio float64) (*sdktrace.TracerProvider, error) {
+	if endpoint == "" {
+		return nil, nil
+	}
+	if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" {
+		switch u.Scheme {
+		case "http":
+			insecure = true
+		case "https":
+			// TLS is the default; nothing to override.
+		default:
+			return nil, fmt.Errorf("invalid --otlp-endpoint %q: want host:port, http:// or https://", endpoint)
+		}
+		if u.Host != "" {
+			endpoint = u.Host
+		}
+	}
+	if ratio < 0 {
+		ratio = 0
+	} else if ratio > 1 {
+		ratio = 1
+	}
+	opts := []otlptracehttp.Option{otlptracehttp.WithEndpoint(endpoint)}
+	if insecure {
+		opts = append(opts, otlptracehttp.WithInsecure())
+	}
+	exporter, err := otlptracehttp.New(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("otlp trace exporter: %w", err)
+	}
+	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(
+		attribute.String("service.name", "ryvexd"),
+		attribute.String("service.version", Version),
+	))
+	if err != nil {
+		return nil, fmt.Errorf("trace resource: %w", err)
+	}
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))),
+	)
+	// Global wiring: plain otel.Tracer call sites (if any appear) and
+	// the W3C propagator used by the API middleware and the webhook
+	// dispatcher both resolve from here.
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	log.Info("tracing enabled", "endpoint", endpoint, "insecure", insecure, "sample_ratio", ratio, "propagator", "W3C tracecontext")
+	return tp, nil
+}
+
 func newLogger(level string) (*slog.Logger, error) {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
@@ -442,6 +550,28 @@ func envIntOr(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// envFloatOr reads a float env var, falling back to def when unset or
+// invalid (issue #83 --tracing-sample-ratio).
+func envFloatOr(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+// envBoolOr reads a bool env var (1/t/T/true/TRUE, ...), falling back
+// to def when unset or invalid (issue #83 --otlp-insecure).
+func envBoolOr(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def

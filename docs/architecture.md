@@ -167,6 +167,9 @@ ryvexd serve --http :8080 --dev-auth --seed --cors-origins http://localhost:3100
 | `--webhook-secret` | `RYVEX_WEBHOOK_SECRET` | HMAC key for webhook signatures (random per boot when unset) |
 | `--audit-cap` | `RYVEX_AUDIT_CAP` | Max audit entries kept by the **memory** backend, oldest evicted first (default 10000; ignored with `--store postgres`, issue #85) |
 | `--metrics-addr` | `RYVEX_METRICS_ADDR` | Dedicated `/metrics` sidecar address (empty disables) |
+| `--otlp-endpoint` | `RYVEX_OTLP_ENDPOINT` | OTLP/HTTP trace export endpoint `host:port` (e.g. `localhost:4318`); **empty disables tracing** (issue #83). An `http://` prefix forces plain HTTP |
+| `--otlp-insecure` | `RYVEX_OTLP_INSECURE` | Export traces without TLS (also implied by an `http://` endpoint) |
+| `--tracing-sample-ratio` | `RYVEX_TRACING_SAMPLE_RATIO` | Parent-based trace sample ratio when tracing is enabled (default 1.0, issue #83) |
 | `--enable-docker-actuator` | | Actuate Application resources against a Docker Engine (needs a binary built with `-tags docker`, issue #80) |
 | `--docker-socket` | `RYVEX_DOCKER_SOCKET` | Docker Engine unix socket when `--enable-docker-actuator` is set |
 | `--drift-interval` | | Cadence of the drift-detection pass for actuated kinds (default 60s, issue #80) |

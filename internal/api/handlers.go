@@ -9,6 +9,8 @@ import (
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 func timeNow() time.Time { return time.Now() }
@@ -29,7 +31,16 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.ID = "" // server-owned
-	created, err := s.store.CreateResource(&in, state.WriteOptions{Actor: ActorFrom(r.Context())})
+	// Issue #83: store writes are spanned at the handler call site so
+	// the span nests under this request's server span.
+	ctx, span := s.startStoreSpan(r.Context(), "store.create",
+		attribute.String("ryvex.resource.kind", in.Kind),
+		attribute.String("ryvex.resource.org", in.Org),
+		attribute.String("ryvex.resource.project", in.Project),
+		attribute.String("ryvex.resource.name", in.Name),
+	)
+	created, err := s.store.CreateResource(&in, state.WriteOptions{Actor: ActorFrom(ctx)})
+	endStoreSpan(span, err)
 	if err != nil {
 		stateStatus(w, r, err)
 		return
@@ -79,7 +90,13 @@ func (s *Server) handleDeleteByID(w http.ResponseWriter, r *http.Request) {
 		stateStatus(w, r, err)
 		return
 	}
-	if err := s.store.DeleteResource(res.ID, state.WriteOptions{Actor: ActorFrom(r.Context()), Reason: "api delete"}); err != nil {
+	ctx, span := s.startStoreSpan(r.Context(), "store.delete",
+		attribute.String("ryvex.resource.id", res.ID),
+		attribute.String("ryvex.resource.kind", res.Kind),
+	)
+	err = s.store.DeleteResource(res.ID, state.WriteOptions{Actor: ActorFrom(ctx), Reason: "api delete"})
+	endStoreSpan(span, err)
+	if err != nil {
 		stateStatus(w, r, err)
 		return
 	}
@@ -138,7 +155,15 @@ func (s *Server) handleScopePut(w http.ResponseWriter, r *http.Request) {
 		// Upsert semantics: PUT to a fresh address creates the resource.
 		in.Org, in.Project, in.Env, in.Kind, in.Name = org, r.PathValue("project"), r.PathValue("env"), kind, name
 		in.ID = ""
-		created, cerr := s.store.CreateResource(&in, state.WriteOptions{Actor: ActorFrom(r.Context()), Reason: "api put"})
+		// Issue #83: store-create child span (nests under the server span).
+		ctx, span := s.startStoreSpan(r.Context(), "store.create",
+			attribute.String("ryvex.resource.kind", in.Kind),
+			attribute.String("ryvex.resource.org", in.Org),
+			attribute.String("ryvex.resource.project", in.Project),
+			attribute.String("ryvex.resource.name", in.Name),
+		)
+		created, cerr := s.store.CreateResource(&in, state.WriteOptions{Actor: ActorFrom(ctx), Reason: "api put"})
+		endStoreSpan(span, cerr)
 		if cerr != nil {
 			stateStatus(w, r, cerr)
 			return
@@ -172,6 +197,13 @@ func (s *Server) handleScopePut(w http.ResponseWriter, r *http.Request) {
 	// it just no longer floods the events feed, the webhook dispatcher
 	// and ryvex_bus_events_published_total.
 	var changed bool
+	// Issue #83: store-update child span. The closure runs under the
+	// store's write lock; the span only brackets the call.
+	ctx, span := s.startStoreSpan(r.Context(), "store.update",
+		attribute.String("ryvex.resource.id", existing.ID),
+		attribute.String("ryvex.resource.kind", existing.Kind),
+		attribute.Int64("ryvex.resource.generation", in.Generation),
+	)
 	updated, err := s.store.UpdateResource(existing.ID, func(cur *state.Resource) error {
 		prev := cur.DeepCopy()
 		cur.Spec = in.Spec
@@ -181,9 +213,10 @@ func (s *Server) handleScopePut(w http.ResponseWriter, r *http.Request) {
 		changed = !state.SpecLabelsEqual(prev, cur)
 		return nil
 	}, state.UpdateOptions{
-		WriteOptions:       state.WriteOptions{Actor: ActorFrom(r.Context()), Reason: "api put"},
+		WriteOptions:       state.WriteOptions{Actor: ActorFrom(ctx), Reason: "api put"},
 		ExpectedGeneration: in.Generation, // optional CAS: client echoes generation it read
 	})
+	endStoreSpan(span, err)
 	if err != nil {
 		stateStatus(w, r, err)
 		return
@@ -208,7 +241,13 @@ func (s *Server) handleScopeDelete(w http.ResponseWriter, r *http.Request) {
 		stateStatus(w, r, err)
 		return
 	}
-	if err := s.store.DeleteResource(res.ID, state.WriteOptions{Actor: ActorFrom(r.Context()), Reason: "api delete"}); err != nil {
+	ctx, span := s.startStoreSpan(r.Context(), "store.delete",
+		attribute.String("ryvex.resource.id", res.ID),
+		attribute.String("ryvex.resource.kind", res.Kind),
+	)
+	err = s.store.DeleteResource(res.ID, state.WriteOptions{Actor: ActorFrom(ctx), Reason: "api delete"})
+	endStoreSpan(span, err)
+	if err != nil {
 		stateStatus(w, r, err)
 		return
 	}

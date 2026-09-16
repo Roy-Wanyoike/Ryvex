@@ -80,6 +80,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +88,12 @@ import (
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Defaults and constants for the dispatcher.
@@ -165,6 +172,16 @@ type Options struct {
 	// deterministically, or (to true) for on-prem deployments that
 	// bypass the environment entirely.
 	AllowPrivateEgress *bool
+
+	// TracerProvider, when non-nil, enables delivery-attempt spans
+	// (issue #83): one "webhook.deliver" client span per POST attempt,
+	// rooted at the context Start was called with (background work —
+	// the causing bus event carries no trace context, the bus wire
+	// contract is untouched), carrying subscription/event identity and
+	// the HTTP outcome, with the W3C traceparent header injected into
+	// the outgoing request so receivers can join the trace. nil keeps
+	// the global default provider — the no-op.
+	TracerProvider trace.TracerProvider
 }
 
 // Dispatcher fans bus events out to Subscription resources. Construct
@@ -182,6 +199,11 @@ type Dispatcher struct {
 
 	mu   sync.RWMutex
 	subs map[string]*subHandle
+
+	// tracer mints the delivery-attempt spans (issue #83); resolved
+	// from opts.TracerProvider (or the global no-op default) in
+	// NewDispatcher.
+	tracer trace.Tracer
 
 	busSub   bus.Sub
 	ctx      context.Context
@@ -257,12 +279,16 @@ func NewDispatcher(store state.Backend, b bus.BusI, opts Options) *Dispatcher {
 		opts.ServerSecret = RandomSecret()
 		opts.Logger.Info("webhook server secret generated at boot; set --webhook-secret for signatures stable across restarts")
 	}
+	if opts.TracerProvider == nil {
+		opts.TracerProvider = otel.GetTracerProvider() // global default: no-op (issue #83)
+	}
 	return &Dispatcher{
-		store: store,
-		bus:   b,
-		opts:  opts,
-		log:   opts.Logger.With("component", "webhook-dispatcher"),
-		subs:  map[string]*subHandle{},
+		store:  store,
+		bus:    b,
+		opts:   opts,
+		log:    opts.Logger.With("component", "webhook-dispatcher"),
+		subs:   map[string]*subHandle{},
+		tracer: opts.TracerProvider.Tracer("github.com/Roy-Wanyoike/Ryvex/internal/webhook"),
 	}
 }
 
@@ -549,7 +575,7 @@ func (d *Dispatcher) process(h *subHandle, del delivery) {
 				"subscription", h.id, "url", view.spec.URL, "err", err)
 			return
 		}
-		if d.attempt(view, body, del.event, h.id) {
+		if d.attempt(view, body, del.event, h.id, attempt) {
 			d.audit(view, ActionDelivered,
 				fmt.Sprintf("%s attempt %d/%d", del.event.Subject, attempt, total))
 			d.log.Debug("webhook delivered",
@@ -571,11 +597,31 @@ func (d *Dispatcher) process(h *subHandle, del delivery) {
 
 // attempt performs one signed POST; success is any 2xx response
 // within the request timeout.
-func (d *Dispatcher) attempt(view *subView, body []byte, e bus.Event, subID string) bool {
-	ctx, cancel := context.WithTimeout(d.ctx, d.opts.RequestTimeout)
+//
+// Issue #83: the attempt is one "webhook.deliver" client span,
+// parented by the dispatcher's start context (d.ctx — normally the
+// daemon root, so attempts are their own traces; when the dispatcher
+// is started under a traced context they nest under it). The span
+// carries the subscription/event identity and the HTTP outcome, and a
+// W3C traceparent header is injected into the outgoing POST so the
+// receiver can continue this trace. The extra header is additive: the
+// HMAC signature covers only the body, so verification is unchanged.
+func (d *Dispatcher) attempt(view *subView, body []byte, e bus.Event, subID string, attemptN int) bool {
+	spanCtx, span := d.tracer.Start(d.ctx, "webhook.deliver", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("ryvex.webhook.subscription_id", subID),
+			attribute.String("ryvex.event.id", e.ID),
+			attribute.String("ryvex.event.subject", e.Subject),
+			attribute.Int("ryvex.webhook.attempt", attemptN),
+		))
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(spanCtx, d.opts.RequestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, view.spec.URL, bytes.NewReader(body))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "request build failed")
 		d.log.Warn("webhook request build failed", "url", view.spec.URL, "err", err)
 		return false
 	}
@@ -583,15 +629,26 @@ func (d *Dispatcher) attempt(view *subView, body []byte, e bus.Event, subID stri
 	req.Header.Set("X-Ryvex-Signature", sign(view.secret, body))
 	req.Header.Set("X-Ryvex-Event-ID", e.ID)
 	req.Header.Set("X-Ryvex-Subscription-ID", subID)
+	// W3C tracecontext directly (not the global propagator): the
+	// injection must work identically whether or not the daemon ran
+	// setupTracing.
+	propagation.TraceContext{}.Inject(spanCtx, propagation.HeaderCarrier(req.Header))
 
 	resp, err := d.opts.Client.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "delivery failed")
 		d.log.Debug("webhook attempt failed", "url", view.spec.URL, "err", err)
 		return false
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+	span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+	if !ok {
+		span.SetStatus(codes.Error, "http "+strconv.Itoa(resp.StatusCode))
+	}
+	return ok
 }
 
 // backoff returns the wait before the retry following attempt n:

@@ -19,6 +19,11 @@ import (
 	"github.com/Roy-Wanyoike/Ryvex/internal/authz"
 	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type ctxKey int
@@ -93,12 +98,21 @@ func IdentityFrom(ctx context.Context) (Identity, bool) {
 }
 
 // RecoverMiddleware converts handler panics into 500s so a bug in one
-// route cannot take down the daemon.
+// route cannot take down the daemon. When the request carries a
+// recording span (issue #83), the panic is stamped onto it as an event
+// plus an error status, so trace backends show the crash instead of a
+// bare 500.
 func RecoverMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
+					if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
+						span.AddEvent("panic", trace.WithAttributes(
+							attribute.String("panic", fmt.Sprint(rec)),
+						))
+						span.SetStatus(codes.Error, "panic in handler")
+					}
 					if log != nil {
 						log.Error("panic in handler", "err", fmt.Sprint(rec), "path", r.URL.Path, "request_id", RequestIDFrom(r.Context()))
 					}
@@ -124,14 +138,24 @@ func LogMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
 			metrics.HTTPRequestsTotal.WithLabelValues(route, r.Method, strconv.Itoa(sw.status)).Inc()
 			metrics.HTTPRequestDuration.WithLabelValues(route, r.Method).Observe(duration.Seconds())
 			if log != nil {
-				log.Info("http",
+				args := []any{
 					"method", r.Method,
 					"path", r.URL.Path,
 					"status", sw.status,
 					"duration_ms", duration.Milliseconds(),
 					"actor", ActorFrom(r.Context()),
 					"request_id", RequestIDFrom(r.Context()),
-				)
+				}
+				// Issue #83, request-ID <-> trace-ID coherence:
+				// when tracing is on, the access line carries
+				// BOTH ids, so any audit entry's request_id can
+				// be turned into a trace ID with a plain grep
+				// (and the server span carries request_id as a
+				// span attribute for the reverse direction).
+				if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
+					args = append(args, "trace_id", sc.TraceID().String())
+				}
+				log.Info("http", args...)
 			}
 		})
 	}
@@ -173,6 +197,83 @@ func routeLabel(path string) string {
 		return "scope/{kind}/{name}"
 	default:
 		return "other"
+	}
+}
+
+// TraceIDHeader echoes the server span's trace ID to the caller
+// (issue #83). It is set only when tracing is enabled: its presence is
+// the client-visible signal that tracing is on, and it is absent —
+// never empty — when the OTLP endpoint is not configured.
+const TraceIDHeader = "X-Ryvex-Trace-Id"
+
+// Request-ID <-> trace-ID coherence (issue #83):
+//
+//	request_id (X-Request-Id) stays THE audit correlation key. Audit
+//	entries (state.AuditEntry), error envelopes and access logs carry
+//	it exactly as before; the struct and its storage gained no field.
+//
+//	trace_id (X-Ryvex-Trace-Id) adds cross-service causality: it is
+//	the W3C trace ID of this request's server span, returned only
+//	when tracing is enabled.
+//
+//	The two are bridged without schema changes:
+//	  - the server span carries a "request_id" span attribute, so any
+//	    audit entry can be located in a trace backend by querying the
+//	    request ID it already stores;
+//	  - the access-log line carries BOTH ids (see LogMiddleware), so a
+//	    request ID yields its trace ID with a grep and vice versa.
+//	  - a client-supplied traceparent header is honored: the server
+//	    span continues the caller's trace instead of starting a root.
+//
+// TracingMiddleware opens one OpenTelemetry server span per request
+// when tp is non-nil. W3C tracecontext is extracted from the incoming
+// headers first (hardcoded propagation.TraceContext — the format is
+// the spec'd contract, not an operator knob), the span is named
+// "<method> <route>" with route =
+// routeLabel(path) — the same low-cardinality buckets the Prometheus
+// metrics use, never raw paths — records the HTTP status code, and
+// rides the request context so store/handler child spans nest under
+// it.
+//
+// When tp is nil the middleware disables itself entirely: the chain
+// element forwards the next handler unwrapped, no spans are created,
+// the X-Ryvex-Trace-Id header is never set and overhead is zero.
+// That is the default posture (issue #83): tracing is opt-in via
+// --otlp-endpoint / RYVEX_OTLP_ENDPOINT.
+func TracingMiddleware(tp trace.TracerProvider) func(http.Handler) http.Handler {
+	if tp == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	tracer := tp.Tracer("github.com/Roy-Wanyoike/Ryvex/internal/api")
+	// W3C tracecontext directly (not the global propagator): the
+	// format is the contract, and the middleware must behave
+	// identically whether or not the daemon ran setupTracing.
+	prop := propagation.TraceContext{}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := prop.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+			route := routeLabel(r.URL.Path)
+			ctx, span := tracer.Start(ctx, r.Method+" "+route,
+				trace.WithSpanKind(trace.SpanKindServer),
+				trace.WithAttributes(
+					attribute.String("http.request.method", r.Method),
+					attribute.String("http.route", route),
+					attribute.String("url.path", r.URL.Path),
+					attribute.String("request_id", RequestIDFrom(ctx)),
+				))
+			defer span.End()
+			if sc := span.SpanContext(); sc.IsValid() {
+				w.Header().Set(TraceIDHeader, sc.TraceID().String())
+			}
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(sw, r.WithContext(ctx))
+			span.SetAttributes(attribute.Int("http.response.status_code", sw.status))
+			if sw.status >= http.StatusInternalServerError {
+				// HTTP semconv: 5xx marks the server span as an
+				// error; 4xx stay non-error on the server side.
+				span.SetStatus(codes.Error, strconv.Itoa(sw.status))
+			}
+		})
 	}
 }
 
