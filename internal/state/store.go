@@ -275,7 +275,12 @@ func (s *Store) UpdateResource(id string, fn func(*Resource) error, o UpdateOpti
 		work.Generation = cur.Generation + 1
 	}
 	now := time.Now().UTC()
-	work.UpdatedAt = now
+	// Issue #108: UpdatedAt only advances on an actual change — a no-op
+	// update returns a byte-identical copy, matching the doc contract
+	// above and keeping heartbeat PUTs byte-identical end to end.
+	if !specLabelsEqual(cur, work) {
+		work.UpdatedAt = now
+	}
 	s.byID[id] = work
 	if !specLabelsEqual(cur, work) {
 		s.appendAuditLocked(o.Actor, "updated", work)

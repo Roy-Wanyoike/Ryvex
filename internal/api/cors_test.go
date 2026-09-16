@@ -94,7 +94,10 @@ func TestCORSMatrix(t *testing.T) {
 		{"origin match is exact: scheme", http.MethodGet, "/v1", "https://localhost:3100", true, http.StatusOK, ""},
 		{"origin match is exact: case", http.MethodGet, "/v1", "HTTP://LOCALHOST:3100", true, http.StatusOK, ""},
 		{"preflight allowed origin short-circuits pre-auth", http.MethodOptions, "/v1/resources", corsAllowedOrigin, false, http.StatusNoContent, corsAllowedOrigin},
-		{"preflight disallowed origin leaks no headers", http.MethodOptions, "/v1/resources", "http://evil.example", false, http.StatusNoContent, ""},
+		// Issue #108: disallowed-origin preflights no longer get the free
+		// pre-auth 204 short-circuit; they are rejected 403 with no CORS
+		// headers (TestCORSDisallowedOriginHygiene pins Vary + envelope).
+		{"preflight disallowed origin rejected, leaks no headers", http.MethodOptions, "/v1/resources", "http://evil.example", false, http.StatusForbidden, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -143,6 +146,53 @@ func TestPreflightPreAuth(t *testing.T) {
 	}
 	if w.Header().Get("Access-Control-Allow-Origin") != corsAllowedOrigin {
 		t.Fatalf("preflight must carry the allowed origin")
+	}
+}
+
+// Issue #108: disallowed-origin hygiene. Every response is
+// origin-dependent, so disallowed-origin responses must carry
+// Vary: Origin - otherwise a shared cache could replay an
+// allowed-origin cached response to this origin (cache-poisoning
+// footnote). Disallowed-origin preflights no longer get the free
+// pre-auth 204: they are rejected 403 with no CORS headers and the
+// standard forbidden envelope. Allowed-origin behavior is unchanged
+// (pinned by the CORS matrix above).
+func TestCORSDisallowedOriginHygiene(t *testing.T) {
+	h := newCORSServer(t)
+
+	// Disallowed preflight: explicit 403, forbidden envelope, no CORS
+	// headers, Vary: Origin.
+	w := corsDo(t, h, http.MethodOptions, "/v1/resources", "http://evil.example", nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("disallowed preflight: want 403, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	corsHeadersAbsent(t, w)
+	if got := w.Header().Get("Vary"); got != "Origin" {
+		t.Fatalf("disallowed preflight Vary = %q, want Origin", got)
+	}
+	if m := decode(t, w)["error"].(map[string]any); m["code"] != CodeForbidden {
+		t.Fatalf("disallowed preflight envelope code = %v, want %q", m["code"], CodeForbidden)
+	}
+
+	// Disallowed regular request: downstream behavior unchanged (the
+	// origin never gains CORS headers), plus the Vary hygiene.
+	w = corsDo(t, h, http.MethodGet, "/v1", "http://evil.example", map[string]string{"Authorization": "Bearer " + testToken})
+	if w.Code != http.StatusOK {
+		t.Fatalf("disallowed GET: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	corsHeadersAbsent(t, w)
+	if got := w.Header().Get("Vary"); got != "Origin" {
+		t.Fatalf("disallowed GET Vary = %q, want Origin", got)
+	}
+
+	// No Origin header: the response is not origin-dependent, so no Vary
+	// is added (unchanged legacy behavior for non-browser clients).
+	w = corsDo(t, h, http.MethodGet, "/v1", "", map[string]string{"Authorization": "Bearer " + testToken})
+	if w.Code != http.StatusOK {
+		t.Fatalf("origin-less GET: want 200, got %d", w.Code)
+	}
+	if got := w.Header().Get("Vary"); got != "" {
+		t.Fatalf("origin-less GET Vary = %q, want none", got)
 	}
 }
 

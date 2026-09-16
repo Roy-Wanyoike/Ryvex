@@ -403,3 +403,28 @@ func TestHealthzKeepsCLIContract(t *testing.T) {
 		t.Fatalf("healthz status broken: %s", w.Body.String())
 	}
 }
+
+// Issue #108: the no-store match is segment-precise. /v1 and everything
+// under /v1/ stays uncacheable, but sibling prefixes like /v1x are not
+// API routes and must not inherit the API's cache directives.
+func TestSecurityHeadersV1PathBoundary(t *testing.T) {
+	h := newTestServer(t)
+	for _, p := range []string{"/v1", "/v1/", "/v1/resources"} {
+		w := do(t, h, http.MethodGet, p, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: want 200, got %d: %s", p, w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("GET %s: Cache-Control = %q, want no-store", p, got)
+		}
+	}
+	for _, p := range []string{"/v1x", "/v1x/resources", "/v10", "/healthz2"} {
+		w := do(t, h, http.MethodGet, p, "")
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("GET %s: want 404, got %d: %s", p, w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Cache-Control"); got != "" {
+			t.Fatalf("GET %s: Cache-Control = %q, want none (path is outside the /v1 segment boundary)", p, got)
+		}
+	}
+}

@@ -15,11 +15,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Roy-Wanyoike/Ryvex/internal/authz"
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus/natsbus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
@@ -444,5 +446,121 @@ func TestNoopScopePutSuppressesUpdatedEventNATS(t *testing.T) {
 	}
 	if evts[1].Type != bus.EventCreated {
 		t.Fatalf("older stream event = %+v, want the created event", evts[1])
+	}
+}
+
+// newNoopRBACServer builds the handler stack with RBAC enabled and a
+// nil reconciler (same exactness argument as newNoopServer: no
+// asynchronous status_changed noise) so event-count assertions can be
+// exact. /v1/keys is only mounted with an authorizer, and key events
+// on the bus keep the authorizer cache fresh without a reconciler.
+func newNoopRBACServer(t *testing.T, adminToken string) (http.Handler, *bus.Bus) {
+	t.Helper()
+	store := state.NewStore()
+	eventBus := bus.New()
+	az := authz.New(store, eventBus, authz.Options{Logger: discardLogger()})
+	if err := SeedAdminKey(store, "root", adminToken, discardLogger()); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	if err := az.Refresh(); err != nil {
+		t.Fatalf("authz refresh: %v", err)
+	}
+	h := NewServer(store, eventBus, nil, ServerOptions{
+		Auth:       AuthOptions{APIKeys: map[string]string{adminToken: "root"}},
+		Logger:     discardLogger(),
+		Authorizer: az,
+	})
+	return h, eventBus
+}
+
+// TestNoopKeyPatchSuppressesUpdatedEvent pins the key-management half
+// of the #72 churn class (issue #108): a no-change PATCH on a managed
+// key - an empty body, or one restating the current
+// roles/scopes/active - must answer 200 with the key view but must NOT
+// publish an `updated` key event. A real change publishes exactly one,
+// and the next identical PATCH is silent again.
+func TestNoopKeyPatchSuppressesUpdatedEvent(t *testing.T) {
+	admin := "ryk_noop_admin_0001"
+	h, eventBus := newNoopRBACServer(t, admin)
+
+	_, keyID := mintKey(t, h, admin, "svc-bot", "operator", "acme", "core")
+	if got := updatedEvents(t, eventBus, keyID); len(got) != 0 {
+		t.Fatalf("key create published %d updated events, want 0", len(got))
+	}
+
+	updatedMetric0 := metrics.BusEventsPublishedTotal.WithLabelValues(bus.EventUpdated).Value()
+
+	// Empty PATCH: nothing addressed, nothing changed.
+	w := doAuth(t, h, http.MethodPut, "/v1/keys/"+keyID, admin, `{}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty PATCH: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// Restating the current values: a non-empty body with an identical
+	// spec must still count as a no-change PATCH.
+	w = doAuth(t, h, http.MethodPut, "/v1/keys/"+keyID, admin,
+		`{"roles":["operator"],"scopes":["org/acme/project/core"],"active":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("restating PATCH: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := decode(t, w)["active"]; got != true {
+		t.Fatalf("restating PATCH must return the unchanged view, got %s", w.Body.String())
+	}
+	if got := updatedEvents(t, eventBus, keyID); len(got) != 0 {
+		t.Fatalf("no-change key PATCHes published %d updated events, want 0: %+v", len(got), got)
+	}
+	if got := metrics.BusEventsPublishedTotal.WithLabelValues(bus.EventUpdated).Value(); got != updatedMetric0 {
+		t.Fatalf("ryvex_bus_events_published_total{updated} moved on no-change key PATCHes: %v -> %v", updatedMetric0, got)
+	}
+
+	// A real change publishes exactly one updated event with the key's
+	// coordinates (reserved namespace, APIKey kind, principal as name).
+	w = doAuth(t, h, http.MethodPut, "/v1/keys/"+keyID, admin, `{"active":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("disable PATCH: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	evts := updatedEvents(t, eventBus, keyID)
+	if len(evts) != 1 {
+		t.Fatalf("real key change published %d updated events, want exactly 1", len(evts))
+	}
+	e := evts[0]
+	if e.Org != state.ReservedOrg || e.Kind != state.KindAPIKey || e.Name != "svc-bot" || e.Actor != "root" {
+		t.Fatalf("published key event fields wrong: %+v", e)
+	}
+
+	// Back to steady state: restating the new value is silent again.
+	w = doAuth(t, h, http.MethodPut, "/v1/keys/"+keyID, admin, `{"active":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("steady-state PATCH: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := updatedEvents(t, eventBus, keyID); len(got) != 1 {
+		t.Fatalf("steady-state no-change PATCH published another event: %d total, want 1", len(got))
+	}
+}
+
+// TestNoopHeartbeatResponseByteIdentical pins the UpdatedAt half of
+// issue #108: UpdateResource must not stamp UpdatedAt on a no-op PUT,
+// so the byte-identical heartbeat bodies the agent re-sends between
+// spec refreshes get byte-identical responses back - the #72 heartbeat
+// invariant now holds field for field, updated_at included.
+func TestNoopHeartbeatResponseByteIdentical(t *testing.T) {
+	h, _, _ := newNoopServer(t)
+	w := do(t, h, http.MethodPut, "/v1/acme/fleet/prod/nodes/node-1", nodeBody(0, "2026-01-01T00:00:00Z"))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("enroll: want 201, got %d", w.Code)
+	}
+	first := w.Body.String()
+	for i := 0; i < 3; i++ {
+		w = do(t, h, http.MethodPut, "/v1/acme/fleet/prod/nodes/node-1", nodeBody(0, "2026-01-01T00:00:00Z"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("heartbeat %d: want 200, got %d: %s", i, w.Code, w.Body.String())
+		}
+		if w.Body.String() != first {
+			t.Fatalf("no-op heartbeat %d changed the response body:\nfirst: %s\nlater: %s", i, first, w.Body.String())
+		}
+	}
+	// updated_at must actually be present in the body, otherwise the
+	// byte-equality above proves nothing.
+	if !strings.Contains(first, `"updated_at"`) {
+		t.Fatalf("response body carries no updated_at field: %s", first)
 	}
 }
