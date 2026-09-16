@@ -76,6 +76,14 @@ Entries are reconstructed from the git history and the shipped ledger in
   spans with an outgoing W3C `traceparent` on deliveries, and the
   request-ID audit bridge: `request_id` rides the server span as a
   span attribute and the access log carries both IDs
+- Events/audit feed cursors: `GET /v1/{org}/events` and
+  `GET /v1/{org}/audit` accept `?cursor=` and answer `next_cursor`
+  (empty string when exhausted) with the exact wire contract of the
+  resources listing, so the console Load-more reaches long feed tails
+  instead of the plane truncating at page one. `from` + `cursor` are
+  mutually exclusive (400), a malformed cursor is a 400
+  `bad_request`, and a stale/evicted cursor clamps to a clean empty
+  page (#107)
 
 ### Changed
 
@@ -89,6 +97,18 @@ Entries are reconstructed from the git history and the shipped ledger in
   effect (#73)
 - Docs truth batch 2: audit-verified contradiction fixes across the
   doc set (#78)
+- Bus metric contract: `ryvex_bus_events_published_total` counts one
+  increment per bus-accepted publish on every backend — the memory bus
+  counts at Publish (pre-fanout, its existing test-pinned meaning),
+  natsbus keeps its JetStream persist-ack gate with refused publishes
+  on `ryvex_bus_publish_failures_total` — pinned by a parity test;
+  `gofmt` drift in `natsbus.go` cleaned up (`gofmt -l internal/ cmd/`
+  empty) (#109)
+- Docs truth batch 3: wave-2 surfaces verified against source — metric
+  families and bus-instrument contracts (`docs/metrics.md`),
+  dependency-health wire shapes and the provider-SPI/drift semantics
+  (`docs/api-contracts.md`, `docs/architecture.md`), plus CHANGELOG
+  backfill (#110)
 
 ### Fixed
 
@@ -131,6 +151,19 @@ Entries are reconstructed from the git history and the shipped ledger in
   token hygiene in `.env.example` (#79)
 - Tests: `TestEventsAndAudit` made deterministic against the async
   reconciler (#70)
+- API polish batch 2: a no-change key PATCH — empty body or one that
+  restates the current roles/scopes/active — no longer publishes an
+  `updated` key event (same churn class as #72's heartbeat gating);
+  store no-op updates leave `UpdatedAt` untouched so heartbeat PUT
+  responses stay byte-identical end to end; disallowed-origin CORS
+  responses carry `Vary: Origin` and their preflights get an explicit
+  403 instead of a free pre-auth 204; `Cache-Control: no-store`
+  matches the `/v1` segment boundary exactly (no more `/v1x` false
+  positives); error-envelope `details` always serializes as `[]`
+  (#108)
+- pgstore: no-op updates preserve `UpdatedAt` exactly like the memory
+  store — byte-identical no-op responses across backends, pinned by a
+  suite case (#115)
 
 ### Security
 

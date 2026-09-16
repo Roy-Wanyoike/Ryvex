@@ -7,15 +7,23 @@ them.
 
 ## Images
 
-Two images are published to GHCR by the release workflow (triggered on
-every `v*` tag):
+Two images are produced from the repository root and are intended to
+be **published to GHCR by the release workflow** (triggered on every
+`v*` tag). The publishing workflow has **not landed yet**: the spec
+ships with [#76](https://github.com/Roy-Wanyoike/Ryvex/issues/76), and
+hosted CI is still pending
+([#34](https://github.com/Roy-Wanyoike/Ryvex/issues/34), open as
+[PR #98](https://github.com/Roy-Wanyoike/Ryvex/pull/98)) — so no
+`.github/workflows/` file exists on `main` today. Until it lands,
+build both images locally (same Dockerfiles the workflow will use):
 
 | Image | Source | Runs as |
 |-------|--------|---------|
 | `ghcr.io/roy-wanyoike/ryvexd` | [`Dockerfile`](../Dockerfile) | static Go binaries (ryvexd + ryvex CLI), UID 10001, alpine |
 | `ghcr.io/roy-wanyoike/ryvex-agent` | [`Dockerfile.agent`](../Dockerfile.agent) | static musl Rust binary, UID 10002, alpine |
 
-Both are built from the repository root:
+Until the release workflow lands, both are built from the repository
+root:
 
 ```bash
 docker build -t ryvexd .                      # control plane (+ ryvex CLI)

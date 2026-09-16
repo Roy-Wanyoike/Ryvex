@@ -10,7 +10,7 @@
 [![Next.js](https://img.shields.io/badge/Next.js-15-black?logo=next.js)](https://nextjs.org)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
-[![Tests](https://img.shields.io/badge/tests-passing-34d399)](#verification)
+[![Tests](https://img.shields.io/badge/tests-passing_locally-34d399)](#verification)
 [![License](https://img.shields.io/badge/license-Apache--2.0-7c5cff)](#license)
 
 [What is Ryvex?](#what-is-ryvex) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Console](#the-console) · [Roadmap](#roadmap)
@@ -101,8 +101,14 @@ flag/env reference.
 ## Deploy
 
 Container images (`ghcr.io/roy-wanyoike/ryvexd` and
-`ghcr.io/roy-wanyoike/ryvex-agent`) are published on `v*` tags, the
-Rust node agent ships in `Dockerfile.agent` with a compose profile and
+`ghcr.io/roy-wanyoike/ryvex-agent`) are **built from the repo root**
+today (`docker build -t ryvexd .` /
+`docker build -f Dockerfile.agent -t ryvex-agent .`) and will be
+**published to GHCR by the release workflow on `v*` tags** once the
+workflow files land — the packaging spec is #76, and hosted CI is
+still pending (#34, open as PR #98), so no `.github/workflows/`
+exists on `main` yet. The Rust node
+agent ships in `Dockerfile.agent` with a compose profile and
 a Kubernetes DaemonSet, and `deploy/k8s/` is hardened with a
 startupProbe, NetworkPolicy, PDB, non-root Postgres, and a
 configurable Postgres TLS mode. The full guide — images, compose
@@ -227,7 +233,10 @@ cd agent/ryvex-agent && cargo test                 # Rust agent suite + clippy -
 
 The repository follows a strict **issue → PR** workflow: no direct
 pushes to `main`, every PR closes an issue (`Fixes #N`), and features
-merge only when built, tested, and verified end-to-end.
+merge only when built, tested, and verified end-to-end. The badge at
+the top is a **static chip linking to this section, not a live CI
+status**: these gates run locally on every PR, and hosted CI
+enforcement is pending (#34 — open as PR #98).
 
 ## Roadmap
 
