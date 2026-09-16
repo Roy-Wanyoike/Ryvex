@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
 )
@@ -43,6 +44,7 @@ func RunSuite(t *testing.T, newStore func(t *testing.T) Store) {
 	t.Run("FetchMissing", func(t *testing.T) { testFetchMissing(t, newStore(t)) })
 	t.Run("UpdateCAS", func(t *testing.T) { testUpdateCAS(t, newStore(t)) })
 	t.Run("UpdateNoOpNoAudit", func(t *testing.T) { testUpdateNoOpNoAudit(t, newStore(t)) })
+	t.Run("UpdateNoOpPreservesUpdatedAt", func(t *testing.T) { testUpdateNoOpPreservesUpdatedAt(t, newStore(t)) })
 	t.Run("UpdateValidationRejected", func(t *testing.T) { testUpdateValidationRejected(t, newStore(t)) })
 	t.Run("UpdateMissingID", func(t *testing.T) { testUpdateMissingID(t, newStore(t)) })
 	t.Run("StatusOwnedByReconciler", func(t *testing.T) { testStatusOwnedByReconciler(t, newStore(t)) })
@@ -336,6 +338,55 @@ func testUpdateNoOpNoAudit(t *testing.T, s Store) {
 		if e.Action == "updated" {
 			t.Fatalf("no-op update produced an audit entry: %+v", e)
 		}
+	}
+}
+
+// testUpdateNoOpPreservesUpdatedAt pins the byte-identical heartbeat
+// invariant across backends (memory: issue #108; pgstore: issue #115):
+// a no-op update must leave UpdatedAt exactly where the last real
+// change left it — in the returned copy and in storage — while a real
+// change still stamps a fresh UpdatedAt alongside the generation bump.
+func testUpdateNoOpPreservesUpdatedAt(t *testing.T, s Store) {
+	t.Helper()
+	r, _ := s.CreateResource(mkRes("Application", "acme", "core", "prod", "heartbeat"), state.WriteOptions{Actor: "t"})
+
+	// Guarantee the clock has moved past the previous stamp so a
+	// backend that re-stamps on no-op is observable on every
+	// precision (pgstore truncates to microseconds).
+	time.Sleep(2 * time.Millisecond)
+
+	// Real change: UpdatedAt advances with the generation bump.
+	changed, err := s.UpdateResource(r.ID, func(cur *state.Resource) error {
+		cur.Spec = map[string]any{"replicas": 3}
+		return nil
+	}, state.UpdateOptions{WriteOptions: state.WriteOptions{Actor: "t"}})
+	if err != nil {
+		t.Fatalf("change update: %v", err)
+	}
+	if !changed.UpdatedAt.After(r.UpdatedAt) {
+		t.Fatalf("real change must advance UpdatedAt: create=%v changed=%v", r.UpdatedAt, changed.UpdatedAt)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+
+	// No-op heartbeat: UpdatedAt must be preserved, not re-stamped.
+	same, err := s.UpdateResource(r.ID, func(cur *state.Resource) error { return nil },
+		state.UpdateOptions{WriteOptions: state.WriteOptions{Actor: "t"}})
+	if err != nil {
+		t.Fatalf("no-op update: %v", err)
+	}
+	if same.Generation != changed.Generation {
+		t.Fatalf("no-op bumped generation: %d -> %d", changed.Generation, same.Generation)
+	}
+	if !same.UpdatedAt.Equal(changed.UpdatedAt) {
+		t.Fatalf("no-op update re-stamped UpdatedAt: %v -> %v", changed.UpdatedAt, same.UpdatedAt)
+	}
+	back, err := s.GetResource(r.ID)
+	if err != nil {
+		t.Fatalf("get after no-op: %v", err)
+	}
+	if !back.UpdatedAt.Equal(changed.UpdatedAt) {
+		t.Fatalf("stored UpdatedAt must survive a no-op update: want %v, got %v", changed.UpdatedAt, back.UpdatedAt)
 	}
 }
 
