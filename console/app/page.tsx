@@ -33,11 +33,27 @@ const NAV: { key: ViewKey; label: string; glyph: string }[] = [
 
 const POLL_INTERVAL_MS = 15_000;
 
+/**
+ * Append only rows whose ids are not already visible (issue #86). Feed pages
+ * are id-unique server-side; this guard keeps a page fetched concurrently
+ * with a refresh from duplicating rows that landed with the fresh page one.
+ */
+function appendUnique<T extends { id: string }>(current: T[], page: T[]): T[] {
+  const seen = new Set(current.map((x) => x.id));
+  const fresh = page.filter((x) => !seen.has(x.id));
+  return fresh.length > 0 ? [...current, ...fresh] : current;
+}
+
 export default function Home() {
   const [view, setView] = useState<ViewKey>("overview");
   const [resources, setResources] = useState<Resource[]>([]);
   const [events, setEvents] = useState<RyvexEvent[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
+  // Feed pagination (issue #86): next cursors from the last page fetched.
+  // undefined = exhausted (or the plane does not paginate) → no Load more.
+  const [eventsCursor, setEventsCursor] = useState<string | undefined>(undefined);
+  const [auditCursor, setAuditCursor] = useState<string | undefined>(undefined);
+  const [loadingMore, setLoadingMore] = useState({ events: false, audit: false });
   const [loaded, setLoaded] = useState(false);
   const [selected, setSelected] = useState<Resource | null>(null);
   const [conn, setConn] = useState<{ mode: "live" | "demo"; base: string }>({ mode: "demo", base: "" });
@@ -51,6 +67,17 @@ export default function Home() {
   // The in-flight poll; a new loadAll cancels it so fetches never overlap.
   const inflight = useRef<AbortController | null>(null);
 
+  /**
+   * Full refresh — manual button, 15s poll, and config reloads.
+   *
+   * Refresh semantics for loaded pages (issue #86, decided): a refresh ALWAYS
+   * re-fetches page one of each feed and REPLACES the accumulated rows —
+   * pages previously appended via "Load more" are truncated. The feeds are
+   * live, newest-first windows and the control plane's cursors are
+   * offset-based, so keeping stale appended pages across a refresh would
+   * duplicate or silently skip rows as new events arrive. Operators reading a
+   * long tail can pause auto-refresh (⏸) to keep loaded pages stable.
+   */
   const loadAll = useCallback(async () => {
     inflight.current?.abort();
     const controller = new AbortController();
@@ -65,6 +92,8 @@ export default function Home() {
       setResources(res.data);
       setEvents(evs.data.events ?? []);
       setAudit(aud.data.entries ?? []);
+      setEventsCursor(evs.nextCursor);
+      setAuditCursor(aud.nextCursor);
       setResults({ resources: res, events: evs, audit: aud });
       setLastUpdated(Date.now());
       setLoaded(true);
@@ -77,6 +106,39 @@ export default function Home() {
       if (inflight.current === controller) inflight.current = null;
     }
   }, []);
+
+  /**
+   * Append the next cursor-addressed page to a feed (issue #86). Rows are
+   * de-duplicated by id so a page that races a concurrent refresh can never
+   * duplicate visible rows; an exhausted or non-paginating feed (no cursor)
+   * is a no-op and the Load more button disappears.
+   */
+  const loadMore = useCallback(async (feed: "events" | "audit") => {
+    if (feed === "events") {
+      if (!eventsCursor) return;
+      setLoadingMore((m) => ({ ...m, events: true }));
+      try {
+        const res = await fetchEvents({ cursor: eventsCursor });
+        setEvents((prev) => appendUnique(prev, res.data.events ?? []));
+        setEventsCursor(res.nextCursor);
+      } finally {
+        setLoadingMore((m) => ({ ...m, events: false }));
+      }
+      return;
+    }
+    if (!auditCursor) return;
+    setLoadingMore((m) => ({ ...m, audit: true }));
+    try {
+      const res = await fetchAudit({ cursor: auditCursor });
+      setAudit((prev) => appendUnique(prev, res.data.entries ?? []));
+      setAuditCursor(res.nextCursor);
+    } finally {
+      setLoadingMore((m) => ({ ...m, audit: false }));
+    }
+  }, [eventsCursor, auditCursor]);
+
+  const loadMoreEvents = useCallback(() => void loadMore("events"), [loadMore]);
+  const loadMoreAudit = useCallback(() => void loadMore("audit"), [loadMore]);
 
   useEffect(() => {
     hydrateApiFromStorage();
@@ -194,7 +256,15 @@ export default function Home() {
             >
               {paused ? "▶ Resume" : "⏸ Pause"}
             </button>
-            <span className={`chip ${badge.chip}`} title={badge.title}>
+            <span
+              className={`chip ${badge.chip}`}
+              title={badge.title}
+              // aria-live scoped to the status chip ONLY (issue #86): the
+              // whole-view live region used to re-announce entire tables on
+              // every 15s poll. The chip announces only when the health label
+              // actually changes (Live → Degraded → …).
+              aria-live="polite"
+            >
               <span className="h-1.5 w-1.5 rounded-full bg-current" />
               {badge.label}
             </span>
@@ -219,12 +289,29 @@ export default function Home() {
             Connecting to control plane…
           </div>
         ) : (
-          <div aria-live="polite">
+          // No aria-live here (issue #86): tables re-render on every 15s poll
+          // and a whole-view live region re-announced them wholesale. Status
+          // changes are announced by the scoped chip/banner regions instead.
+          <div>
             {view === "overview" && <OverviewView resources={resources} events={events} />}
             {view === "resources" && <ResourcesView resources={resources} onOpen={setSelected} />}
             {view === "topology" && <TopologyView resources={resources} />}
-            {view === "events" && <EventsView events={events} />}
-            {view === "audit" && <AuditView entries={audit} />}
+            {view === "events" && (
+              <EventsView
+                events={events}
+                hasMore={Boolean(eventsCursor)}
+                loadingMore={loadingMore.events}
+                onLoadMore={loadMoreEvents}
+              />
+            )}
+            {view === "audit" && (
+              <AuditView
+                entries={audit}
+                hasMore={Boolean(auditCursor)}
+                loadingMore={loadingMore.audit}
+                onLoadMore={loadMoreAudit}
+              />
+            )}
             {view === "settings" && <SettingsView onConfigChange={handleConfigChange} />}
           </div>
         )}
