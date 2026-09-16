@@ -387,11 +387,13 @@ func (s *Store) ListResources(o state.ListOptions) ([]*state.Resource, string, e
 // UpdateResource mutates the resource via fn under a CAS check, all in
 // one transaction: the row is locked, ExpectedGeneration is verified,
 // fn runs on a copy, the result is validated, and a single guarded
-// UPDATE persists it. Generation advances only when spec or labels
-// actually changed (JSON equality); status is whatever fn leaves
-// behind (users never send it — the API layer owns that rule), and a
-// no-op update rewrites updated_at without bumping the generation and
-// without an "updated" audit entry.
+// UPDATE persists it. Generation and UpdatedAt advance only when spec
+// or labels actually changed (JSON equality on the locked pre-image —
+// issue #115: a no-op update returns and stores a byte-identical row,
+// matching the memory store's issue #108 semantics so the agent's
+// heartbeat PUTs don't churn updated_at every interval); status is
+// whatever fn leaves behind (users never send it — the API layer owns
+// that rule), and a no-op update writes no "updated" audit entry.
 func (s *Store) UpdateResource(id string, fn func(*state.Resource) error, o state.UpdateOptions) (*state.Resource, error) {
 	if o.Actor == "" {
 		o.Actor = "anonymous"
@@ -432,7 +434,14 @@ func (s *Store) UpdateResource(id string, fn func(*state.Resource) error, o stat
 	}
 	now := nowMicro()
 	work.Generation = newGen
-	work.UpdatedAt = now
+	// Issue #115: UpdatedAt only advances on an actual change. A no-op
+	// update keeps the pre-image's updated_at (work is still a copy of
+	// cur here), matching the memory store's issue #108 semantics so
+	// the agent's interval heartbeat PUTs stay byte-identical end to
+	// end.
+	if changed {
+		work.UpdatedAt = now
+	}
 
 	labels, err := json.Marshal(work.Labels)
 	if err != nil {
