@@ -5,6 +5,7 @@
 package bus
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -93,6 +94,59 @@ type Replayer interface {
 type HealthChecker interface {
 	// Healthy returns nil while the bus can serve events.
 	Healthy() error
+}
+
+// Failure taxonomy for durable consumers (issue #81). A
+// DurableHandler returns one of these (or any other error, which is
+// treated like ErrEventRetry) to tell the consumer what to do with a
+// failed delivery.
+var (
+	// ErrEventRetry marks a handler failure as transient: the event is
+	// redelivered (immediately, then per the consumer's ack-wait),
+	// bounded by the consumer's max-deliver budget. Once the budget is
+	// spent the event is dead-lettered.
+	ErrEventRetry = errors.New("bus: retryable event failure")
+
+	// ErrEventPoison marks a handler failure as permanent: the event is
+	// dead-lettered immediately instead of being retried. Retrying a
+	// poison event would only replay the same failure.
+	ErrEventPoison = errors.New("bus: permanent event failure")
+)
+
+// DurableHandler processes one event with explicit delivery
+// semantics: return nil to acknowledge the event, ErrEventRetry for a
+// transient failure (redeliver, then dead-letter once exhausted), or
+// ErrEventPoison for a permanent failure (dead-letter immediately).
+type DurableHandler func(Event) error
+
+// DurableSubscriber is the optional capability of a bus that can
+// consume through named, restart-idempotent, at-least-once consumers
+// with explicit acknowledgements and a dead-letter queue (issue #81).
+// *natsbus.Bus implements it over JetStream (durable pull consumer +
+// RYVEX_DLQ stream); the in-memory *Bus does not, so callers should
+// fall back to Subscribe (best-effort live delivery, no redelivery).
+// Callers detect the capability with a type assertion on BusI.
+type DurableSubscriber interface {
+	// SubscribeDurable registers h under the deterministic consumer
+	// name durable (a valid NATS subject token, e.g. RYVEX_DISPATCHER)
+	// for events matching pattern. Events persisted while the process
+	// was down are delivered on the next SubscribeDurable with the
+	// same name; handler failures are retried and, once the delivery
+	// budget is exhausted, dead-lettered.
+	SubscribeDurable(durable, pattern string, h DurableHandler) (Sub, error)
+}
+
+// Publisher is the optional capability of a bus that can surface
+// publish failures to the caller (issue #81). *natsbus.Bus returns
+// the JetStream persistence outcome; the in-memory *Bus cannot fail.
+// Callers that must know whether an event was durably stored
+// type-assert BusI to Publisher and fall back to plain Publish
+// otherwise.
+type Publisher interface {
+	// PublishErr publishes e and returns nil once the event is durably
+	// persisted, or the failure (marshal error, broker disconnect,
+	// JetStream rejection).
+	PublishErr(e Event) error
 }
 
 // Subscription ties a handler to a subject pattern.

@@ -758,3 +758,158 @@ func testCountByKindPhase(t *testing.T, s Store) {
 		t.Fatalf("unexpected snapshot: %+v", snap)
 	}
 }
+
+// ---- audit retention (issue #85) ----
+
+// RunAuditRetentionSuite runs the bounded-audit-retention cases
+// (issue #85) against a store whose retention cap is configured SMALL
+// by the factory: cap must equal the cap the factory installs (the
+// memory backend passes state.WithAuditCap(cap); see the
+// internal/state store_test call site).
+//
+// It is deliberately NOT part of RunSuite, and it runs for the memory
+// backend only. Parity note for pgstore: the Postgres backend asserts
+// NO cap instead of running these cases — its audit table is the
+// durable compliance record (issue #85 acceptance criteria), so
+// unbounded growth there is correct behaviour, not a leak; a ring
+// eviction case would neither apply nor be honest to run against it.
+// Everything retention must not disturb — newest-first ordering,
+// filter semantics, limit clamping, AppendAudit completion — is
+// already proven for every backend by RunSuite above; the cases below
+// additionally prove that retention preserves the offset-cursor
+// guarantees (v2 8-byte base64url tokens, see state cursor docs):
+// cursors never error and never loop across the eviction boundary,
+// and evicted entries are simply absent.
+func RunAuditRetentionSuite(t *testing.T, cap int, newStore func(t *testing.T) Store) {
+	t.Run("AuditCapRespectedUnderSustainedWrites", func(t *testing.T) { testAuditCapRespected(t, newStore(t), cap) })
+	t.Run("AuditNewestFirstAcrossEvictionBoundary", func(t *testing.T) { testAuditNewestFirstAtBoundary(t, newStore(t), cap) })
+	t.Run("AuditCursorWalkAcrossEvictionTerminates", func(t *testing.T) { testAuditCursorWalkAcrossEviction(t, newStore(t), cap) })
+}
+
+// retentionEntry builds a distinguishable webhook-style audit entry:
+// the write ordinal rides in Reason so ordering assertions can name
+// exactly which write a listed entry came from.
+func retentionEntry(ordinal int) state.AuditEntry {
+	return state.AuditEntry{
+		Actor:      "webhook-dispatcher",
+		Action:     "webhook_delivered",
+		Kind:       "Subscription",
+		LogicalKey: "acme/core/prod/Subscription/hook",
+		Reason:     fmt.Sprintf("attempt %d", ordinal),
+	}
+}
+
+// testAuditCapRespected: sustained writes at 2× cap must leave
+// exactly cap entries retained — the newest ones — with the evicted
+// oldest simply absent and no error anywhere.
+func testAuditCapRespected(t *testing.T, s Store, cap int) {
+	t.Helper()
+	for i := 0; i < 2*cap; i++ {
+		mustAppendAudit(t, s, retentionEntry(i))
+	}
+	entries := mustListAudit(t, s, state.AuditOptions{Org: "acme", Limit: 500})
+	if len(entries) != cap {
+		t.Fatalf("cap %d not respected under sustained writes: %d entries retained", cap, len(entries))
+	}
+	if entries[0].Reason != fmt.Sprintf("attempt %d", 2*cap-1) {
+		t.Fatalf("newest entry lost: %+v", entries[0])
+	}
+	if entries[cap-1].Reason != fmt.Sprintf("attempt %d", cap) {
+		t.Fatalf("oldest retained entry wrong: %+v (writes 0..%d must be evicted)", entries[cap-1], cap-1)
+	}
+	for _, e := range entries {
+		if e.ID == "" || e.Time.IsZero() {
+			t.Fatalf("retained entry missing ID/Time: %+v", e)
+		}
+	}
+}
+
+// testAuditNewestFirstAtBoundary: at one-past-the-cap the listing
+// stays strictly newest-first and the boundary sits exactly where
+// oldest-first eviction puts it (writes cap-1..0 evicted, cap.. kept).
+func testAuditNewestFirstAtBoundary(t *testing.T, s Store, cap int) {
+	t.Helper()
+	for i := 0; i < cap+3; i++ {
+		mustAppendAudit(t, s, retentionEntry(i))
+	}
+	entries := mustListAudit(t, s, state.AuditOptions{Limit: 500})
+	if len(entries) != cap {
+		t.Fatalf("retained %d entries, want cap %d", len(entries), cap)
+	}
+	for k, e := range entries {
+		want := fmt.Sprintf("attempt %d", cap+2-k) // newest-first: cap+2 .. 3
+		if e.Reason != want {
+			t.Fatalf("entry %d = %q, want %q (newest-first broken at the eviction boundary)", k, e.Reason, want)
+		}
+	}
+}
+
+// testAuditCursorWalkAcrossEviction: offset cursors built from the
+// shared v2 helpers (the tokens the list pagination mints) must never
+// error and never loop across the eviction boundary. A stale cursor
+// minted before a write burst still decodes; offsets that now land
+// past the retained window clamp to an empty page; the walk
+// terminates; and the newest entry keeps outranking everything else
+// while the ring rolls mid-walk.
+func testAuditCursorWalkAcrossEviction(t *testing.T, s Store, cap int) {
+	t.Helper()
+	// Burst past the cap so the ring is full and evicting.
+	for i := 0; i < 2*cap; i++ {
+		mustAppendAudit(t, s, retentionEntry(i))
+	}
+	// A cursor minted before the burst (mid-window offset) must still
+	// decode — eviction must not corrupt the token space.
+	stale := state.EncodeCursor(1)
+	if n, err := state.DecodeCursor(stale); err != nil || n != 1 {
+		t.Fatalf("stale cursor across eviction: decoded (%d, %v), want (1, nil)", n, err)
+	}
+
+	const pageLimit = 3
+	maxSteps := 100 * cap // hard bound: a walk must always terminate
+	offset := 0
+	steps := 0
+	for steps = 0; steps < maxSteps; steps++ {
+		decoded, err := state.DecodeCursor(state.EncodeCursor(uint64(offset)))
+		if err != nil {
+			t.Fatalf("offset %d must encode+decode without error across eviction: %v", offset, err)
+		}
+		if decoded != uint64(offset) {
+			t.Fatalf("cursor roundtrip drifted: %d -> %d", offset, decoded)
+		}
+		window := mustListAudit(t, s, state.AuditOptions{Limit: 500})
+		if offset >= len(window) {
+			break // past the retained window: empty page, walk terminates
+		}
+		end := offset + pageLimit
+		if end > len(window) {
+			end = len(window)
+		}
+		page := window[offset:end]
+		for _, e := range page {
+			if e.LogicalKey != "acme/core/prod/Subscription/hook" {
+				t.Fatalf("phantom entry outside the ring at offset %d: %+v", offset, e)
+			}
+		}
+		offset = end
+		// Keep the ring rolling between pages: eviction mid-walk must
+		// never stall, error or loop the walk.
+		mustAppendAudit(t, s, retentionEntry(1000+steps))
+	}
+	if steps == maxSteps {
+		t.Fatalf("cursor walk across the eviction boundary did not terminate within %d steps", maxSteps)
+	}
+	if offset < cap {
+		t.Fatalf("walk stopped at offset %d before covering the cap-sized window", offset)
+	}
+	// newest-first survives mid-walk appends: the newest entry is the
+	// most recent append.
+	fresh := mustListAudit(t, s, state.AuditOptions{Limit: 1})
+	if len(fresh) != 1 || fresh[0].Reason != fmt.Sprintf("attempt %d", 1000+steps-1) {
+		t.Fatalf("newest-first broken after mid-walk appends: %+v", fresh)
+	}
+	// an offset far beyond anything the window can hold decodes fine
+	// and simply pages empty — absent, never an error
+	if _, err := state.DecodeCursor(state.EncodeCursor(uint64(10*cap + 42))); err != nil {
+		t.Fatalf("far-future offset must decode: %v", err)
+	}
+}

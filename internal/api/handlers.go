@@ -149,11 +149,28 @@ func (s *Server) handleScopePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Issue #72: the node agent re-sends byte-identical PUTs between
+	// spec refreshes specifically to avoid event churn, so publication
+	// of EventUpdated is gated on an actual transition. The mutation
+	// callback snapshots the store's authoritative pre-image — taken
+	// here, under the store's write lock, NOT from the earlier GET,
+	// which a concurrent writer could invalidate — and compares it to
+	// the post-mutation state with the store's own canonical predicate
+	// (state.SpecLabelsEqual), i.e. exactly the check that decides the
+	// generation bump and the audit entry below. The published and
+	// stored change decisions therefore cannot drift. CAS, generation
+	// and audit semantics are unchanged: a no-op heartbeat still
+	// answers 200 with the same generation and writes no audit entry —
+	// it just no longer floods the events feed, the webhook dispatcher
+	// and ryvex_bus_events_published_total.
+	var changed bool
 	updated, err := s.store.UpdateResource(existing.ID, func(cur *state.Resource) error {
+		prev := cur.DeepCopy()
 		cur.Spec = in.Spec
 		if in.Labels != nil {
 			cur.Labels = in.Labels
 		}
+		changed = !state.SpecLabelsEqual(prev, cur)
 		return nil
 	}, state.UpdateOptions{
 		WriteOptions:       state.WriteOptions{Actor: ActorFrom(r.Context()), Reason: "api put"},
@@ -163,13 +180,15 @@ func (s *Server) handleScopePut(w http.ResponseWriter, r *http.Request) {
 		stateStatus(w, r, err)
 		return
 	}
-	s.bus.Publish(bus.Event{
-		Type: bus.EventUpdated,
-		Org:  updated.Org, Project: updated.Project, Env: updated.Env,
-		Kind: updated.Kind, Name: updated.Name, ResourceID: updated.ID,
-		Generation: updated.Generation, Phase: updated.Status.Phase,
-		Actor: ActorFrom(r.Context()),
-	})
+	if changed {
+		s.bus.Publish(bus.Event{
+			Type: bus.EventUpdated,
+			Org:  updated.Org, Project: updated.Project, Env: updated.Env,
+			Kind: updated.Kind, Name: updated.Name, ResourceID: updated.ID,
+			Generation: updated.Generation, Phase: updated.Status.Phase,
+			Actor: ActorFrom(r.Context()),
+		})
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 

@@ -361,6 +361,14 @@ func (s *Server) routeV1(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, r, http.MethodPut, http.MethodDelete)
 		}
 	case len(seg) == 4:
+		// Scope list is a read-only collection route (#84): any
+		// non-GET (including POST/PUT/DELETE, which previously
+		// fell through to the list handler and returned 200)
+		// must be rejected with 405 + Allow.
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, r, http.MethodGet)
+			return
+		}
 		s.handleScopeList(w, r, seg)
 	case len(seg) == 5:
 		r.SetPathValue("org", seg[0])

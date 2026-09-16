@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +35,8 @@ func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	httpAddr := fs.String("http", envOr("RYVEX_HTTP_ADDR", ":8080"), "HTTP listen address")
 	storeKind := fs.String("store", "memory", "state backend (memory)")
+	// --- audit retention (issue #85): bounded memory-backend audit log ---
+	auditCap := fs.Int("audit-cap", envIntOr("RYVEX_AUDIT_CAP", state.DefaultAuditCap), "max audit entries kept by the memory backend, oldest evicted first (default 10000, env RYVEX_AUDIT_CAP; ignored with --store=postgres)")
 	devAuth := fs.Bool("dev-auth", false, "accept any ryk_ bearer token (development only)")
 	apiKeys := fs.String("api-keys", envOr("RYVEX_API_KEYS", ""), "static API keys as name=token,comma-separated")
 	corsOrigins := fs.String("cors-origins", envOr("RYVEX_CORS_ORIGINS", ""), "browser origins allowed to call the API, comma-separated")
@@ -76,7 +79,7 @@ func runServe(args []string) error {
 	var store state.Backend
 	switch *storeKind {
 	case "memory":
-		store = state.NewStore()
+		store = state.NewStore(state.WithAuditCap(*auditCap))
 	case "postgres":
 		if *dsn == "" {
 			return fmt.Errorf("--store postgres requires --dsn (or env RYVEX_DATABASE_URL)")
@@ -410,6 +413,17 @@ func newLogger(level string) (*slog.Logger, error) {
 	}
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
 	return slog.New(h), nil
+}
+
+// envIntOr reads an integer env var, falling back to def when the
+// variable is unset or not a valid integer (issue #85 --audit-cap).
+func envIntOr(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func envOr(key, def string) string {
