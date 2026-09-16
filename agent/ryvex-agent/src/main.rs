@@ -63,10 +63,10 @@ async fn run() -> i32 {
     }
 
     let mut bo = backoff::Backoff::new();
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM stream");
-    let mut sigint =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("SIGINT stream");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM stream");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("SIGINT stream");
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(cfg.interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -76,7 +76,11 @@ async fn run() -> i32 {
         match agent.sync_node(AGENT_VERSION, None).await {
             client::Outcome::Upserted { generation } => {
                 if bo.attempts() > 0 || generation <= 1 {
-                    tracing::info!(generation, node = cfg.node_name(), "node synced with control plane");
+                    tracing::info!(
+                        generation,
+                        node = cfg.node_name(),
+                        "node synced with control plane"
+                    );
                 } else {
                     tracing::debug!(generation, "heartbeat ok");
                 }
@@ -110,7 +114,10 @@ async fn run() -> i32 {
                     "sync_node leaked a Conflict outcome (bug); treating as transient"
                 );
                 let wait = bo.advance();
-                tracing::warn!(wait_secs = wait.as_secs(), "backing off after unexpected conflict");
+                tracing::warn!(
+                    wait_secs = wait.as_secs(),
+                    "backing off after unexpected conflict"
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(wait) => {}
                     _ = sigterm.recv() => break,

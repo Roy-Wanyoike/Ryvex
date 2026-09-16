@@ -4,7 +4,13 @@
 use serde_json::{json, Value};
 
 /// Build the resource document the agent upserts for itself.
-pub fn node_document(cfg: &crate::config::Config, agent_version: &str, last_seen: &str, generation: Option<i64>, status_message: Option<&str>) -> Value {
+pub fn node_document(
+    cfg: &crate::config::Config,
+    agent_version: &str,
+    last_seen: &str,
+    generation: Option<i64>,
+    status_message: Option<&str>,
+) -> Value {
     let mut doc = json!({
         "kind": "Node",
         "org": cfg.org,

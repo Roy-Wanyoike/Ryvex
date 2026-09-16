@@ -71,9 +71,16 @@ Logs honor `RUST_LOG` (default `info`; use `debug` for per-heartbeat lines).
   safe.
 - **Self-heal**: node deleted out from under a running agent? The next
   tick re-creates it.
-- **Resilience**: transport errors and 5xx back off exponentially
-  (1s → 2s → 4s … capped at 30s, symmetric ±20% jitter) and recover
-  without restarts.
+- **Resilience**: transient failures back off exponentially and
+  recover without restarts. A transient failure is any transport
+  error, a non-decodable response body, or a 5xx status on either the
+  node GET or the node PUT (issue #75: PUT 5xx used to be classified
+  as a permanent rejection, so a flaky load balancer reduced the whole
+  fleet to a fixed-interval retry hammer). The backoff sequence is
+  1s → 2s → 4s … capped at 30s with symmetric ±20% jitter (floored at
+  1s), and the counter resets on the first success. Other 4xx
+  responses (anything but 404/409) are permanent rejections: logged
+  loudly and retried at the fixed heartbeat interval without backoff.
 - **Shutdown**: SIGINT/SIGTERM writes one best-effort
   `status_message: "draining"` and exits 0.
 

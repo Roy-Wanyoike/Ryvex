@@ -45,8 +45,19 @@ fn api_trailing_slash_trimmed() {
 
 #[test]
 fn node_path_scope_addressing() {
-    let mut c = cfg(&["--token", "ryk_x", "--org", "acme", "--project", "core", "--env", "prod", "--name", "n1"])
-        .unwrap();
+    let mut c = cfg(&[
+        "--token",
+        "ryk_x",
+        "--org",
+        "acme",
+        "--project",
+        "core",
+        "--env",
+        "prod",
+        "--name",
+        "n1",
+    ])
+    .unwrap();
     c.validate().unwrap();
     assert_eq!(c.node_path(), "/v1/acme/core/prod/nodes/n1");
 }
@@ -97,16 +108,28 @@ fn backoff_doubles_then_caps_with_symmetric_jitter() {
 #[test]
 fn node_document_matches_golden_contract() {
     let mut c = cfg(&[
-        "--token", "ryk_x",
-        "--org", "acme",
-        "--project", "core",
-        "--env", "prod",
-        "--name", "smoke-node",
-        "--cluster", "prod-eu1",
+        "--token",
+        "ryk_x",
+        "--org",
+        "acme",
+        "--project",
+        "core",
+        "--env",
+        "prod",
+        "--name",
+        "smoke-node",
+        "--cluster",
+        "prod-eu1",
     ])
     .unwrap();
     c.validate().unwrap();
-    let doc = spec::node_document(&c, "1.0.0", "2026-09-08T10:00:00Z", Some(3), Some("draining"));
+    let doc = spec::node_document(
+        &c,
+        "1.0.0",
+        "2026-09-08T10:00:00Z",
+        Some(3),
+        Some("draining"),
+    );
     assert_eq!(
         doc,
         json!({
