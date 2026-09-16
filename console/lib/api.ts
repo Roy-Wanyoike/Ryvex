@@ -1,4 +1,9 @@
-import { demoAudit, demoEvents, demoResources } from "./demo";
+/**
+ * NOTE (issue #86): ./demo is intentionally NOT statically imported here.
+ * The 180-line fabricated snapshot is code-split into its own async chunk and
+ * loaded via `await import('./demo')` ONLY when no API base is configured,
+ * so the live production bundle carries zero bytes of demo data.
+ */
 import type { AuditEntry, Resource, RyvexEvent } from "./types";
 
 /**
@@ -57,6 +62,26 @@ export const REQUEST_TIMEOUT_MS = 10_000;
 /** Hard cap on resources accumulated by the pagination loop. */
 const RESOURCE_PAGE_LIMIT = 200; // server max page size
 const RESOURCE_TOTAL_CAP = 1000;
+
+/**
+ * Page size for the events/audit feeds (issue #86). This is a PAGE size, not
+ * a cap: the view loads one page up front and a "Load more" button appends
+ * further cursor-addressed pages, so feeds are no longer silently truncated
+ * at 100 rows. It matches the control plane's server-side default limit.
+ */
+export const FEED_PAGE_SIZE = 100;
+
+/** Options for cursor-paginated feed reads (issue #86). */
+export interface FeedReadOptions {
+  signal?: AbortSignal;
+  /**
+   * Opaque continuation cursor from a previous page's `nextCursor`. Omit for
+   * the first page. The console speaks the resources pagination vocabulary
+   * (`?cursor=` request param, `next_cursor` response field — docs/api-contracts.md)
+   * for every list endpoint, feeds included.
+   */
+  cursor?: string;
+}
 
 // ---- module-level runtime config store ----
 
@@ -418,6 +443,7 @@ export async function fetchResource(
   name: string,
 ): Promise<Resource | null> {
   if (!getApiBase()) {
+    const { demoResources } = await import("./demo");
     return (
       demoResources().find(
         (r) => r.org === org && r.project === project && r.env === env && r.kind === kind && r.name === name,
@@ -491,6 +517,13 @@ export interface FetchResult<T> {
   at: number;
   /** Present when status !== "ok": operator-actionable failure reason. */
   reason?: string;
+  /**
+   * Opaque continuation cursor (issue #86): present only when the control
+   * plane emitted a `next_cursor` for this page AND the read succeeded.
+   * `undefined` = no more pages (or the plane does not paginate this feed),
+   * so the UI must not offer "Load more".
+   */
+  nextCursor?: string;
 }
 
 /**
@@ -539,35 +572,53 @@ async function listAllResources(into: Resource[], signal?: AbortSignal): Promise
   return into.slice(0, RESOURCE_TOTAL_CAP);
 }
 
-/** Single-request feed with last-good fallback. Never throws. */
+/**
+ * Live-only single-request feed with last-good fallback (issue #86). Never
+ * throws. Demo mode is handled by the callers, which dynamically import the
+ * demo snapshot — this function always talks to the control plane.
+ *
+ * Cursor support (#86): appends `&cursor=` when the caller continues a feed
+ * and surfaces the plane's `next_cursor` as `nextCursor` (stripped from
+ * `data`, which stays the plain feed payload). A plane that does not emit
+ * cursors simply yields `nextCursor: undefined` — no fabricated pagination.
+ */
 async function fetchFeed<T>(
   path: string,
-  demo: () => T,
   empty: () => T,
-  opts?: { signal?: AbortSignal },
+  opts?: FeedReadOptions,
 ): Promise<FetchResult<T>> {
-  // Demo data ONLY when no API base is configured — that is the mode.
-  if (!getApiBase()) {
-    return { data: demo(), status: "ok", at: Date.now() };
-  }
   const base = getApiBase();
+  const url = opts?.cursor ? `${base}${path}&cursor=${encodeURIComponent(opts.cursor)}` : `${base}${path}`;
   try {
-    const res = await fetch(`${base}${path}`, {
+    const res = await fetch(url, {
       headers: { "Content-Type": "application/json", ...authHeader(getApiToken()) },
       cache: "no-store",
       signal: requestSignal(opts?.signal),
     });
     if (!res.ok) throw new ApiError(res.status, `http_${res.status}`, httpReason(res.status));
-    const data = (await res.json()) as T;
+    const raw = (await res.json()) as T & { next_cursor?: unknown };
+    const nextCursor =
+      typeof raw?.next_cursor === "string" && raw.next_cursor ? raw.next_cursor : undefined;
+    const data = stripNextCursor(raw);
     const now = Date.now();
     lastGood.set(path, { data, at: now });
-    return { data, status: "ok", at: now };
+    return { data, status: "ok", at: now, nextCursor };
   } catch (err) {
     const reason = failureReason(err);
     const cached = lastGood.get(path) as { data: T; at: number } | undefined;
     if (cached) return { data: cached.data, status: "degraded", at: cached.at, reason };
     return { data: empty(), status: "error", at: Date.now(), reason };
   }
+}
+
+/** Copy of the page payload with the transport-only next_cursor key removed. */
+function stripNextCursor<T>(raw: T & { next_cursor?: unknown }): T {
+  if (raw !== null && typeof raw === "object" && "next_cursor" in raw) {
+    const clone = { ...(raw as Record<string, unknown>) };
+    delete clone.next_cursor;
+    return clone as T;
+  }
+  return raw;
 }
 
 /**
@@ -578,6 +629,7 @@ async function fetchFeed<T>(
  */
 export async function fetchResources(opts?: { signal?: AbortSignal }): Promise<FetchResult<Resource[]>> {
   if (!getApiBase()) {
+    const { demoResources } = await import("./demo");
     return { data: demoResources(), status: "ok", at: Date.now() };
   }
   const key = "/v1/resources";
@@ -600,24 +652,43 @@ export async function fetchResources(opts?: { signal?: AbortSignal }): Promise<F
   }
 }
 
-/** Events for the configured org (newest first, limit 100). */
-export function fetchEvents(opts?: { signal?: AbortSignal }): Promise<FetchResult<{ events: RyvexEvent[] }>> {
-  const org = encodeURIComponent(getOrg());
-  return fetchFeed<{ events: RyvexEvent[] }>(
-    `/v1/${org}/events?limit=100`,
-    () => ({ events: demoEvents() }),
-    () => ({ events: [] }),
-    opts,
-  );
+/** Events feed payload (wire shape, docs/api-contracts.md). */
+export interface EventsPage {
+  events: RyvexEvent[];
 }
 
-/** Audit entries for the configured org (newest first, limit 100). */
-export function fetchAudit(opts?: { signal?: AbortSignal }): Promise<FetchResult<{ entries: AuditEntry[] }>> {
+/** Audit feed payload (wire shape, docs/api-contracts.md). */
+export interface AuditPage {
+  entries: AuditEntry[];
+}
+
+/**
+ * Events for the configured org (newest first), one FEED_PAGE_SIZE page per
+ * call (issue #86). Pass the previous result's `nextCursor` to load the next
+ * page; the 100-row console-side cap is gone — the view accumulates pages.
+ *
+ * Demo mode dynamically imports the snapshot ONLY here, when no API base is
+ * configured; the live code path never touches the demo module.
+ */
+export async function fetchEvents(opts?: FeedReadOptions): Promise<FetchResult<EventsPage>> {
+  if (!getApiBase()) {
+    const { demoEvents } = await import("./demo");
+    return { data: { events: demoEvents() }, status: "ok", at: Date.now() };
+  }
   const org = encodeURIComponent(getOrg());
-  return fetchFeed<{ entries: AuditEntry[] }>(
-    `/v1/${org}/audit?limit=100`,
-    () => ({ entries: demoAudit() }),
-    () => ({ entries: [] }),
-    opts,
-  );
+  return fetchFeed<EventsPage>(`/v1/${org}/events?limit=${FEED_PAGE_SIZE}`, () => ({ events: [] }), opts);
+}
+
+/**
+ * Audit entries for the configured org (newest first), one FEED_PAGE_SIZE
+ * page per call (issue #86) — same cursor contract as fetchEvents, so long
+ * audit tails are no longer silently truncated at 100.
+ */
+export async function fetchAudit(opts?: FeedReadOptions): Promise<FetchResult<AuditPage>> {
+  if (!getApiBase()) {
+    const { demoAudit } = await import("./demo");
+    return { data: { entries: demoAudit() }, status: "ok", at: Date.now() };
+  }
+  const org = encodeURIComponent(getOrg());
+  return fetchFeed<AuditPage>(`/v1/${org}/audit?limit=${FEED_PAGE_SIZE}`, () => ({ entries: [] }), opts);
 }

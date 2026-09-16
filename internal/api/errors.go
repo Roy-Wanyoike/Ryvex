@@ -3,6 +3,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
@@ -49,18 +50,21 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg st
 	}})
 }
 
-// stateStatus maps store sentinel errors onto HTTP responses.
+// stateStatus maps store sentinel errors onto HTTP responses. Mapping
+// uses errors.Is (#84) so wrapped errors — fmt.Errorf("...: %w", err)
+// chains added by future callers — still land on the right status
+// instead of falling through to a misleading 500.
 func stateStatus(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case isValidation(err):
 		writeError(w, r, http.StatusBadRequest, CodeValidation, err.Error())
-	case err == state.ErrNotFound:
+	case errors.Is(err, state.ErrNotFound):
 		writeError(w, r, http.StatusNotFound, CodeNotFound, "resource not found")
-	case err == state.ErrAlreadyExists:
+	case errors.Is(err, state.ErrAlreadyExists):
 		writeError(w, r, http.StatusConflict, CodeAlreadyExists, "resource already exists at this address")
-	case err == state.ErrConflict:
+	case errors.Is(err, state.ErrConflict):
 		writeError(w, r, http.StatusConflict, CodeConflict, "generation conflict: resource was modified concurrently")
-	case err == state.ErrBadRequest:
+	case errors.Is(err, state.ErrBadRequest):
 		writeError(w, r, http.StatusBadRequest, CodeBadRequest, err.Error())
 	default:
 		writeError(w, r, http.StatusInternalServerError, CodeInternal, "internal error")
@@ -72,16 +76,15 @@ func isValidation(err error) bool {
 	if ok := asValidation(err, &ve); ok {
 		return true
 	}
-	return err == state.ErrValidation
+	return errors.Is(err, state.ErrValidation)
 }
 
+// asValidation unwraps the error chain looking for a
+// *state.ValidationError (errors.As, #84), so validation errors
+// wrapped by intermediate layers are still recognized and their
+// field-level message surfaced.
 func asValidation(err error, target **state.ValidationError) bool {
-	ve, ok := err.(*state.ValidationError)
-	if ok {
-		*target = ve
-		return true
-	}
-	return false
+	return errors.As(err, target)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -7,6 +7,7 @@
  * implicit Authorization header is ever sent (issue #42).
  */
 import { beforeEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   ApiError,
   DemoModeError,
@@ -25,7 +26,9 @@ import {
   httpReason,
   parseErrorEnvelope,
 } from "@/lib/api";
+import { FEED_PAGE_SIZE } from "@/lib/api";
 import { demoAudit, demoEvents, demoResources } from "@/lib/demo";
+import type { RyvexEvent } from "@/lib/types";
 import { installFetch, jsonReply, networkFailure, reqHeader } from "./helpers";
 
 const BASE = "https://api.test";
@@ -223,7 +226,8 @@ describe("fetchEvents (fetchFeed semantics)", () => {
 
   test("live path: failure after a good read degrades to the last good snapshot", async () => {
     configureApi({ apiBase: BASE });
-    const good = { events: [{ id: "evt-good" }] };
+    const goodEvent: RyvexEvent = { id: "evt-good", time: "t", type: "created", subject: "s", org: "acme", kind: "Application", name: "web" };
+    const good = { events: [goodEvent] };
     let n = 0;
     const { calls } = installFetch(() => {
       n++;
@@ -353,7 +357,129 @@ describe("fetchResources", () => {
   });
 });
 
-// ---- Authorization header hygiene (issue #42) ----
+// ---- feed cursor pagination (issue #86) ----
+
+describe("feed cursor pagination (issue #86)", () => {
+  test("page size is a page, not a cap: FEED_PAGE_SIZE feeds the request and stays at 100", () => {
+    expect(FEED_PAGE_SIZE).toBe(100);
+  });
+
+  test("events: first page surfaces the plane's next_cursor as nextCursor and strips it from data", async () => {
+    configureApi({ apiBase: BASE });
+    const { calls } = installFetch(() =>
+      jsonReply({ events: [{ id: "e1" }, { id: "e2" }], count: 2, next_cursor: "c2" }),
+    );
+    const result = await fetchEvents();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toBe(`${BASE}/v1/acme/events?limit=${FEED_PAGE_SIZE}`);
+    expect(result.status).toBe("ok");
+    expect(result.data.events.map((e) => e.id)).toEqual(["e1", "e2"]);
+    expect(result.nextCursor).toBe("c2");
+    // transport-only key must not leak into the rendered payload
+    expect("next_cursor" in result.data).toBe(false);
+  });
+
+  test("events: passing the cursor appends &cursor= and continues the feed", async () => {
+    configureApi({ apiBase: BASE });
+    const { calls } = installFetch(() => jsonReply({ events: [{ id: "e3" }] }));
+    const result = await fetchEvents({ cursor: "c2" });
+    expect(calls[0].input).toBe(`${BASE}/v1/acme/events?limit=${FEED_PAGE_SIZE}&cursor=c2`);
+    expect(result.data.events.map((e) => e.id)).toEqual(["e3"]);
+  });
+
+  test("events: cursors are URL-encoded like any query value", async () => {
+    configureApi({ apiBase: BASE });
+    const { calls } = installFetch(() => jsonReply({ events: [] }));
+    await fetchEvents({ cursor: "a b/c?" });
+    expect(calls[0].input).toBe(`${BASE}/v1/acme/events?limit=${FEED_PAGE_SIZE}&cursor=a%20b%2Fc%3F`);
+  });
+
+  test("events: empty or non-string next_cursor means exhausted (no fabricated pagination)", async () => {
+    configureApi({ apiBase: BASE });
+    installFetch(() => jsonReply({ events: [{ id: "e1" }], next_cursor: "" }));
+    expect((await fetchEvents()).nextCursor).toBeUndefined();
+
+    installFetch(() => jsonReply({ events: [{ id: "e1" }], next_cursor: 42 }));
+    expect((await fetchEvents()).nextCursor).toBeUndefined();
+
+    installFetch(() => jsonReply({ events: [{ id: "e1" }] }));
+    expect((await fetchEvents()).nextCursor).toBeUndefined();
+  });
+
+  test("audit: full cursor round-trip — page one hands the cursor to page two", async () => {
+    configureApi({ apiBase: BASE });
+    let page = 0;
+    const { calls } = installFetch(() => {
+      page++;
+      return page === 1
+        ? jsonReply({ entries: [{ id: "a-100" }, { id: "a-99" }], count: 2, next_cursor: "off100" })
+        : jsonReply({ entries: [{ id: "a-98" }], count: 1 });
+    });
+    const first = await fetchAudit();
+    expect(first.nextCursor).toBe("off100");
+
+    const second = await fetchAudit({ cursor: first.nextCursor });
+    expect(calls.map((c) => c.input)).toEqual([
+      `${BASE}/v1/acme/audit?limit=${FEED_PAGE_SIZE}`,
+      `${BASE}/v1/acme/audit?limit=${FEED_PAGE_SIZE}&cursor=off100`,
+    ]);
+    expect(second.data.entries.map((a) => a.id)).toEqual(["a-98"]);
+    expect(second.nextCursor).toBeUndefined(); // exhausted — no Load more
+  });
+
+  test("degraded fallback carries no cursor — Load more hides while the plane is failing", async () => {
+    configureApi({ apiBase: BASE });
+    let n = 0;
+    installFetch(() => {
+      n++;
+      return n === 1 ? jsonReply({ events: [{ id: "e1" }], next_cursor: "c2" }) : jsonReply({}, 503);
+    });
+    expect((await fetchEvents()).nextCursor).toBe("c2");
+
+    const degraded = await fetchEvents();
+    expect(degraded.status).toBe("degraded");
+    expect(degraded.nextCursor).toBeUndefined();
+  });
+
+  test("demo mode: feeds are served through the dynamic demo import with no cursor fabricated", async () => {
+    const { calls } = installFetch(() => jsonReply({ events: [] }));
+    const events = await fetchEvents();
+    const audit = await fetchAudit();
+    expect(calls).toHaveLength(0); // demo mode never hits the wire
+    expect(events.status).toBe("ok");
+    expect(events.data.events.map((e) => e.id)).toEqual(demoEvents().map((e) => e.id));
+    expect(events.nextCursor).toBeUndefined();
+    expect(audit.data.entries.map((a) => a.id)).toEqual(demoAudit().map((a) => a.id));
+    expect(audit.nextCursor).toBeUndefined();
+  });
+
+  test("live mode never touches the demo snapshot, even when it fails", async () => {
+    configureApi({ apiBase: BASE });
+    installFetch(networkFailure());
+    const result = await fetchAudit();
+    expect(result.status).toBe("error");
+    expect(result.data.entries).toEqual([]);
+    expect(result.data.entries).not.toEqual(demoAudit());
+  });
+});
+
+// ---- demo code-split hygiene (issue #86) ----
+
+describe("demo code-split hygiene (issue #86)", () => {
+  const apiSource = readFileSync(new URL("../lib/api.ts", import.meta.url), "utf8");
+
+  test("lib/api.ts has NO static import of ./demo — the live bundle must not ship the snapshot", () => {
+    expect(apiSource).not.toMatch(/(^|\n)\s*import\s+[^;]*from\s+["']\.\/demo["']/);
+  });
+
+  test("every demo access is a dynamic import guarded by an empty API base", () => {
+    const dynamicImports = apiSource.match(/await import\("\.\/demo"\)/g) ?? [];
+    expect(dynamicImports.length).toBeGreaterThan(0);
+    // each dynamic import must sit directly inside `if (!getApiBase()) {`
+    const guardedImports = apiSource.match(/if \(!getApiBase\(\)\) \{\s*\n\s*const \{ demo\w+ \} = await import\("\.\/demo"\);/g) ?? [];
+    expect(guardedImports.length).toBe(dynamicImports.length);
+  });
+});
 
 describe("Authorization header hygiene", () => {
   test("no Authorization header is sent when no token is configured", async () => {

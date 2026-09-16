@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -31,12 +32,23 @@ const (
 // TokenPrefix is the namespace for Ryvex API keys.
 const TokenPrefix = "ryk_"
 
+// requestIDPattern constrains client-supplied X-Request-Id values to a
+// safe subset (#84): 1-64 characters of [A-Za-z0-9._-]. Anything else
+// - too long, or carrying whitespace, newlines, control/escape bytes,
+// quotes or separators that could break log lines or JSON envelopes -
+// is discarded and replaced with a server-generated id.
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
 // RequestIDMiddleware assigns a short request ID to every request and
-// echoes it back in X-Request-Id.
+// echoes it back in X-Request-Id. A client-supplied X-Request-Id is
+// honored only when it matches requestIDPattern (bounded length, safe
+// charset - #84); otherwise a fresh 6-byte hex id is generated, so the
+// id that reaches the logs and error envelopes is always safe to
+// interpolate.
 func RequestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")
-		if id == "" {
+		if !requestIDPattern.MatchString(id) {
 			var b [6]byte
 			_, _ = rand.Read(b[:])
 			id = hex.EncodeToString(b[:])

@@ -863,3 +863,144 @@ func TestDispatchDeniesRedirects(t *testing.T) {
 		t.Errorf("webhook_failed entries = %d, want 1 (single denied attempt)", got)
 	}
 }
+
+// ---- issue #81: durable-consumer consume path ----
+
+// durableStub is a bus.BusI that also implements bus.DurableSubscriber,
+// standing in for *natsbus.Bus. The memory bus it embeds stays
+// available for the fallback path.
+type durableStub struct {
+	*bus.Bus
+
+	durable string
+	pattern string
+	handler bus.DurableHandler
+	err     error
+}
+
+func (d *durableStub) SubscribeDurable(durable, pattern string, h bus.DurableHandler) (bus.Sub, error) {
+	if d.err != nil {
+		return nil, d.err
+	}
+	d.durable, d.pattern, d.handler = durable, pattern, h
+	return &stubDurableSub{}, nil
+}
+
+type stubDurableSub struct{ canceled atomic.Bool }
+
+func (s *stubDurableSub) Cancel() { s.canceled.Store(true) }
+
+// TestStartUsesDurableConsumer pins the durable-consumer switch (issue
+// #81): when the bus implements bus.DurableSubscriber the dispatcher
+// subscribes under the deterministic RYVEX_DISPATCHER consumer, and
+// events handed to the durable handler fan out to subscriptions as
+// usual — acked (nil) once processed.
+func TestStartUsesDurableConsumer(t *testing.T) {
+	st := state.NewStore()
+	srv, ch := captureServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	createSubscription(t, st, "acme", "durable-hook", map[string]any{
+		"url": srv.URL, "subjects": []any{"ryvex.resource.acme.>"}, "active": true, "max_retries": 1,
+	})
+	db := &durableStub{Bus: bus.New()}
+	d := NewDispatcher(st, db, testOptions("secret", nil))
+	d.Start(context.Background())
+	defer d.Stop(time.Second)
+
+	if db.durable != DurableName {
+		t.Fatalf("durable consumer name = %q, want %q", db.durable, DurableName)
+	}
+	if db.pattern != SubjectPattern {
+		t.Fatalf("durable pattern = %q, want %q", db.pattern, SubjectPattern)
+	}
+	if db.handler == nil {
+		t.Fatal("durable handler was not registered")
+	}
+
+	e := bus.Event{
+		Type: bus.EventCreated, Subject: "ryvex.resource.acme.application.created",
+		Org: "acme", Project: "core", Env: "prod",
+		Kind: "Application", Name: "evt-1", ResourceID: "r-1", Generation: 1, Actor: "test",
+	}
+	if err := db.handler(e); err != nil {
+		t.Fatalf("durable handler returned error for a processable event: %v", err)
+	}
+	c := recv(t, ch, 3*time.Second)
+	var payload deliveryPayload
+	if err := json.Unmarshal(c.body, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.Name != "evt-1" || payload.Event.Subject != e.Subject {
+		t.Fatalf("delivered payload = %+v", payload)
+	}
+}
+
+// TestStartFallsBackToLiveWhenDurableFails pins the degradation
+// contract: a bus that fails the durable subscribe (or lacks the
+// capability) leaves the dispatcher on the best-effort live
+// subscription instead of dying.
+func TestStartFallsBackToLiveWhenDurableFails(t *testing.T) {
+	st := state.NewStore()
+	srv, ch := captureServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	createSubscription(t, st, "acme", "fallback-hook", map[string]any{
+		"url": srv.URL, "subjects": []any{"ryvex.resource.acme.>"}, "active": true, "max_retries": 1,
+	})
+	db := &durableStub{Bus: bus.New(), err: errors.New("jetstream unavailable")}
+	d := NewDispatcher(st, db, testOptions("secret", nil))
+	d.Start(context.Background())
+	defer d.Stop(time.Second)
+
+	if db.durable != "" {
+		t.Fatalf("durable consumer %q must not be registered on subscribe failure", db.durable)
+	}
+	// The embedded memory bus is now the live path: publish there.
+	db.Publish(bus.Event{
+		Type: bus.EventCreated, Subject: "ryvex.resource.acme.application.created",
+		Org: "acme", Project: "core", Env: "prod",
+		Kind: "Application", Name: "evt-live", ResourceID: "r-2", Generation: 1, Actor: "test",
+	})
+	c := recv(t, ch, 3*time.Second)
+	if !strings.Contains(string(c.body), "evt-live") {
+		t.Fatalf("live fallback delivery = %s", c.body)
+	}
+}
+
+// failListStore wraps the memory store with a failing ListResources.
+type failListStore struct{ *state.Store }
+
+func (f failListStore) ListResources(state.ListOptions) ([]*state.Resource, string, error) {
+	return nil, "", errors.New("store down")
+}
+
+// panicListStore wraps the memory store with a panicking ListResources.
+type panicListStore struct{ *state.Store }
+
+func (p panicListStore) ListResources(state.ListOptions) ([]*state.Resource, string, error) {
+	panic("boom")
+}
+
+// TestOnEventDurableTaxonomy pins the failure taxonomy the dispatcher
+// reports to the durable consumer (issue #81): a failed subscription
+// refresh or a panic is a transient failure (redeliver, bounded by
+// MaxDeliver), while ordinary events are processed and acked.
+func TestOnEventDurableTaxonomy(t *testing.T) {
+	d := NewDispatcher(failListStore{state.NewStore()}, bus.New(), testOptions("secret", nil))
+
+	err := d.onEventDurable(bus.Event{Kind: state.KindSubscription})
+	if !errors.Is(err, bus.ErrEventRetry) {
+		t.Fatalf("refresh failure = %v, want bus.ErrEventRetry", err)
+	}
+	// Non-subscription events skip the refresh entirely: processable.
+	if err := d.onEventDurable(bus.Event{Kind: "Application"}); err != nil {
+		t.Fatalf("plain event = %v, want nil (acked)", err)
+	}
+
+	d2 := NewDispatcher(panicListStore{state.NewStore()}, bus.New(), testOptions("secret", nil))
+	err = d2.onEventDurable(bus.Event{Kind: state.KindSubscription})
+	if !errors.Is(err, bus.ErrEventRetry) {
+		t.Fatalf("panic = %v, want bus.ErrEventRetry (contained, redelivered)", err)
+	}
+}

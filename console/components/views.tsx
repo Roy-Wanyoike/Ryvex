@@ -241,18 +241,75 @@ export function EventStream({ events }: { events: RyvexEvent[] }) {
   );
 }
 
-export function EventsView({ events }: { events: RyvexEvent[] }) {
+export function EventsView({
+  events,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
+}: {
+  events: RyvexEvent[];
+  /** Next page available (issue #86): the plane emitted a continuation cursor. */
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
+}) {
   return (
     <div className="panel p-5">
       <SectionTitle>Event stream — subject ryvex.resource.*</SectionTitle>
       <EventStream events={events} />
+      <LoadMoreRow hasMore={hasMore} loading={loadingMore} onLoadMore={onLoadMore} what="events" />
+    </div>
+  );
+}
+
+/**
+ * "Load more" affordance for cursor-paginated feeds (issue #86). Renders only
+ * when the control plane actually emitted a continuation cursor — a plane
+ * that does not paginate a feed never shows the button, so the console never
+ * implies there are more rows than exist.
+ */
+function LoadMoreRow({
+  hasMore,
+  loading,
+  onLoadMore,
+  what,
+}: {
+  hasMore: boolean;
+  loading: boolean;
+  onLoadMore?: () => void;
+  what: string;
+}) {
+  if (!hasMore || !onLoadMore) return null;
+  return (
+    <div className="mt-4 flex justify-center border-t border-[var(--line)] pt-4">
+      <button
+        type="button"
+        onClick={onLoadMore}
+        disabled={loading}
+        aria-busy={loading}
+        aria-label={`Load more ${what}`}
+        className="rounded-lg border border-[var(--line)] px-4 py-1.5 text-xs font-semibold text-[var(--muted)] transition hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {loading ? "Loading…" : `Load more ${what}`}
+      </button>
     </div>
   );
 }
 
 /* ---------------- Audit ---------------- */
 
-export function AuditView({ entries }: { entries: AuditEntry[] }) {
+export function AuditView({
+  entries,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
+}: {
+  entries: AuditEntry[];
+  /** Next page available (issue #86): the plane emitted a continuation cursor. */
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
+}) {
   return (
     <div className="panel overflow-hidden">
       <div className="border-b border-[var(--line)] p-4">
@@ -298,6 +355,7 @@ export function AuditView({ entries }: { entries: AuditEntry[] }) {
           </tbody>
         </table>
       </div>
+      <LoadMoreRow hasMore={hasMore} loading={loadingMore} onLoadMore={onLoadMore} what="audit entries" />
     </div>
   );
 }
