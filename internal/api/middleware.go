@@ -277,8 +277,14 @@ func authenticateToken(tok string, ix staticKeyIndex, devAuth bool) (string, boo
 }
 
 // CORSMiddleware enables cross-origin browser clients (the web
-// console) to call the API. Only explicitly allowed origins get
-// headers; preflight requests short-circuit before auth.
+// console) to call the API. Only explicitly allowed origins get CORS
+// headers; allowed-origin preflights short-circuit a 204 before auth.
+// Disallowed-origin hygiene (issue #108): their responses carry
+// Vary: Origin so shared caches can never replay an allowed-origin
+// response to another origin, and their preflights no longer get the
+// free pre-auth 204 — they are rejected 403 with no CORS headers. The
+// browser blocks disallowed cross-origin responses either way; this is
+// server-side hygiene, and the allowed-origin behavior is unchanged.
 func CORSMiddleware(allowed []string) func(http.Handler) http.Handler {
 	allowedSet := make(map[string]bool, len(allowed))
 	for _, o := range allowed {
@@ -293,8 +299,21 @@ func CORSMiddleware(allowed []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 				w.Header().Set("Access-Control-Max-Age", "600")
+			} else if origin != "" {
+				// Disallowed origin (issue #108): no CORS headers, but the
+				// response is origin-dependent for every cache, so Vary
+				// must list Origin here too.
+				w.Header().Add("Vary", "Origin")
+				if r.Method == http.MethodOptions {
+					// Tightened preflight (issue #108): disallowed origins
+					// no longer short-circuit a free 204 pre-auth; they
+					// get an explicit 403 and no CORS headers.
+					writeError(w, r, http.StatusForbidden, CodeForbidden, "origin not allowed")
+					return
+				}
 			}
 			if r.Method == http.MethodOptions && origin != "" {
+				// Allowed-origin preflight short-circuits before auth.
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -313,7 +332,10 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
-		if strings.HasPrefix(r.URL.Path, "/v1") {
+		// Issue #108: match the /v1 segment boundary precisely — the
+		// old HasPrefix("/v1") also caught sibling paths like /v1x,
+		// which are not API routes and keep their own semantics.
+		if r.URL.Path == "/v1" || r.URL.Path == "/v1/" || strings.HasPrefix(r.URL.Path, "/v1/") {
 			h.Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)

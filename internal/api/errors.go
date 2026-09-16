@@ -39,10 +39,10 @@ const (
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
 	rid := RequestIDFrom(r.Context())
+	// The frozen envelope contract always carries "details" as an array
+	// (docs/api-contracts.md): a non-nil empty slice serializes as [],
+	// whereas nil would serialize as null. There is no nil path here.
 	details := []string{}
-	if details == nil {
-		details = make([]string, 0)
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(errorBody{Error: errDetail{

@@ -141,16 +141,26 @@ func (k *KeyService) List() ([]KeyView, error) {
 	return out, nil
 }
 
-// Update applies PATCH-style role/scope/active changes by key ID.
-func (k *KeyService) Update(actor, id string, req updateKeyRequest) (KeyView, error) {
+// Update applies PATCH-style role/scope/active changes by key ID. The
+// second return reports whether the mutation actually changed the
+// resource (issue #108): a no-change PATCH — an empty body, or one that
+// restates the current roles/scopes/active — must not fan an `updated`
+// key event (same churn class as #72's heartbeat PUTs). The decision
+// is made with the store's canonical predicate (state.SpecLabelsEqual)
+// inside the mutation closure — the authoritative pre-image snapshot
+// pattern from the scope-PUT gating in handlers.go — so the published
+// and stored change decisions cannot drift.
+func (k *KeyService) Update(actor, id string, req updateKeyRequest) (KeyView, bool, error) {
 	res, err := k.store.GetResource(id)
 	if err != nil {
-		return KeyView{}, err
+		return KeyView{}, false, err
 	}
 	if res.Kind != state.KindAPIKey {
-		return KeyView{}, state.ErrNotFound
+		return KeyView{}, false, state.ErrNotFound
 	}
+	var changed bool
 	updated, err := k.store.UpdateResource(id, func(cur *state.Resource) error {
+		prev := cur.DeepCopy() // pre-image under the store's write lock
 		if req.Roles != nil {
 			cur.Spec["roles"] = anyStrings(*req.Roles)
 		}
@@ -160,14 +170,19 @@ func (k *KeyService) Update(actor, id string, req updateKeyRequest) (KeyView, er
 		if req.Active != nil {
 			cur.Spec["active"] = *req.Active
 		}
+		changed = !state.SpecLabelsEqual(prev, cur)
 		return nil
 	}, state.UpdateOptions{
 		WriteOptions: state.WriteOptions{Actor: actor, Reason: "keys api: update"},
 	})
 	if err != nil {
-		return KeyView{}, err
+		return KeyView{}, false, err
 	}
-	return resourceToKeyView(updated)
+	view, err := resourceToKeyView(updated)
+	if err != nil {
+		return KeyView{}, false, err
+	}
+	return view, changed, nil
 }
 
 // Delete revokes a key by ID. Revocation is immediate: the API layer
@@ -357,12 +372,19 @@ func (s *Server) handleKeysUpdate(w http.ResponseWriter, r *http.Request) {
 		bodyStatus(w, r, err)
 		return
 	}
-	view, err := s.keys.Update(ident.Principal, r.PathValue("id"), req)
+	view, changed, err := s.keys.Update(ident.Principal, r.PathValue("id"), req)
 	if err != nil {
 		stateStatus(w, r, err)
 		return
 	}
-	s.publishKeyEvent(bus.EventUpdated, view, ident.Principal)
+	if changed {
+		// Issue #108: a no-change PATCH publishes nothing — the event
+		// feed, webhook dispatcher and bus metrics stay quiet, exactly
+		// like the #72 heartbeat gating for resources.
+		s.publishKeyEvent(bus.EventUpdated, view, ident.Principal)
+	}
+	// Refresh stays unconditional as a cache-drift safety net: a no-op
+	// cannot have changed the key's auth state, so this is idempotent.
 	_ = s.authorizer.Refresh()
 	writeJSON(w, http.StatusOK, view)
 }
