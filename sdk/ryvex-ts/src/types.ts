@@ -11,19 +11,37 @@
  * exhaustive.
  */
 
-/** The closed set of resource kinds registered in the control plane. */
-export type ResourceKind =
-  | "Project"
-  | "Environment"
-  | "Application"
-  | "Deployment"
-  | "Cluster"
-  | "Node"
-  | "Database"
-  | "Cache"
-  | "Bucket"
-  | "Policy"
-  | "Secret";
+/**
+ * Resource kinds registered in the control plane, mirroring the
+ * `Kind*` constants and the authoritative `Kinds` map in
+ * `internal/state/resource.go` (server spelling, exact).
+ *
+ * Parity contract (issue #79): this list MUST stay in lockstep with the
+ * server registry. `test/parity.test.ts` reads the Go source at test
+ * time and fails the suite the moment the two sets drift — so a new
+ * server kind lands together with its SDK counterpart. The wire API
+ * still accepts any string at runtime (`Resource.kind` is
+ * `ResourceKind | string`); this array is completion sugar plus the
+ * drift-detection anchor, not a client-side validation gate.
+ */
+export const RESOURCE_KINDS = [
+  "Project",
+  "Environment",
+  "Application",
+  "Deployment",
+  "Cluster",
+  "Node",
+  "Database",
+  "Cache",
+  "Bucket",
+  "Policy",
+  "Secret",
+  "Subscription",
+  "APIKey",
+] as const;
+
+/** A resource kind registered in the control plane (see {@link RESOURCE_KINDS}). */
+export type ResourceKind = (typeof RESOURCE_KINDS)[number];
 
 /** Reconciliation lifecycle phases (server-owned). */
 export type ResourcePhase =
