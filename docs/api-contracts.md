@@ -20,6 +20,16 @@
   discarded and replaced with a fresh server-generated 12-hex-char id,
   so the value echoed into logs and error envelopes is always safe to
   interpolate (issue #84).
+- **Trace IDs:** when the daemon runs with `--otlp-endpoint` set
+  (OpenTelemetry tracing, issue #83), every response also carries
+  `X-Ryvex-Trace-Id` — the W3C trace ID of that request's server span
+  — and an incoming `traceparent` header continues the caller's trace
+  instead of starting a root. `X-Request-Id` stays the audit
+  correlation key: it rides the server span as the `request_id`
+  attribute (so an audit entry's request ID locates its trace in any
+  trace backend) and the access log carries both IDs. When tracing is
+  disabled — the default — the header is absent, never empty, and
+  `X-Request-Id` behaves exactly as below.
 - **Security headers:** responses carry `X-Content-Type-Options:
   nosniff` and `X-Frame-Options: DENY`; `/v1` responses add
   `Cache-Control: no-store`.

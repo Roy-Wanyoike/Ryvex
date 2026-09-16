@@ -30,6 +30,12 @@ Flags (serve):
   --cors-origins list  comma-separated browser origins allowed to call the API (env RYVEX_CORS_ORIGINS)
   --webhook-secret key HMAC key material for webhook signatures (random per boot when unset, env RYVEX_WEBHOOK_SECRET)
   --metrics-addr addr  dedicated listen address for /metrics (empty disables, env RYVEX_METRICS_ADDR)
+  --otlp-endpoint url  OTLP/HTTP trace export endpoint host:port (empty disables tracing,
+                       env RYVEX_OTLP_ENDPOINT; an http:// prefix forces plain HTTP)
+  --otlp-insecure      export traces without TLS (also implied by an http:// --otlp-endpoint,
+                       env RYVEX_OTLP_INSECURE)
+  --tracing-sample-ratio f  parent-based trace sample ratio when tracing is enabled
+                       (default 1.0, env RYVEX_TRACING_SAMPLE_RATIO)
   --seed               load the demo dataset on boot
   --log-level lvl      debug | info | warn | error (default info)
 

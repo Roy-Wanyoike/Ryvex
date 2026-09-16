@@ -8,9 +8,14 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/authz"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ---- logger levels ----
@@ -76,6 +81,36 @@ func TestEnvOr(t *testing.T) {
 	for _, c := range cases {
 		if got := envOr(c.key, c.def); got != c.want {
 			t.Errorf("%s: envOr(%q, %q) = %q, want %q", c.name, c.key, c.def, got, c.want)
+		}
+	}
+}
+
+// Issue #83 flag fallbacks: float (--tracing-sample-ratio) and bool
+// (--otlp-insecure) env reads, each falling back on unset OR invalid.
+func TestEnvFloatOr(t *testing.T) {
+	t.Setenv("RYVEX_TEST_F_SET", "0.25")
+	t.Setenv("RYVEX_TEST_F_BAD", "not-a-float")
+	t.Setenv("RYVEX_TEST_F_EMPTY", "")
+	if got := envFloatOr("RYVEX_TEST_F_SET", 1.0); got != 0.25 {
+		t.Errorf("envFloatOr set = %v, want 0.25", got)
+	}
+	for _, key := range []string{"RYVEX_TEST_F_UNSET", "RYVEX_TEST_F_BAD", "RYVEX_TEST_F_EMPTY"} {
+		if got := envFloatOr(key, 1.0); got != 1.0 {
+			t.Errorf("envFloatOr(%q) = %v, want fallback 1.0", key, got)
+		}
+	}
+}
+
+func TestEnvBoolOr(t *testing.T) {
+	t.Setenv("RYVEX_TEST_B_SET", "true")
+	t.Setenv("RYVEX_TEST_B_BAD", "maybe")
+	t.Setenv("RYVEX_TEST_B_EMPTY", "")
+	if got := envBoolOr("RYVEX_TEST_B_SET", false); got != true {
+		t.Errorf("envBoolOr set = %v, want true", got)
+	}
+	for _, key := range []string{"RYVEX_TEST_B_UNSET", "RYVEX_TEST_B_BAD", "RYVEX_TEST_B_EMPTY"} {
+		if got := envBoolOr(key, false); got != false {
+			t.Errorf("envBoolOr(%q) = %v, want fallback false", key, got)
 		}
 	}
 }
@@ -189,6 +224,7 @@ func clearServeEnv(t *testing.T) {
 		"RYVEX_HTTP_ADDR", "RYVEX_API_KEYS", "RYVEX_CORS_ORIGINS",
 		"RYVEX_METRICS_ADDR", "RYVEX_DATABASE_URL", "RYVEX_WEBHOOK_SECRET",
 		"RYVEX_NATS_URL",
+		"RYVEX_OTLP_ENDPOINT", "RYVEX_OTLP_INSECURE", "RYVEX_TRACING_SAMPLE_RATIO",
 	} {
 		t.Setenv(k, "")
 	}
@@ -217,6 +253,53 @@ func TestRunServeFlagValidation(t *testing.T) {
 			t.Errorf("%s: error = %q, want substring %q", c.name, err, c.want)
 		}
 	}
+}
+
+// ---- tracing boot (issue #83) ----
+
+// TestSetupTracing pins the enable semantics: empty endpoint = no-op
+// default (nil provider, nil error — the zero-overhead default
+// posture), an unsupported URL scheme is a boot error, and a valid
+// endpoint boots the SDK provider (the exporter connects lazily, so
+// no collector is needed here). The otel globals that setupTracing
+// mutates on the enabled path are restored so other tests stay
+// hermetic.
+func TestSetupTracing(t *testing.T) {
+	clearServeEnv(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	restore := func() {
+		otel.SetTracerProvider(trace.NewNoopTracerProvider())
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{}, propagation.Baggage{}))
+	}
+
+	// Disabled (default): no endpoint, no provider, no error.
+	tp, err := setupTracing(context.Background(), log, "", false, 1.0)
+	if tp != nil || err != nil {
+		t.Errorf("setupTracing(\"\") = %v, %v; want nil, nil", tp, err)
+	}
+
+	// Unsupported scheme: refuse to boot with a bad endpoint.
+	tp, err = setupTracing(context.Background(), log, "grpc://collector:4318", false, 1.0)
+	if err == nil || tp != nil {
+		t.Errorf("setupTracing(grpc://...) = %v, %v; want nil provider and an error", tp, err)
+	}
+
+	// Valid endpoint: the SDK provider boots (no dial happens here).
+	t.Cleanup(restore)
+	tp, err = setupTracing(context.Background(), log, "http://127.0.0.1:4318", false, 1.0)
+	if err != nil {
+		t.Fatalf("setupTracing(http://127.0.0.1:4318): %v", err)
+	}
+	if tp == nil {
+		t.Fatal("setupTracing with a valid endpoint returned a nil provider")
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tp.Shutdown(shutdownCtx); err != nil {
+		t.Errorf("provider shutdown: %v", err)
+	}
+	restore()
 }
 
 // ---- version stamp ----
