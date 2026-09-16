@@ -1,0 +1,9 @@
+# BuildKit per-Dockerfile ignore file: used INSTEAD of .dockerignore when
+# building `docker build -f Dockerfile.agent` (docker/build-push-action v6
+# honors it too). The root .dockerignore excludes agent/ to keep the
+# control-plane context Go-only; this file does the inverse — keep only
+# the Rust agent workspace (issue #76).
+*
+!agent/
+# Never ship build artifacts or local state into the builder cache.
+agent/target

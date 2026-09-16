@@ -21,3 +21,14 @@ data:
   # Used only when the container args add "--bus", "nats" (JetStream).
   # Memory bus is the default and requires no extra service.
   RYVEX_NATS_URL: "nats://nats.ryvex.svc.cluster.local:4222"
+  # Postgres TLS mode, injected into the DSN assembled in 04-ryvexd.yaml
+  # (issue #76: sslmode used to be hardcoded to "disable").
+  #   disable      — plaintext. Only defensible while traffic provably
+  #                  stays inside the cluster network (the in-cluster
+  #                  default below) AND you accept that trade-off.
+  #   verify-full  — encrypt AND verify the server certificate against
+  #                  the CA bundle in the ryvexd image; pair with a
+  #                  cert-manager certificate on ryvex-postgres whose
+  #                  DNS SAN matches the DSN host. Example:
+  #                  RYVEX_PG_SSLMODE: "verify-full"
+  RYVEX_PG_SSLMODE: "disable"

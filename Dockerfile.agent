@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Ryvex node agent image (issue #76) — the Rust agent's deploy story.
+#
+# Build:  docker build -f Dockerfile.agent -t ryvex-agent .
+# Run:    docker run --rm \
+#           -e RYVEX_AGENT_API=http://host:8080 \
+#           -e RYVEX_AGENT_TOKEN=ryk_... \
+#           ryvex-agent
+#
+# Stage 1 cross-compiles the agent statically against musl
+# (x86_64-unknown-linux-musl) so stage 2 can ship alpine:3.21 with zero
+# runtime dependencies — mirroring the CGO_ENABLED=0 Go image in
+# ./Dockerfile. reqwest is built with rustls and default features off
+# (no OpenSSL), which keeps the musl build clean.
+#
+# The build context is trimmed by Dockerfile.agent.dockerignore (BuildKit
+# per-Dockerfile ignore file): only agent/ sources + the Cargo manifests
+# reach the builder. The root .dockerignore still excludes agent/ for the
+# control-plane image, so both contexts stay minimal.
+#
+# The agent opens NO listen port (it only makes outbound GET/PUT calls to
+# the control plane — see agent/ryvex-agent/README.md), so there is no
+# EXPOSE and no HTTP HEALTHCHECK; in Kubernetes the DaemonSet in
+# deploy/k8s/07-ryvex-agent.yaml relies on restartPolicy: Always.
+# ---------------------------------------------------------------------------
+
+# ---- Stage 1: build --------------------------------------------------------
+# rust:1.98-alpine matches the toolchain the agent is verified with
+# (rustc 1.98.1; the crate builds clean on it) — pin the minor so a newer
+# rustc cannot break the musl build unannounced.
+FROM rust:1.98-alpine AS build
+
+# musl-dev: a C compiler for the ring/rustls C shims (cc crate).
+RUN apk add --no-cache musl-dev
+
+WORKDIR /src
+
+# agent/ only — Dockerfile.agent.dockerignore keeps everything else out
+# of the (repo-root) context, and this copies the agent workspace's
+# CONTENTS to /src so Cargo.toml sits at the workdir root.
+COPY agent/ .
+
+# --locked: build exactly what Cargo.lock pins (reproducible releases).
+# Cache mounts keep the registry download and the target dir warm across
+# builds; the binary is copied OUT of the cache mount into /out so it
+# lands in the image layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    mkdir -p /out && \
+    cargo build --release --locked --target x86_64-unknown-linux-musl && \
+    cp target/x86_64-unknown-linux-musl/release/ryvex-agent /out/ryvex-agent
+
+# ---- Stage 2: runtime -------------------------------------------------------
+FROM alpine:3.21
+
+# ca-certificates: outbound TLS to the control plane (rustls reads the
+# system trust store when RYVEX_AGENT_API is https://).
+RUN apk add --no-cache ca-certificates && \
+    addgroup -S ryvex-agent -g 10002 && \
+    adduser -S -H -u 10002 -G ryvex-agent -s /sbin/nologin ryvex-agent
+
+COPY --from=build /out/ryvex-agent /usr/local/bin/ryvex-agent
+
+# The agent writes nothing to local disk (logs to stderr, state lives in
+# the control plane) and never listens, so a read-only, non-root runtime
+# is safe. UID/GID 10002 parallels ryvexd's 10001 in ./Dockerfile.
+USER ryvex-agent
+
+# RYVEX_AGENT_TOKEN is required (the binary exits 2 without a ryk_ key);
+# RYVEX_AGENT_API defaults to loopback, so production must override it.
+ENTRYPOINT ["/usr/local/bin/ryvex-agent"]

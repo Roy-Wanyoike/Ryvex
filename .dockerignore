@@ -15,7 +15,10 @@
 # Web console (covers required excludes console/node_modules, console/.next)
 console/
 
-# Rust agent + its build artifacts (covers required exclude agent/target)
+# Rust agent + its build artifacts (covers required exclude agent/target).
+# NOTE (issue #76): this applies to the control-plane image only. The
+# agent image is built with `docker build -f Dockerfile.agent`, which
+# uses its own per-Dockerfile context: Dockerfile.agent.dockerignore.
 agent/
 agent/target
 

@@ -4,6 +4,16 @@
 #
 # The Postgres credentials come from the ryvexd-secret template
 # (03-ryvexd-secret.yaml): key postgres-password.
+#
+# Hardening (issue #76): the pod runs as UID/GID 999 — the `postgres`
+# user baked into the official image — with fsGroup handing the PVC to
+# group 999, all capabilities dropped and the default seccomp profile.
+# Running the entrypoint as non-root makes it skip its root-only
+# bootstrap (chown + su-exec), which is exactly what we want; initdb
+# still runs, as the postgres user, against the fsGroup-owned volume.
+# NOTE: a data volume first written by a root-run postgres (e.g. from a
+# previous un-hardened apply) needs a one-time chown -R 999:999 before
+# this manifest can adopt it.
 apiVersion: v1
 kind: Service
 metadata:
@@ -41,10 +51,26 @@ spec:
         app.kubernetes.io/name: postgres
         app.kubernetes.io/part-of: ryvex
     spec:
+      # Pod-level securityContext (issue #76). UID 999 = postgres in the
+      # official image; fsGroup 999 makes the mounted PVC group-writable
+      # for it (the kubelet chowns new volumes once at mount time).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgres
           image: postgres:16-alpine
           imagePullPolicy: IfNotPresent
+          # Postgres binds 5432 (>1024) as its own user and needs no
+          # kernel privileges, so ALL caps can go.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: pg
               containerPort: 5432

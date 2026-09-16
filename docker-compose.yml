@@ -1,10 +1,12 @@
-# Ryvex self-hosted stack (issue #35).
+# Ryvex self-hosted stack (issue #35; agent added by #76).
 #
 #   docker compose up -d                   # postgres + ryvexd (memory event bus)
 #   docker compose --profile nats up -d    # additionally enable the NATS JetStream bus
+#   docker compose --profile agent up -d   # additionally run the node agent (needs RYVEX_AGENT_TOKEN)
 #
-# ryvexd ships prebuilt inside the image (see Dockerfile) — no Go
-# toolchain is required on the host.
+# ryvexd ships prebuilt inside the image (see Dockerfile); the agent is
+# built by Dockerfile.agent (see below). No Go/Rust toolchain is
+# required on the host.
 #
 # Credentials are env-configurable: compose reads a .env file placed
 # next to this file, or you can export the variables in your shell.
@@ -92,6 +94,46 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+  # Optional node agent (issue #76): enrolls its host with the control
+  # plane and heartbeats (GET/PUT only — it opens no listen port). Opt-in
+  # via the "agent" profile so plain `docker compose up` stays unchanged:
+  #
+  #   RYVEX_AGENT_TOKEN=ryk_... docker compose --profile agent up -d
+  #
+  # The token must be a real ryk_ API key (POST /v1/keys, or a static
+  # --api-keys entry): the binary refuses an empty or non-ryk_ token and
+  # would exit(2) — restart: unless-stopped would then loop it. Every
+  # variable name below is verbatim from agent/ryvex-agent/src/config.rs
+  # (all 9 are listed in .env.example).
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: ryvex-agent:local
+    profiles: ["agent"]
+    restart: unless-stopped
+    environment:
+      # In-container host is the compose service name "ryvexd".
+      RYVEX_AGENT_API: http://ryvexd:8080
+      # Required. Left soft-defaulted (the agent fails fast on empty)
+      # so compose config parsing never hard-errors for people who
+      # never enable the "agent" profile.
+      RYVEX_AGENT_TOKEN: ${RYVEX_AGENT_TOKEN:-}
+      # Node resource name. Unset => the agent uses the container
+      # HOSTNAME (unique per container, changes on recreate). Prefer
+      # pinning a stable name for anything you keep:
+      # RYVEX_AGENT_NAME: my-laptop
+      RYVEX_AGENT_CLUSTER: ${RYVEX_AGENT_CLUSTER:-compose-local}
+      RYVEX_AGENT_ORG: ${RYVEX_AGENT_ORG:-acme}
+      RYVEX_AGENT_PROJECT: ${RYVEX_AGENT_PROJECT:-core}
+      RYVEX_AGENT_ENV: ${RYVEX_AGENT_ENV:-prod}
+      RYVEX_AGENT_INTERVAL: ${RYVEX_AGENT_INTERVAL:-10}
+      RYVEX_AGENT_SPEC_REFRESH_SECS: ${RYVEX_AGENT_SPEC_REFRESH_SECS:-300}
+    depends_on:
+      ryvexd:
+        condition: service_healthy
+    # No healthcheck: the agent has no HTTP endpoint (client only).
 
   # Optional durable event bus (NATS JetStream, issue #15). Deliberately
   # behind a compose profile so plain `docker compose up` stays

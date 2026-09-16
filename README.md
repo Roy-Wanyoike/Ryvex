@@ -98,6 +98,17 @@ in `schema_migrations`). Env equivalent:
 See [`docs/architecture.md`](docs/architecture.md) for the full
 flag/env reference.
 
+## Deploy
+
+Container images (`ghcr.io/roy-wanyoike/ryvexd` and
+`ghcr.io/roy-wanyoike/ryvex-agent`) are published on `v*` tags, the
+Rust node agent ships in `Dockerfile.agent` with a compose profile and
+a Kubernetes DaemonSet, and `deploy/k8s/` is hardened with a
+startupProbe, NetworkPolicy, PDB, non-root Postgres, and a
+configurable Postgres TLS mode. The full guide — images, compose
+profiles, bus choice, secrets, tag pinning, and the network-policy
+assumptions — lives in [`docs/deploy.md`](docs/deploy.md).
+
 ## Architecture
 
 ```

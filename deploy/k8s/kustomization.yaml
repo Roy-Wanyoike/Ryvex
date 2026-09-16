@@ -1,0 +1,35 @@
+# Kustomize entrypoint over the plain manifests (issue #76).
+#
+# Every YAML file here stays a self-contained, plain manifest —
+# `kubectl apply -f deploy/k8s` keeps working unchanged — but applying
+# with `-k` additionally allows overriding the image tags WITHOUT
+# editing YAML:
+#
+#   kubectl apply -k deploy/k8s
+#
+#   # pin a different release:
+#   cd deploy/k8s && \
+#   kustomize edit set image \
+#     ghcr.io/roy-wanyoike/ryvexd=v1.2.0 \
+#     ghcr.io/roy-wanyoike/ryvex-agent=v1.2.0
+#
+# The tags below are the versions the release workflow publishes on the
+# matching `v*` git tags (ghcr.io/roy-wanyoike/ryvexd + ryvex-agent).
+# NOTE: until the release workflow is pushed and the tag exists, those
+# images cannot be pulled — the failure this file set fixes (issue #76).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - 00-namespace.yaml
+  - 01-postgres.yaml
+  - 02-ryvexd-configmap.yaml
+  - 03-ryvexd-secret.yaml
+  - 04-ryvexd.yaml
+  - 05-ryvexd-networkpolicy.yaml
+  - 06-ryvexd-pdb.yaml
+  - 07-ryvex-agent.yaml
+images:
+  - name: ghcr.io/roy-wanyoike/ryvexd
+    newTag: v1.1.0
+  - name: ghcr.io/roy-wanyoike/ryvex-agent
+    newTag: v1.1.0

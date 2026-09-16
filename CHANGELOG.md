@@ -22,6 +22,16 @@ Entries are reconstructed from the git history and the shipped ledger in
 - QA report: GA-readiness assessment — audit ledger, quality gates,
   onboarding verdict (verdict later superseded by the 2026-09-16 audit
   in `docs/audit/`; see #78) (#67 → #68)
+- Deploy: publishable images (`ghcr.io/roy-wanyoike/ryvexd` +
+  `ryvex-agent`, release workflow spec on `v*` tags), agent Dockerfile
+  + compose `agent` profile, k8s DaemonSet for the node agent, and tag
+  parameterization via `deploy/k8s/kustomization.yaml` (#76)
+- k8s hardening: startupProbe on `/readyz` (migrations no longer race
+  liveness), NetworkPolicy (default-deny both ways around ryvexd),
+  PDB (`minAvailable: 1`), non-root Postgres StatefulSet (UID 999,
+  fsGroup, caps dropped), configurable DSN sslmode
+  (`RYVEX_PG_SSLMODE`, `verify-full` example), agent DaemonSet + all 9
+  `RYVEX_AGENT_*` vars in `.env.example`, `docs/deploy.md` (#76)
 
 ### Changed
 
