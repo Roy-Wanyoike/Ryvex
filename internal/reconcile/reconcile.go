@@ -13,6 +13,7 @@ import (
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
 	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
+	"github.com/Roy-Wanyoike/Ryvex/internal/provider"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
 )
 
@@ -23,6 +24,26 @@ type Options struct {
 	Scopes      [][2]string   // namespaces the platform controls, e.g. {"org","project"}
 	Namespaces  []string      // env namespaces considered in-scope
 	Logger      *slog.Logger
+
+	// --- provider SPI (issue #80, docs/adr/0002-provider-spi.md) ---
+
+	// Actuators drive kinds that touch real infrastructure. Kinds
+	// without an actuator keep the exact status-only convergence flow
+	// (and messages) they have always had.
+	Actuators []provider.Actuator
+
+	// DriftInterval is the cadence of the drift-detection pass for
+	// actuated kinds that declare Caps.DriftDetection. Zero selects
+	// the default (60s). The pass is only started when at least one
+	// drift-capable actuator is registered.
+	DriftInterval time.Duration
+
+	// RetryDefaults overrides the built-in retry policy for every
+	// actuated kind without a specific entry (nil = DefaultRetryPolicy).
+	RetryDefaults *RetryPolicy
+
+	// RetryPolicies overrides the retry policy per resource kind.
+	RetryPolicies map[string]RetryPolicy
 }
 
 // Reconciler scans the store on a fixed interval and progresses
@@ -36,6 +57,25 @@ type Reconciler struct {
 	triggers chan string
 	stopOnce sync.Once
 	done     chan struct{}
+
+	// --- provider SPI state (issue #80) ---
+	actuators *provider.Registry
+
+	// attempts is the in-memory per-resource retry book (generation,
+	// attempt count, next-due time). A daemon restart restarts the
+	// episode; durable retry bookkeeping is the ADR-0001 workflow
+	// engine's territory.
+	attempts *attemptBook
+
+	// actuating/actMu form the per-resource single-flight claim shared
+	// by the worker pool and the drift pass: the in-process half of
+	// the single-actor guarantee (one daemon, one store).
+	actMu     sync.Mutex
+	actuating map[string]struct{}
+
+	// baseCtx is the daemon context captured by Start; actuator calls
+	// run under it so shutdown cancels in-flight Applies.
+	baseCtx context.Context
 }
 
 // New constructs a reconciler. Call Start to begin the loop.
@@ -49,14 +89,22 @@ func New(store state.Backend, b bus.BusI, opts Options) *Reconciler {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &Reconciler{
-		store:    store,
-		bus:      b,
-		opts:     opts,
-		log:      opts.Logger.With("component", "reconciler"),
-		triggers: make(chan string, 128),
-		done:     make(chan struct{}),
+	if opts.DriftInterval <= 0 {
+		opts.DriftInterval = 60 * time.Second
 	}
+	r := &Reconciler{
+		store:     store,
+		bus:       b,
+		opts:      opts,
+		log:       opts.Logger.With("component", "reconciler"),
+		triggers:  make(chan string, 128),
+		done:      make(chan struct{}),
+		actuators: provider.NewRegistry(),
+		attempts:  newAttemptBook(),
+		actuating: map[string]struct{}{},
+	}
+	r.registerActuators(opts.Actuators)
+	return r
 }
 
 // Start launches the scan loop and worker pool; it returns
@@ -67,9 +115,15 @@ func New(store state.Backend, b bus.BusI, opts Options) *Reconciler {
 // panic: close of closed channel). Workers exit via ctx.Done instead
 // and the buffered channel is simply abandoned at shutdown.
 func (r *Reconciler) Start(ctx context.Context) {
+	r.baseCtx = ctx
 	go r.loop(ctx)
 	for i := 0; i < r.opts.Concurrency; i++ {
 		go r.worker(ctx, i)
+	}
+	// The drift pass only exists when something can actuate; status-
+	// only deployments keep the exact footprint they had before #80.
+	if r.actuators.Len() > 0 {
+		go r.driftLoop(ctx)
 	}
 	go func() {
 		<-ctx.Done()
@@ -180,6 +234,16 @@ func (r *Reconciler) scan() {
 				res.Status.Phase == state.PhasePending ||
 				res.Status.Phase == state.PhaseProvisioning {
 				r.Trigger(res.ID)
+				continue
+			}
+			// Actuated kinds in Degraded re-enter the retry schedule once
+			// their backoff window has elapsed (issue #80); the per-resource
+			// gate drops triggers that arrive early. Failed resources are
+			// terminal for their generation and are never re-queued here.
+			if res.Status.Phase == state.PhaseDegraded {
+				if _, actuated := r.actuators.Lookup(res.Kind); actuated && r.attempts.due(res.ID, res.Generation) {
+					r.Trigger(res.ID)
+				}
 			}
 		}
 		if next == "" {
@@ -205,6 +269,16 @@ func (r *Reconciler) reconcileOne(id, cause string) {
 	if err != nil {
 		return // deleted between scan and reconcile
 	}
+
+	// Actuated kinds take the provider path (issue #80): the actuator
+	// owns Plan/Apply, and the guards inside decide whether this pass
+	// should run at all. Everything below is the untouched status-only
+	// flow for kinds without an actuator.
+	if _, actuated := r.actuators.Lookup(res.Kind); actuated {
+		r.reconcileActuated(res, cause)
+		return
+	}
+
 	if res.Status.ObservedGen >= res.Generation &&
 		res.Status.Phase != state.PhasePending &&
 		res.Status.Phase != state.PhaseProvisioning {

@@ -81,6 +81,27 @@ var (
 		"ryvex_bus_events_delivered_total",
 		"Event deliveries to subscriber handlers (one increment per handler invocation).",
 	)
+
+	// ReconcilerActuationsTotal counts actuator outcomes for
+	// actuated kinds (issue #80), by resource kind and outcome
+	// (create, update, noop, failed). "failed" increments once per
+	// failed attempt, so it also exposes retry pressure.
+	ReconcilerActuationsTotal = Default.NewCounterVec(
+		"ryvex_reconciler_actuations_total",
+		"Actuator Plan/Apply outcomes, by resource kind and outcome (create, update, noop, failed).",
+		"kind", "outcome",
+	)
+
+	// ReconcilerDriftsTotal counts drift detections: one increment
+	// per drift episode observed by the drift pass (issue #80).
+	// Sustained growth means external state keeps diverging from
+	// declared specs (a fighting actor, or a provider whose
+	// normalized fields do not round-trip).
+	ReconcilerDriftsTotal = Default.NewCounterVec(
+		"ryvex_reconciler_drifts_total",
+		"External-state drift detections for actuated resources, by kind.",
+		"kind",
+	)
 )
 
 // Handler serves the default registry; mount it at /metrics.
