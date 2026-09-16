@@ -130,8 +130,11 @@ so dashboards do not change when durability is switched on.
 - **Thread safety.** Every mutation is guarded by the family mutex, so
   instruments are safe to call from the API worker goroutines, reconciler
   workers and bus publishers concurrently (verified under `go test -race`).
-- **No dependencies.** `internal/metrics` imports only the standard library;
-  `go.mod` stays dependency-free. The exposition writer handles label-value
+- **No dependencies on the metrics path.** `internal/metrics` imports only the
+  standard library. The module as a whole is no longer dependency-free — `go.mod`
+  carries `github.com/lib/pq` (Postgres state backend) and `github.com/nats-io/nats.go`
+  (JetStream bus backend) — but neither appears on the metrics hot path. The exposition
+  writer handles label-value
   escaping (`\`, `"`, newline), `NaN`/`±Inf` literals and cumulative
   histogram buckets with the implied `+Inf` bucket.
 - **Reusing the registry.** `metrics.Default` holds all predefined

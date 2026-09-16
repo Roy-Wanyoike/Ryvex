@@ -153,7 +153,8 @@ for events** — without touching the API or reconciler. Full write-up in
 - **Prometheus metrics** — dependency-free exposition sidecar
 - **Operator tooling** — `ryvex` CLI (apply with CAS, list, get,
   delete, events, audit, reconcile, health), TypeScript + Python SDKs,
-  Rust data-plane node agent
+  Rust node agent (enrollment, heartbeat, state-sync skeleton —
+  data-plane expansion tracked in [docs/audit/](docs/audit/))
 - **Real-time web console** — five views plus settings, read + write
   with CAS-aware saves, live and demo modes, dark control-room
   aesthetic
@@ -190,7 +191,7 @@ Ryvex/
 ├── sdk/
 │   ├── ryvex-ts/        # TypeScript client (ESM + CJS)
 │   └── ryvex-py/        # Python client (stdlib-only runtime)
-├── agent/ryvex-agent/   # Rust data-plane node agent
+├── agent/ryvex-agent/   # Rust node agent (enroll/heartbeat skeleton)
 ├── docs/
 │   ├── architecture.md  # system design
 │   ├── api-contracts.md # frozen REST contract
@@ -224,7 +225,9 @@ map. **Shipped:** TypeScript & Python SDKs, the `ryvex` CLI (with
 pagination and CAS apply), signed webhook subscriptions with an SSRF
 egress guard, durable **Postgres** state and **NATS JetStream** event
 streaming, org/project-scoped **RBAC** with managed keys, a Prometheus
-metrics sidecar, and a Rust data-plane agent. **Next up:** a
+metrics sidecar, and a Rust node agent (enrollment + heartbeat + state
+sync skeleton; data-plane expansion tracked in the
+[audit](docs/audit/)). **Next up:** a
 server-side agent-heartbeat endpoint, key rotation UX, a real
 deployment controller, and agent-side drift detection — with a Go SDK
 further out.

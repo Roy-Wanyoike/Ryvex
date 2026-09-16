@@ -14,6 +14,20 @@ Entries are reconstructed from the git history and the shipped ledger in
 - `ryvex list` pagination and CAS-guarded `ryvex apply --generation` (#51)
 - TypeScript SDK: request timeouts, `AbortSignal` support, `forbidden` /
   `transport_error` error codes, CJS type declarations (#52)
+- Packaging: multi-stage Dockerfile and complete compose stack — Postgres +
+  ryvexd (+ NATS profile), non-root image with healthcheck (#35 → #58)
+- Onboarding artifacts: four example manifests, `.env.example`, k8s
+  manifests, CONTRIBUTING / SECURITY / CODEOWNERS, dependabot config,
+  pinned bun.lock (#48 → #60)
+- QA report: GA-readiness assessment — audit ledger, quality gates,
+  onboarding verdict (verdict later superseded by the 2026-09-16 audit
+  in `docs/audit/`; see #78) (#67 → #68)
+
+### Changed
+
+- Docs truth sync: Postgres durability section, `/v1/keys` + 13 kinds +
+  `?from=` in the frozen contract, kind-count and console read/write
+  contradictions resolved, roadmap ledger made truthful (#47 → #64)
 
 ### Fixed
 
@@ -25,6 +39,20 @@ Entries are reconstructed from the git history and the shipped ledger in
   pagination, request timeouts, refresh control (#55)
 - Rust node agent: panic path, hostname reporting, heartbeat churn,
   client-state coverage (#56)
+- Python SDK: `403` modeled as `forbidden`; `transport_error` documented
+  as the cross-SDK standard (#45 → #57)
+- Reconciler: cursor-paged scan past the 200-resource list ceiling, with
+  a stuck-cursor guard (#37 → #59)
+- NATS bus: publish metric counts only server-acknowledged successes
+  (#40 → #61)
+- State store: 64-bit pagination cursors (legacy-decodable), bounded
+  Postgres pool, ListAudit SQL and swallowed-error fixes, parity cases
+  (#39 → #62)
+- Console: accessibility (drawer focus trap, ARIA), responsive tables,
+  token hygiene (no baked default token), clipboard buttons, data-driven
+  kind chips, topology scoping (#42 → #63)
+- Webhook test flake: wait for the audit trail, not the wire, before
+  asserting attempts (TOCTOU under `-race`) (#65 → #66)
 
 ### Security
 

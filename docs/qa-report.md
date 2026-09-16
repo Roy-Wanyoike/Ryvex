@@ -7,11 +7,21 @@
 
 ## Verdict
 
+> **⚠️ SUPERSEDED (2026-09-16).** This verdict rests on artifacts that were never
+> produced. Most notably, the CI workflow said to be "fully written" on branch
+> `feat/34-ci-pipeline` exists in **no ref of this repository** — the push was blocked
+> by token scope and never re-attempted. The 2026-09-16 feature audit re-verified every
+> gate independently and classified this report's load-bearing claims as unverifiable —
+> see [`docs/audit/`](./audit/) (esp. 01 — Git Archaeology, 06 — Gap Analysis, 08 — Issue
+> Reconciliation). CI enforcement remains tracked as issue **#34** (spec expanded in
+> #74). The verdict is **not re-issued** here; a fresh assessment follows only after CI
+> exists and passes.
+
 **READY for first-customer onboarding** — with one engineering condition and one operational condition, both disclosed below. The control plane, console, CLI, and SDKs pass every quality gate this org can run; the remaining items are env-scope mechanics, not product defects.
 
 | Condition | Detail |
 |---|---|
-| Engineering | The CI workflow (issue **#34**) is fully written but cannot be pushed by the current API token (GitHub requires the `workflow` scope to create `.github/workflows/` files). Local gates all pass; CI turns them into per-PR enforcement the moment a workflow-scoped token pushes the prepared branch. |
+| Engineering | The CI workflow (issue **#34**) is fully written but cannot be pushed by the current API token (GitHub requires the `workflow` scope to create `.github/workflows/` files). Local gates all pass; CI turns them into per-PR enforcement the moment a workflow-scoped token pushes the prepared branch. **Superseded:** the prepared branch (`feat/34-ci-pipeline`) never landed — no such ref exists (see banner above). |
 | Operational | Rust agent changes compile-verify only on CI runners (no cargo in this sandbox). The diff was hand-reviewed line-by-line and one compile defect was caught and fixed in review (PR #56); treat first CI run as the formal compile gate. |
 
 ## What was audited
@@ -25,7 +35,7 @@
 
 | Issue | Severity | Fix | PR | Verification |
 |---|---|---|---|---|
-| #34 CI pipeline | critical | workflow written; **push blocked by token scope** — see handoff below | — (branch `feat/34-ci-pipeline` ready) | YAML-validated; dry-runs of all jobs passed locally |
+| #34 CI pipeline | critical | workflow written; **push blocked by token scope** — see handoff below | — (branch `feat/34-ci-pipeline` claimed ready; **no such ref exists** — see banner) | YAML-validated; dry-runs of all jobs passed locally (artifact never landed; unverifiable) |
 | #35 No deployable artifact | high | multi-stage Dockerfile + full compose stack (postgres, ryvexd, nats profile) | #58 | compose config parsed; Dockerfile reviewed; non-root + healthcheck |
 | #36 Webhook SSRF | high | private-range egress guard at create + dispatch-time revalidation, redirect denial | #53 | unit matrix (12+ address classes) + **live smoke**: 169.254.169.254 and 127.0.0.1 refused with actionable messages |
 | #37 Reconciler 200-ceiling | high | cursor-paged scan with stuck-cursor guard | #59 | new test: 250/250 resources converge; mutation-checked (fails on old code) |
@@ -34,7 +44,7 @@
 | #40 NATS publish metric lies | medium | counter moves behind the ack; failure branch logged | #61 | stub-JS test pins success/failure counting; mutation-checked |
 | #41 Console trust (7 findings) | critical | zero demo-fallback in live mode, degraded banner with reasons (401 vs network), configurable org, error boundary + 404 page, pagination loop, fetch timeouts, refresh/freshness control | #55 | lint + tsc + build green; 10/10 behavioral smoke vs stub control plane |
 | #42 Console polish (8 findings) | medium | drawer focus trap, responsive tables, token hygiene (no default token in bundle, sessionStorage opt-in, security headers), ARIA batch, copy buttons, data-driven kind chips, topology scoping, dead code removal | #63 | lint + tsc + build green; `rg ryk_console_dev` → 0 hits incl. bundle |
-| #43 Rust agent correctness | high | unreachable-panic eliminated (3-strike CAS → Transient), hostname resolution (env → kernel, refuse `localhost`), heartbeat spec-throttle (no per-tick generation churn), path escaping, symmetric jitter, 14-test client state suite | #56 (+review fix) | hand-reviewed; `unreachable!` gone; compile gate = first CI run |
+| #43 Rust agent correctness | high | unreachable-panic eliminated (3-strike CAS → Transient), hostname resolution (env → kernel, refuse `localhost`), heartbeat spec-throttle (no per-tick generation churn), path escaping, symmetric jitter, 16-test client state suite | #56 (+review fix) | hand-reviewed; `unreachable!` gone; compile gate = first CI run |
 | #44 TS SDK hardening | high | timeoutMs + AbortSignal on all 13 methods, `forbidden`/`timeout`/`transport_error` codes, CJS types, v0.2.0 | #52 | 44 tests pass; tsc clean; CJS smoke |
 | #45 Python SDK parity | medium | 403 → `forbidden`, transport_error documented as cross-SDK standard | #57 | 53 tests pass (+3 new), zero regressions |
 | #46 CLI gaps | medium | `ryvex list` (pagination, JSON/table) + CAS `apply --generation` with readable 409 | #51 | 20 new tests incl. 2 e2e; **live smoke**: list → `next_cursor`, stale apply → actionable conflict |
@@ -62,7 +72,7 @@
 
 ## Known limitations (documented, non-blocking)
 
-1. **Postgres/NATS parity suites** execute only where service containers exist — the written CI (issue #34) runs them on every push; until then they self-skip locally. The memory backend is exercised everywhere.
+1. **Postgres/NATS parity suites** execute only where service containers exist — the CI from issue #34, once it lands, runs them on every push; until then they self-skip locally. The memory backend is exercised everywhere.
 2. **Rust agent** first formal compile+clippy+test run happens in CI (see conditions above).
 3. Offset-based pagination can skip/duplicate under concurrent writes (inherent to offset cursors; keyset cursors are the follow-up if pagination-under-churn matters). Reconciler treats this benignly.
 4. `natsbus` publish-failure counting has no dedicated metric instrument yet (logged on failure; follow-up instrument suggested in PR #61).
