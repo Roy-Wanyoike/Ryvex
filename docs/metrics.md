@@ -73,6 +73,7 @@ the `routeV1` dispatcher and replaces parameters with placeholders:
 | Route bucket | Matches |
 | ------------ | ------- |
 | `healthz` | `/healthz` |
+| `readyz` | `/readyz` (dependency-aware readiness, issue #71) |
 | `index` | `/`, `/v1`, `/v1/` |
 | `resources` | `/v1/resources` (list/create) |
 | `resources/{id}` | `/v1/resources/{id}` |
@@ -110,17 +111,33 @@ trigger burst). Kind/phase pairs that disappear from the snapshot are set to
 | `ryvex_reconciler_scan_seconds` | histogram | — | Whole-scan duration. Buckets: 0.001 … 1 (see `instruments.go`). |
 | `ryvex_reconciler_converge_seconds` | histogram | — | Per-resource reconcile pass (`reconcileOne`) duration. Buckets: 0.001 … 2.5. |
 | `ryvex_reconciler_queue_depth` | gauge | — | Trigger queue length (`len(triggers)`), sampled immediately after each scan. Sustained growth means the reconciler cannot keep up with the change rate. |
+| `ryvex_reconciler_actuations_total` | counter | `kind`, `outcome` | Actuator Plan/Apply outcomes for actuated kinds (issue #80), by `outcome` (`create`, `update`, `noop`, `failed`). `failed` increments **once per failed attempt**, so its rate exposes retry pressure, not just terminal failures. |
+| `ryvex_reconciler_drifts_total` | counter | `kind` | Drift detections: one increment per drift episode observed by the drift pass (issue #80). Sustained growth means external state keeps diverging from declared specs — a fighting actor, or a provider whose normalized fields do not round-trip. |
 
-### Event bus (`internal/bus`)
+The two issue-#80 families exist only for **actuated kinds** — kinds with a
+registered actuator in the [provider SPI](architecture.md). Status-only
+deployments (no actuator) never create these series; see
+[architecture.md](architecture.md) for what actuation, drift detection and
+retry mean for the resource lifecycle.
+
+### Event bus (`internal/bus` + `internal/bus/natsbus`)
 
 | Family | Type | Labels | Description |
 | ------ | ---- | ------ | ----------- |
-| `ryvex_bus_events_published_total` | counter | `type` | Events published, by type (`created`, `updated`, `deleted`, `status_changed`; `unknown` when a publish omits the type). |
+| `ryvex_bus_events_published_total` | counter | `type` | Events published, by type (`created`, `updated`, `deleted`, `status_changed`, `drift_detected`; `unknown` when a publish omits the type). |
 | `ryvex_bus_events_delivered_total` | counter | — | Handler invocations: one increment per event handed to a subscriber. Publishes without matching subscribers do not increment it. |
+| `ryvex_bus_publish_failures_total` | counter | — | Publish attempts that failed to reach JetStream persistence — marshal error, broker disconnect, server rejection (issue #81). Every failed `PublishErr` increments it, so a mid-outage loss is visible even when callers ignore the returned error. |
+| `ryvex_bus_dlq_total` | counter | `reason` | Events dead-lettered into the `RYVEX_DLQ` stream (issue #81), by `reason`: `poison` (permanent handler failure / undecodable payload) or `max_deliver` (retry budget exhausted). |
 
-Both bus counters are fed by whichever backend is active: the in-memory bus
-and the JetStream bus (`--bus nats`, issue #15) increment the same families,
-so dashboards do not change when durability is switched on.
+The two `ryvex_bus_events_*` counters are fed by whichever backend is
+active: the in-memory bus and the JetStream bus (`--bus nats`, issue #15)
+increment the same families, so dashboards do not change when durability is
+switched on. `ryvex_bus_publish_failures_total` and `ryvex_bus_dlq_total`
+are **JetStream-backend instruments**: they are declared in
+`internal/bus/natsbus` and registered on the same shared `metrics.Default`
+registry at package init, so they render on every scrape (with no series
+until the first failure/dead-letter), but only move when `--bus nats` is
+running.
 
 ## Instrumentation notes
 
@@ -139,4 +156,13 @@ so dashboards do not change when durability is switched on.
   histogram buckets with the implied `+Inf` bucket.
 - **Reusing the registry.** `metrics.Default` holds all predefined
   instruments; `metrics.Handler()` is a ready-to-mount `http.Handler`. New
-  families can be registered on any `metrics.Registry` at startup.
+  families can be registered on any `metrics.Registry` at startup — the
+  pattern `internal/bus/natsbus` uses for its two durability counters
+  (issue #81).
+- **Complete family list.** Every instrument that exists today: the two
+  HTTP families, `ryvex_resources`, the four reconciler loop families,
+  `ryvex_reconciler_actuations_total` + `ryvex_reconciler_drifts_total`
+  (issue #80), the two `ryvex_bus_events_*` families, and the two
+  JetStream durability families `ryvex_bus_publish_failures_total` +
+  `ryvex_bus_dlq_total` (issue #81). Thirteen families total; nothing is
+  registered anywhere else.

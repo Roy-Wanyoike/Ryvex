@@ -32,12 +32,52 @@ Entries are reconstructed from the git history and the shipped ledger in
   fsGroup, caps dropped), configurable DSN sslmode
   (`RYVEX_PG_SSLMODE`, `verify-full` example), agent DaemonSet + all 9
   `RYVEX_AGENT_*` vars in `.env.example`, `docs/deploy.md` (#76)
+- Dependency-aware health: `/readyz` answers 503 until the store and
+  the bus both answer a real query (dead-Postgres pods leave the
+  Service rotation), `/healthz` reports `"status": "degraded"` with
+  per-dependency states instead of a lying 200, and failed store/audit
+  queries surface `500` envelopes instead of empty success bodies (#71)
+- Provider SPI (ADR-0002): per-kind actuator interface (`Plan` / `Apply`
+  / `Inspect` / `Capabilities` + optional `FieldMapper`), drift
+  detection pass (`Drifted:` annotations, `drift_detected` events and
+  audit entries, `ryvex_reconciler_drifts_total`), per-kind
+  retry/backoff with reachable `Degraded`/`Failed` phases and
+  `ryvex_reconciler_actuations_total`, and a stdlib Docker Engine
+  reference actuator behind `-tags docker` (`--enable-docker-actuator`,
+  `--docker-socket`, `--drift-interval`) (#80)
+- JetStream durability: named restart-idempotent durable pull
+  consumers (the webhook dispatcher runs as `RYVEX_DISPATCHER`,
+  at-least-once with explicit acks), a dead-letter stream `RYVEX_DLQ`
+  (poison / max_deliver reasons, 7-day retention, failure headers),
+  and publish-failure surfacing via `PublishErr` plus the
+  `ryvex_bus_publish_failures_total` and `ryvex_bus_dlq_total`
+  instruments (#81)
+- Bounded audit retention for the memory state backend:
+  `--audit-cap` / `RYVEX_AUDIT_CAP` (default 10000, oldest evicted
+  first; Postgres keeps its own durable history) (#85)
+- Console: events/audit load-more pagination, code-split demo
+  snapshot, scoped aria-live announcements (#86)
+- ADR-0001: durable workflow engine — the design record for the
+  lease/claim seam and the workflow step client (#82)
+- Repository audit series: git archaeology, feature baseline,
+  architecture evolution, regressions, dead code, gap analysis, test
+  coverage, issue reconciliation and recommended issues
+  (`docs/audit/`) (PR #88)
+- Console test harness: `bun test` suite guarding the truth-in-UI
+  logic (live vs demo states, health reporting) (#77)
 
 ### Changed
 
 - Docs truth sync: Postgres durability section, `/v1/keys` + 13 kinds +
   `?from=` in the frozen contract, kind-count and console read/write
   contradictions resolved, roadmap ledger made truthful (#47 → #64)
+- Bootstrap `--api-keys` entries are seeded as ordinary `APIKey`
+  resources: they are revocable, demotable and disableable through the
+  `/v1/keys` lifecycle, and authentication derives only from the live
+  key-resource view — no static digest fallback, no restart to take
+  effect (#73)
+- Docs truth batch 2: audit-verified contradiction fixes across the
+  doc set (#78)
 
 ### Fixed
 
@@ -63,6 +103,23 @@ Entries are reconstructed from the git history and the shipped ledger in
   kind chips, topology scoping (#42 → #63)
 - Webhook test flake: wait for the audit trail, not the wire, before
   asserting attempts (TOCTOU under `-race`) (#65 → #66)
+- Bus: `Subscription.Cancel` removed the wrong element when several
+  subscribers matched one pattern; multi-subscriber cancel is
+  parity-covered in `bustest` (#69)
+- API: no-op heartbeat PUTs — byte-identical spec/labels re-sent by
+  the node agent — keep `200` and the unchanged generation but no
+  longer publish `updated` events, write audit entries or fan out
+  webhook deliveries (#72)
+- API: scope-list rejects non-GET methods with `405` + `Allow`;
+  error-status mapping uses `errors.Is`/`errors.As` so wrapped
+  sentinel errors keep their codes; client-supplied `X-Request-Id` is
+  constrained to a safe charset/length; CORS matrix coverage (#84)
+- Rust node agent: PUT 5xx treated as transient — exponential
+  backoff with jitter instead of a tight retry loop (#75)
+- SDKs: TypeScript `ResourceKind` parity with the server registry;
+  token hygiene in `.env.example` (#79)
+- Tests: `TestEventsAndAudit` made deterministic against the async
+  reconciler (#70)
 
 ### Security
 
