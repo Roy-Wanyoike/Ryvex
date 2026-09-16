@@ -1,6 +1,7 @@
 # ryvexd control plane: Deployment + Service.
 #
-# - Probes hit /healthz (unauthenticated per docs/api-contracts.md).
+# - Liveness hits /healthz (unauthenticated per docs/api-contracts.md);
+#   readiness hits /readyz, the dependency-aware probe (issue #71).
 # - State: --store postgres, DSN assembled from the postgres credentials in
 #   ryvexd-secret (RYVEX_DATABASE_URL references $(POSTGRES_PASSWORD), which
 #   Kubernetes expands from the env entry defined above it).
@@ -87,7 +88,14 @@ spec:
             failureThreshold: 6
           readinessProbe:
             httpGet:
-              path: /healthz
+              # /readyz is dependency-aware (issue #71): it answers a
+              # real store+bus query and 503s while Postgres (or the
+              # bus) is down, so a dead-DB pod leaves the Service
+              # rotation instead of serving errors. /healthz stays on
+              # livenessProbe: it keeps 200 semantics and does not
+              # restart the pod for a dependency failure a restart
+              # cannot fix.
+              path: /readyz
               port: http
             initialDelaySeconds: 3
             periodSeconds: 5

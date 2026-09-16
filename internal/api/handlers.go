@@ -266,11 +266,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, org string
 }
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, org string) {
-	entries := s.store.ListAudit(state.AuditOptions{
+	entries, err := s.store.ListAudit(state.AuditOptions{
 		Org:   org,
 		Kind:  matchKind(r.URL.Query().Get("kind")),
 		Limit: queryInt(r, "limit", 100),
 	})
+	if err != nil {
+		// A failed audit query must not masquerade as an empty
+		// compliance log (issue #71): surface a 500 envelope instead.
+		s.log.Error("audit query failed", "org", org, "err", err)
+		writeError(w, r, http.StatusInternalServerError, CodeInternal, "audit query failed")
+		return
+	}
 	if entries == nil {
 		entries = []state.AuditEntry{}
 	}

@@ -155,8 +155,11 @@ func (r *Reconciler) scan() {
 
 	// Refresh the ryvex_resources gauge from a lightweight store
 	// snapshot so the gauge tracks kind/phase inventory without any
-	// per-mutation bookkeeping.
-	metrics.ReconcileMetrics(r.store)
+	// per-mutation bookkeeping. A failed snapshot is logged (issue
+	// #71) and leaves the previous gauge values untouched.
+	if _, err := metrics.ReconcileMetrics(r.store); err != nil {
+		r.log.Error("resource metrics snapshot failed", "err", err)
+	}
 
 	// Walk every page, following the cursor chain until it is
 	// exhausted (""). Guarded like the TS SDK listAll: a cursor we

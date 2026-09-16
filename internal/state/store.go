@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -270,18 +271,26 @@ func (s *Store) DeleteResource(id string, opts WriteOptions) error {
 	return nil
 }
 
-// Count returns the number of stored resources (used by tests and /healthz).
-func (s *Store) Count() int {
+// Ping reports store health for /healthz and /readyz (issue #71).
+// The in-memory store has no external dependency, so it is always
+// healthy; the method exists so both backends share the state.Backend
+// contract.
+func (s *Store) Ping(_ context.Context) error { return nil }
+
+// Count returns the number of stored resources (used by tests and
+// /healthz). The in-memory store cannot fail; the error return keeps
+// parity with state.Backend (issue #71).
+func (s *Store) Count() (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.byID)
+	return len(s.byID), nil
 }
 
 // CountByKindPhase returns how many resources exist per kind and
 // lifecycle phase. It backs the ryvex_resources metrics gauge
 // (issue #17): a read-only snapshot with no deep copies, refreshed by
 // the reconciler on each scan.
-func (s *Store) CountByKindPhase() map[string]map[string]int64 {
+func (s *Store) CountByKindPhase() (map[string]map[string]int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string]map[string]int64, len(s.byID))
@@ -293,7 +302,7 @@ func (s *Store) CountByKindPhase() map[string]map[string]int64 {
 		}
 		ph[r.Status.Phase]++
 	}
-	return out
+	return out, nil
 }
 
 // AuditOptions filters the audit log.
@@ -303,8 +312,10 @@ type AuditOptions struct {
 	Limit int
 }
 
-// ListAudit returns audit entries newest-first.
-func (s *Store) ListAudit(o AuditOptions) []AuditEntry {
+// ListAudit returns audit entries newest-first. The in-memory store
+// cannot fail; the error return keeps parity with state.Backend
+// (issue #71).
+func (s *Store) ListAudit(o AuditOptions) ([]AuditEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	limit := o.Limit
@@ -322,7 +333,7 @@ func (s *Store) ListAudit(o AuditOptions) []AuditEntry {
 		}
 		out = append(out, e)
 	}
-	return out
+	return out, nil
 }
 
 func (s *Store) appendAuditLocked(actor, action string, r *Resource) {
@@ -343,8 +354,10 @@ func (s *Store) appendAuditLocked(actor, action string, r *Resource) {
 // not resource mutations — e.g. webhook delivery attempts reported by
 // the webhook dispatcher. Missing ID and Time are filled in; the
 // completed entry is returned. Filterable via ListAudit like any
-// other entry (org filtering keys off LogicalKey).
-func (s *Store) AppendAudit(e AuditEntry) AuditEntry {
+// other entry (org filtering keys off LogicalKey). The in-memory
+// store cannot fail; the error return keeps parity with state.Backend
+// (issue #71).
+func (s *Store) AppendAudit(e AuditEntry) (AuditEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq++
@@ -355,7 +368,7 @@ func (s *Store) AppendAudit(e AuditEntry) AuditEntry {
 		e.Time = time.Now().UTC()
 	}
 	s.audit = append(s.audit, e)
-	return e
+	return e, nil
 }
 
 func logical(org, project, env, kind, name string) string {

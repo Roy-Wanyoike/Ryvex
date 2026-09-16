@@ -133,6 +133,8 @@ func routeLabel(path string) string {
 	switch path {
 	case "/healthz":
 		return "healthz"
+	case "/readyz": // dependency-aware readiness (issue #71)
+		return "readyz"
 	case "/", "/v1", "/v1/":
 		return "index"
 	}
@@ -381,7 +383,8 @@ func AuthZMiddleware(az *authz.Authorizer, opts AuthOptions, log *slog.Logger) f
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/healthz/") {
+			if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/healthz/") ||
+				r.URL.Path == "/readyz" || strings.HasPrefix(r.URL.Path, "/readyz/") {
 				next.ServeHTTP(w, r)
 				return
 			}

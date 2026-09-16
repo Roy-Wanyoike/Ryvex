@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/authz"
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
@@ -85,6 +87,7 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 	}
 
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	s.mux.HandleFunc("/readyz", s.handleReadyz) // dependency-aware readiness (issue #71)
 	s.mux.HandleFunc("/v1/", s.routeV1)
 	s.mux.HandleFunc("/v1", s.handleIndex)
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -95,8 +98,8 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 		s.handleIndex(w, r)
 	})
 
-	// /healthz stays open; everything under /v1 requires a key.
-	o.Auth.SkipPrefixes = append(o.Auth.SkipPrefixes, "/healthz")
+	// /healthz and /readyz stay open; everything under /v1 requires a key.
+	o.Auth.SkipPrefixes = append(o.Auth.SkipPrefixes, "/healthz", "/readyz")
 	authMW := AuthMiddleware(o.Auth, o.Logger)
 	if s.authorizer != nil {
 		authMW = AuthZMiddleware(o.Authorizer, o.Auth, o.Logger)
@@ -122,24 +125,105 @@ func Chain(mws ...func(http.Handler) http.Handler) func(http.Handler) http.Handl
 	}
 }
 
-// handleHealthz serves the liveness probe. Anonymous callers (the
-// common case: load balancers, k8s probes, `ryvex health` without a
-// token) get status + version only — resource counts are operational
+// probeTimeout bounds every dependency check inside /healthz and
+// /readyz so a wedged dependency cannot stall a probe past the k8s
+// probe timeout (deploy/k8s/04-ryvexd.yaml allows 3s).
+const probeTimeout = 2 * time.Second
+
+// handleHealthz serves the liveness probe. It stays HTTP 200 even
+// when dependencies are down (a restart cannot fix a dead Postgres —
+// readiness owns rotation, issue #71) but it no longer lies: it runs
+// a cheap real store query (Store.Ping) plus the bus health check and
+// reflects the outcome in the body ("status":"degraded" +
+// "dependencies"). Anonymous callers (the common case: load
+// balancers, k8s probes, `ryvex health` without a token) get status +
+// version + dependency states only — resource counts are operational
 // detail that must not leak without a valid key (issue #38). Probes
 // presenting a valid bearer token additionally get the resource count
 // and the principal they authenticated as.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), probeTimeout)
+	defer cancel()
+	deps, healthy := s.dependencyStates(ctx)
+	status := "ok"
+	if !healthy {
+		status = "degraded"
+	}
 	body := map[string]any{
-		"status":  "ok",
-		"service": "ryvexd",
-		"version": s.version,
-		"time":    nowUTC(),
+		"status":       status,
+		"service":      "ryvexd",
+		"version":      s.version,
+		"time":         nowUTC(),
+		"dependencies": deps,
 	}
 	if actor := s.probeActor(r); actor != "" {
-		body["resources"] = s.store.Count()
 		body["authenticated_as"] = actor
+		if n, err := s.store.Count(); err != nil {
+			// The ping answered but the count failed: keep the 200
+			// liveness contract and report the store as unavailable.
+			deps["store"] = "unavailable"
+			body["status"] = "degraded"
+			s.log.Warn("healthz store count failed", "err", err)
+		} else {
+			body["resources"] = n
+		}
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// handleReadyz serves the readiness probe (issue #71). It returns 503
+// until BOTH dependencies answer a real query — the store via
+// Store.Ping (a genuine database round trip on the Postgres backend)
+// and the bus via bus.HealthChecker — and goes back to 503 the moment
+// either fails, so a dead-Postgres pod leaves the Service rotation
+// instead of serving errors. The body lists each dependency's state;
+// error details stay in the server log, never in the anonymous body.
+// The route is unauthenticated by design (like /healthz): it exposes
+// no resource data.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), probeTimeout)
+	defer cancel()
+	deps, healthy := s.dependencyStates(ctx)
+	status, code := "ready", http.StatusOK
+	if !healthy {
+		status, code = "unavailable", http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, map[string]any{
+		"status":       status,
+		"service":      "ryvexd",
+		"version":      s.version,
+		"time":         nowUTC(),
+		"dependencies": deps,
+	})
+}
+
+// dependencyStates probes the store and the bus. It returns the
+// per-dependency state map and whether all dependencies are healthy.
+// Failures are logged (without leaking anything to probe callers).
+func (s *Server) dependencyStates(ctx context.Context) (map[string]string, bool) {
+	deps := map[string]string{"store": "ok", "bus": "ok"}
+	healthy := true
+	if err := s.store.Ping(ctx); err != nil {
+		deps["store"] = "unavailable"
+		healthy = false
+		s.log.Warn("probe: store ping failed", "err", err)
+	}
+	if err := busHealth(s.bus); err != nil {
+		deps["bus"] = "unavailable"
+		healthy = false
+		s.log.Warn("probe: bus check failed", "err", err)
+	}
+	return deps, healthy
+}
+
+// busHealth reports the bus dependency state for the probes (issue
+// #71). Buses without the bus.HealthChecker capability (custom or
+// test doubles) are treated as healthy by definition.
+func busHealth(b bus.BusI) error {
+	if hc, ok := b.(bus.HealthChecker); ok {
+		return hc.Healthy()
+	}
+	return nil
 }
 
 // probeActor resolves the optional bearer token on a /healthz probe
@@ -166,6 +250,7 @@ func (s *Server) probeActor(r *http.Request) string {
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	endpoints := []string{
 		"GET    /healthz",
+		"GET    /readyz",
 		"GET    /v1",
 		"POST   /v1/resources",
 		"GET    /v1/resources?org=&project=&env=&kind=&limit=&cursor=",

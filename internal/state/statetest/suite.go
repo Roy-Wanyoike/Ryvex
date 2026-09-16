@@ -5,6 +5,7 @@
 package statetest
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -23,10 +24,11 @@ type Store interface {
 	UpdateResource(id string, fn func(*state.Resource) error, o state.UpdateOptions) (*state.Resource, error)
 	UpdateStatus(id string, phase, message string, actor state.WriteOptions) error
 	DeleteResource(id string, opts state.WriteOptions) error
-	Count() int
-	CountByKindPhase() map[string]map[string]int64
-	ListAudit(o state.AuditOptions) []state.AuditEntry
-	AppendAudit(e state.AuditEntry) state.AuditEntry
+	Count() (int, error)
+	CountByKindPhase() (map[string]map[string]int64, error)
+	ListAudit(o state.AuditOptions) ([]state.AuditEntry, error)
+	AppendAudit(e state.AuditEntry) (state.AuditEntry, error)
+	Ping(ctx context.Context) error
 }
 
 // RunSuite runs the full behavioral parity suite against a fresh store
@@ -59,6 +61,64 @@ func RunSuite(t *testing.T, newStore func(t *testing.T) Store) {
 	t.Run("AuditListEmptyOptions", func(t *testing.T) { testAuditListEmptyOptions(t, newStore(t)) })
 	t.Run("Count", func(t *testing.T) { testCount(t, newStore(t)) })
 	t.Run("CountByKindPhase", func(t *testing.T) { testCountByKindPhase(t, newStore(t)) })
+	t.Run("PingHealthy", func(t *testing.T) { testPingHealthy(t, newStore(t)) })
+}
+
+// The must* helpers below fail the test when a backend reports an
+// error (issue #71): a healthy backend must never fail these paths,
+// so error returns are asserted once here instead of at every call
+// site.
+
+// mustListAudit fetches audit entries, failing the test on error.
+func mustListAudit(t *testing.T, s Store, o state.AuditOptions) []state.AuditEntry {
+	t.Helper()
+	entries, err := s.ListAudit(o)
+	if err != nil {
+		t.Fatalf("ListAudit(%+v): %v", o, err)
+	}
+	return entries
+}
+
+// mustCount returns the resource count, failing the test on error.
+func mustCount(t *testing.T, s Store) int {
+	t.Helper()
+	n, err := s.Count()
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	return n
+}
+
+// mustCountByKindPhase returns the kind/phase snapshot, failing the
+// test on error.
+func mustCountByKindPhase(t *testing.T, s Store) map[string]map[string]int64 {
+	t.Helper()
+	snap, err := s.CountByKindPhase()
+	if err != nil {
+		t.Fatalf("CountByKindPhase: %v", err)
+	}
+	return snap
+}
+
+// mustAppendAudit appends a caller-built entry, failing the test on
+// error.
+func mustAppendAudit(t *testing.T, s Store, e state.AuditEntry) state.AuditEntry {
+	t.Helper()
+	got, err := s.AppendAudit(e)
+	if err != nil {
+		t.Fatalf("AppendAudit(%s): %v", e.Action, err)
+	}
+	return got
+}
+
+// testPingHealthy: every backend answers Ping with nil when it can
+// serve requests. On the Postgres backend this is a real database
+// round trip (issue #71).
+func testPingHealthy(t *testing.T, s Store) {
+	t.Helper()
+	if err := s.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping on a healthy backend must succeed, got %v", err)
+	}
 }
 
 // mkRes builds a valid resource with the standard test label/spec.
@@ -191,7 +251,7 @@ func testValidationMatrix(t *testing.T, s Store) {
 	if _, err := s.CreateResource(bad, state.WriteOptions{Actor: "t"}); !errors.Is(err, state.ErrValidation) {
 		t.Errorf("invalid duplicate: want ErrValidation, got %v", err)
 	}
-	if n := s.Count(); n != 1 {
+	if n := mustCount(t, s); n != 1 {
 		t.Errorf("failed creates must not leave rows behind, count=%d", n)
 	}
 }
@@ -271,7 +331,7 @@ func testUpdateNoOpNoAudit(t *testing.T, s Store) {
 	if _, err := s.UpdateResource(r.ID, func(cur *state.Resource) error { return nil }, state.UpdateOptions{WriteOptions: state.WriteOptions{Actor: "bob"}}); err != nil {
 		t.Fatalf("no-op update: %v", err)
 	}
-	for _, e := range s.ListAudit(state.AuditOptions{Org: "acme"}) {
+	for _, e := range mustListAudit(t, s, state.AuditOptions{Org: "acme"}) {
 		if e.Action == "updated" {
 			t.Fatalf("no-op update produced an audit entry: %+v", e)
 		}
@@ -325,7 +385,7 @@ func testStatusOwnedByReconciler(t *testing.T, s Store) {
 		t.Fatalf("status change must not bump spec generation, got %d", got.Generation)
 	}
 	// the transition is audited with the reconciler identity
-	entries := s.ListAudit(state.AuditOptions{Org: "acme"})
+	entries := mustListAudit(t, s, state.AuditOptions{Org: "acme"})
 	if len(entries) == 0 || entries[0].Action != "status_changed" || entries[0].Actor != "reconciler" {
 		t.Fatalf("status change not audited: %+v", entries)
 	}
@@ -347,7 +407,7 @@ func testUpdateStatusAlwaysAudits(t *testing.T, s Store) {
 		t.Fatalf("observed generation must track spec generation, got %d", got.Status.ObservedGen)
 	}
 	n := 0
-	for _, e := range s.ListAudit(state.AuditOptions{Org: "acme"}) {
+	for _, e := range mustListAudit(t, s, state.AuditOptions{Org: "acme"}) {
 		if e.Action == "status_changed" {
 			n++
 		}
@@ -532,7 +592,7 @@ func testDelete(t *testing.T, s Store) {
 		t.Fatalf("recreate at same address: %v", err)
 	}
 	deleted := 0
-	for _, e := range s.ListAudit(state.AuditOptions{Org: "acme"}) {
+	for _, e := range mustListAudit(t, s, state.AuditOptions{Org: "acme"}) {
 		if e.Action == "deleted" {
 			deleted++
 			if e.ResourceID != r.ID || e.Kind != "Cache" || e.LogicalKey != "acme/core/prod/Cache/sessions" {
@@ -561,7 +621,7 @@ func testAuditTrail(t *testing.T, s Store) {
 	_, _ = s.UpdateResource(r.ID, func(cur *state.Resource) error { return nil }, state.UpdateOptions{WriteOptions: state.WriteOptions{Actor: "bob"}})
 	_ = s.DeleteResource(r.ID, state.WriteOptions{Actor: "carol"})
 
-	entries := s.ListAudit(state.AuditOptions{Org: "acme"})
+	entries := mustListAudit(t, s, state.AuditOptions{Org: "acme"})
 	if len(entries) < 2 {
 		t.Fatalf("expected at least 2 audit entries, got %d", len(entries))
 	}
@@ -571,7 +631,7 @@ func testAuditTrail(t *testing.T, s Store) {
 	if entries[0].LogicalKey != "acme/core/prod/Secret/api-key" {
 		t.Fatalf("audit logical key malformed: %+v", entries[0])
 	}
-	filtered := s.ListAudit(state.AuditOptions{Kind: "Secret", Limit: 10})
+	filtered := mustListAudit(t, s, state.AuditOptions{Kind: "Secret", Limit: 10})
 	if len(filtered) == 0 {
 		t.Fatalf("kind filter dropped everything")
 	}
@@ -579,13 +639,13 @@ func testAuditTrail(t *testing.T, s Store) {
 	if _, err := s.CreateResource(mkRes("Cache", "globex", "core", "prod", "g1"), state.WriteOptions{Actor: "t"}); err != nil {
 		t.Fatalf("seed globex: %v", err)
 	}
-	acmeOnly := s.ListAudit(state.AuditOptions{Org: "acme"})
+	acmeOnly := mustListAudit(t, s, state.AuditOptions{Org: "acme"})
 	for _, e := range acmeOnly {
 		if len(e.LogicalKey) < 5 || e.LogicalKey[:5] != "acme/" {
 			t.Fatalf("org filter leaked foreign entry: %+v", e)
 		}
 	}
-	globex := s.ListAudit(state.AuditOptions{Org: "globex"})
+	globex := mustListAudit(t, s, state.AuditOptions{Org: "globex"})
 	if len(globex) != 1 || globex[0].Action != "created" {
 		t.Fatalf("globex audit: %+v", globex)
 	}
@@ -599,7 +659,7 @@ func testAuditReasonNotRecorded(t *testing.T, s Store) {
 	if _, err := s.CreateResource(mkRes("Secret", "acme", "core", "prod", "why"), state.WriteOptions{Actor: "alice", Reason: "bootstrap"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	for _, e := range s.ListAudit(state.AuditOptions{Org: "acme"}) {
+	for _, e := range mustListAudit(t, s, state.AuditOptions{Org: "acme"}) {
 		if e.Reason != "" {
 			t.Fatalf("reason must not leak from WriteOptions: %+v", e)
 		}
@@ -610,7 +670,7 @@ func testAuditReasonNotRecorded(t *testing.T, s Store) {
 // returned completed and are filterable like any other entry.
 func testAppendAudit(t *testing.T, s Store) {
 	t.Helper()
-	e := s.AppendAudit(state.AuditEntry{
+	e := mustAppendAudit(t, s, state.AuditEntry{
 		Actor:      "webhook-dispatcher",
 		Action:     "webhook_delivered",
 		Kind:       "Subscription",
@@ -621,14 +681,14 @@ func testAppendAudit(t *testing.T, s Store) {
 	if e.ID == "" || len(e.ID) < 3 || e.Time.IsZero() {
 		t.Fatalf("AppendAudit must fill ID and Time: %+v", e)
 	}
-	entries := s.ListAudit(state.AuditOptions{Org: "acme"})
+	entries := mustListAudit(t, s, state.AuditOptions{Org: "acme"})
 	if len(entries) != 1 || entries[0].Action != "webhook_delivered" || entries[0].Reason == "" {
 		t.Fatalf("appended entry not listed: %+v", entries)
 	}
-	if got := s.ListAudit(state.AuditOptions{Org: "other"}); len(got) != 0 {
+	if got := mustListAudit(t, s, state.AuditOptions{Org: "other"}); len(got) != 0 {
 		t.Fatalf("org prefix filter must exclude other orgs: %+v", got)
 	}
-	if got := s.ListAudit(state.AuditOptions{Kind: "Subscription"}); len(got) != 1 {
+	if got := mustListAudit(t, s, state.AuditOptions{Kind: "Subscription"}); len(got) != 1 {
 		t.Fatalf("kind filter must include appended entry: %+v", got)
 	}
 }
@@ -649,17 +709,17 @@ func testAuditListEmptyOptions(t *testing.T, s Store) {
 		t.Fatalf("seed 2: %v", err)
 	}
 
-	entries := s.ListAudit(state.AuditOptions{})
+	entries := mustListAudit(t, s, state.AuditOptions{})
 	if len(entries) != 2 {
 		t.Fatalf("empty options must list every entry (default limit), got %d: %+v", len(entries), entries)
 	}
 	if entries[0].ResourceID != r2.ID || entries[1].ResourceID != r1.ID {
 		t.Fatalf("empty options must stay newest-first: %+v", entries)
 	}
-	if n := s.ListAudit(state.AuditOptions{Limit: -5}); len(n) != 2 {
+	if n := mustListAudit(t, s, state.AuditOptions{Limit: -5}); len(n) != 2 {
 		t.Fatalf("non-positive limit must clamp to the default, got %d entries", len(n))
 	}
-	if n := s.ListAudit(state.AuditOptions{Limit: 1}); len(n) != 1 || n[0].ResourceID != r2.ID {
+	if n := mustListAudit(t, s, state.AuditOptions{Limit: 1}); len(n) != 1 || n[0].ResourceID != r2.ID {
 		t.Fatalf("limit 1 must keep only the newest entry: %+v", n)
 	}
 }
@@ -667,7 +727,7 @@ func testAuditListEmptyOptions(t *testing.T, s Store) {
 // testCount.
 func testCount(t *testing.T, s Store) {
 	t.Helper()
-	if n := s.Count(); n != 0 {
+	if n := mustCount(t, s); n != 0 {
 		t.Fatalf("fresh store must be empty, count=%d", n)
 	}
 	for _, n := range []string{"a", "b", "c"} {
@@ -675,7 +735,7 @@ func testCount(t *testing.T, s Store) {
 			t.Fatalf("seed %s: %v", n, err)
 		}
 	}
-	if n := s.Count(); n != 3 {
+	if n := mustCount(t, s); n != 3 {
 		t.Fatalf("want count 3, got %d", n)
 	}
 }
@@ -693,7 +753,7 @@ func testCountByKindPhase(t *testing.T, s Store) {
 	}
 	_ = s.UpdateStatus(a1.ID, state.PhaseReady, "converged", state.WriteOptions{Actor: "reconciler"})
 
-	snap := s.CountByKindPhase()
+	snap := mustCountByKindPhase(t, s)
 	if snap["Application"]["Ready"] != 1 || snap["Application"]["Pending"] != 1 || snap["Node"]["Pending"] != 1 {
 		t.Fatalf("unexpected snapshot: %+v", snap)
 	}

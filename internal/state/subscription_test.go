@@ -192,7 +192,7 @@ func TestSubscriptionResourceCRUD(t *testing.T) {
 
 func TestStoreAppendAudit(t *testing.T) {
 	st := NewStore()
-	e := st.AppendAudit(AuditEntry{
+	e, err := st.AppendAudit(AuditEntry{
 		Actor:      "webhook-dispatcher",
 		Action:     "webhook_delivered",
 		ResourceID: "r-x",
@@ -200,13 +200,19 @@ func TestStoreAppendAudit(t *testing.T) {
 		LogicalKey: "acme/ops/prod/Subscription/hooks",
 		Reason:     "ryvex.resource.acme.application.created attempt 1/6",
 	})
+	if err != nil {
+		t.Fatalf("AppendAudit: %v", err)
+	}
 	if e.ID == "" || e.Time.IsZero() {
 		t.Fatalf("AppendAudit did not fill ID/Time: %+v", e)
 	}
 	if e.Time.Location() != time.UTC {
 		t.Errorf("audit time %v not UTC", e.Time)
 	}
-	got := st.ListAudit(AuditOptions{Org: "acme", Kind: KindSubscription, Limit: 10})
+	got, err := st.ListAudit(AuditOptions{Org: "acme", Kind: KindSubscription, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
 	if len(got) != 1 || got[0].ID != e.ID {
 		t.Fatalf("ListAudit = %+v, want the appended entry", got)
 	}
