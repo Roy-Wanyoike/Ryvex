@@ -15,6 +15,21 @@ that keep concurrent contributions from colliding.
 | Python | 3.10+ | Python SDK tests (`sdk/ryvex-py`, pytest) |
 | Docker (optional) | — | `docker-compose.yml` starts the Postgres used by `--store postgres` |
 
+## Quickstart (first clone)
+
+```bash
+git clone https://github.com/Roy-Wanyoike/Ryvex && cd Ryvex
+
+go build ./... && go vet ./... && go test ./... -race -count=1   # control plane + CLI
+cd console && bun install --frozen-lockfile && bun run build && cd ..   # console
+cd sdk/ryvex-ts && bun install && bun test && cd ../..           # TS SDK
+cd sdk/ryvex-py && pip install -e '.[dev]' && pytest -q && cd ../..  # Python SDK
+cd agent/ryvex-agent && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test  # Rust agent
+```
+
+No services are required for the above — durable-backend parity suites
+activate only when the DSNs below are exported.
+
 ## Build & test commands per surface
 
 **Control plane + CLI (Go, repo root):**
@@ -26,7 +41,14 @@ go run ./cmd/ryvex --help                     # CLI
 ```
 
 Durable backends have parity suites that activate when the DSNs are
-provided (see `internal/state/pgstore` and `internal/bus/natsbus`).
+provided (see `internal/state/pgstore` and `internal/bus/natsbus`):
+
+```bash
+# with docker compose running the repo stack (postgres profile optional):
+RYVEX_TEST_PG_DSN='postgres://postgres:postgres@127.0.0.1:5432/ryvex?sslmode=disable' \
+RYVEX_TEST_NATS_URL='nats://127.0.0.1:4222' \
+    go test ./internal/state/pgstore/... ./internal/bus/natsbus/... -race -count=1 -v
+```
 
 **Console (Next.js, `console/`):**
 
@@ -49,8 +71,35 @@ cd sdk/ryvex-py && pip install -e '.[dev]' && python3 -m pytest
 **Node agent (Rust, `agent/ryvex-agent/`):**
 
 ```bash
-cd agent/ryvex-agent && cargo build --release && cargo test && cargo clippy -- -D warnings
+cd agent/ryvex-agent && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
+
+## Continuous integration — required checks
+
+`.github/workflows/ci.yml` runs on **every push to `main` and every pull
+request**; a newer push to the same ref cancels the stale run. Branch
+protection on `main` requires all five jobs to pass — the required
+status checks are the job names:
+
+| Required check | Stack | What it runs |
+|---|---|---|
+| `go` | Control plane + CLI (Go) | `go build ./...`, `go vet ./...`, `go test ./... -race -count=1` with coverage artifact |
+| `console` | Next.js console | `bun install --frozen-lockfile`, `next lint`, `tsc --noEmit`, `next build` |
+| `sdk-ts` | TypeScript SDK | `bun install`, `bun test` |
+| `sdk-py` | Python SDK | `pip install -e ".[dev]"`, `pytest -q` |
+| `agent` | Rust node agent | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
+
+The `go` job also runs the **live-backend parity suites**: it starts
+`postgres:16` and `nats:2` (JetStream) service containers and exports
+`RYVEX_TEST_PG_DSN` / `RYVEX_TEST_NATS_URL`, the exact env vars read by
+`internal/state/pgstore/pgstore_test.go` and
+`internal/bus/natsbus/natsbus_test.go`. A dedicated CI step fails the job
+if those suites skip instead of run. The SDK live-daemon integration
+tests (`RYVEX_INTEGRATION=1`) keep skipping cleanly in CI — they need a
+running `ryvexd` and stay opt-in.
+
+A failing required check blocks merge; fix forward (or explicitly
+revert) rather than bypassing CI.
 
 ## Workflow: issues first, then branch, then PR
 
