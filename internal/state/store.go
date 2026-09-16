@@ -363,40 +363,63 @@ func (s *Store) CountByKindPhase() (map[string]map[string]int64, error) {
 	return out, nil
 }
 
-// AuditOptions filters the audit log.
+// AuditOptions filters the audit log. Cursor is the opaque pagination
+// token returned by a previous page (issue #107); empty means "newest
+// first page".
 type AuditOptions struct {
-	Org   string
-	Kind  string
-	Limit int
+	Org    string
+	Kind   string
+	Limit  int
+	Cursor string
 }
 
-// ListAudit returns audit entries newest-first. The in-memory store
-// cannot fail; the error return keeps parity with state.Backend
-// (issue #71).
+// ListAudit returns one page of audit entries newest-first. The
+// in-memory store cannot fail except for malformed cursors; the error
+// return keeps parity with state.Backend (issue #71).
+//
+// Cursor pagination (issue #107): o.Cursor is an offset token from the
+// shared v2 cursor vocabulary (the same 8-byte base64url form the
+// resource listing issues), applied to the filtered newest-first
+// sequence — exactly ListResources' contract, so the API layer serves
+// feeds and lists with one wire shape. A malformed token is ErrBadRequest;
+// a well-formed offset past the end clamps to an empty page.
 //
 // Retention (issue #85): the memory backend keeps at most AuditCap
 // entries (DefaultAuditCap by default; WithAuditCap / ryvexd
 // --audit-cap override) and evicts oldest-first once full, so the
 // newest-first contract is unaffected — evicted entries are simply
 // absent from listings, never phantom or reordered. Offset cursors
-// built from the shared v2 helpers (the 8-byte base64url tokens the
-// list pagination issues) keep decoding for any offset that was ever
-// minted: an offset that now lands past the retained window clamps to
-// an empty page exactly like a cursor past the end of a list, so a
-// walk across the eviction boundary can neither error nor loop. (The
-// audit listing itself is limit-paged; ListResources owns the
-// offset-cursor machinery this guarantee refers to.) The Postgres
-// backend needs no cap: its audit table is the durable record.
+// built from the shared v2 helpers keep decoding for any offset that
+// was ever minted: an offset that now lands past the retained window
+// clamps to an empty page exactly like a cursor past the end of a
+// list, so a walk across the eviction boundary can neither error nor
+// loop. The Postgres backend needs no cap: its audit table is the
+// durable record.
 func (s *Store) ListAudit(o AuditOptions) ([]AuditEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	limit := o.Limit
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 || limit > maxAuditQueryLimit {
 		limit = 100
 	}
+	// Offset cursors (issue #107): decode before listing so a hostile
+	// token fails the request instead of silently wrapping, and clamp
+	// the offset BEFORE computing the page end so offset+limit cannot
+	// overflow (same ordering as ListResources).
+	offset := 0
+	if o.Cursor != "" {
+		n, err := decodeCursor(o.Cursor)
+		if err != nil {
+			return nil, ErrBadRequest
+		}
+		offset = int(n)
+	}
+	// Materialize the filtered newest-first sequence; offsets address
+	// this sequence (filters first, pagination second, like
+	// ListResources).
 	n := len(s.audit)
-	out := make([]AuditEntry, 0, limit)
-	for k := 0; k < n && len(out) < limit; k++ {
+	filtered := make([]AuditEntry, 0, n)
+	for k := 0; k < n; k++ {
 		// newest-first over the ring: (auditWrite-1-k) mod n. The +n
 		// keeps the operand non-negative for every k < n.
 		e := s.audit[(s.auditWrite-1-k+n)%n]
@@ -406,8 +429,17 @@ func (s *Store) ListAudit(o AuditOptions) ([]AuditEntry, error) {
 		if o.Kind != "" && e.Kind != o.Kind {
 			continue
 		}
-		out = append(out, e)
+		filtered = append(filtered, e)
 	}
+	if offset > len(filtered) {
+		offset = len(filtered) // past the end (or past the #85 window): empty page
+	}
+	end := offset + limit
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	out := make([]AuditEntry, end-offset)
+	copy(out, filtered[offset:end])
 	return out, nil
 }
 
@@ -524,6 +556,13 @@ func specLabelsEqual(a, b *Resource) bool {
 // duplicated. v2 encodes the full 64-bit offset; decode still accepts
 // the legacy 2-byte form (same offset semantics) so tokens issued
 // before the upgrade keep working.
+
+// maxAuditQueryLimit caps the page size ListAudit honors per call
+// (issue #107). It was 500; the feed cursor work raised it to 1000 so
+// the API layer's limit+1 more-probe (page+1 ≤ 501) is always honored
+// verbatim by both backends and next_cursor stays exact at every page
+// size. The default page is unchanged: limit <= 0 falls back to 100.
+const maxAuditQueryLimit = 1000
 
 // maxCursorOffset is the decode bound. No legitimate list page can
 // produce an offset beyond it (that would need >2^31 rows), and

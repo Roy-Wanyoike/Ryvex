@@ -54,6 +54,13 @@ const (
 	connMaxIdleTime     = 5 * time.Minute
 )
 
+// auditQueryLimit caps the page size ListAudit honors per call,
+// mirroring the memory store's maxAuditQueryLimit (issue #107): raised
+// from 500 to 1000 so the API layer's limit+1 more-probe is always
+// honored verbatim and feed next_cursor stays exact at every page
+// size. The default page is unchanged: limit <= 0 falls back to 100.
+const auditQueryLimit = 1000
+
 // poolLimitsFromEnv resolves the pool size knobs from the environment,
 // defensively: a bad value must never take the control plane down at
 // boot, so only positive integers are honoured. The idle cap is
@@ -621,17 +628,37 @@ func (s *Store) CountByKindPhase() (map[string]map[string]int64, error) {
 	return out, nil
 }
 
-// ListAudit returns audit entries newest-first. The org filter is a
-// prefix match on the logical key, mirroring the reference store.
-// With no filters at all the WHERE clause is omitted entirely —
+// ListAudit returns one page of audit entries newest-first. The org
+// filter is a prefix match on the logical key, mirroring the reference
+// store. With no filters at all the WHERE clause is omitted entirely —
 // emitting a bare "WHERE" rendered invalid SQL (issue #39) and every
-// unfiltered call failed. Database errors are propagated (issue #71):
-// a failed query is an error, never a silent empty audit log — the
-// compliance trail must not be able to disappear quietly.
+// unfiltered call failed.
+//
+// Cursor pagination (issue #107): o.Cursor is the offset token minted
+// by a previous page, decoded with the shared state helpers so memory
+// and Postgres issue and accept byte-identical tokens; the offset is
+// applied as SQL OFFSET over the same filtered, seq-ordered query the
+// first page scans. Malformed tokens fail with state.ErrBadRequest
+// (mapped to 400 by the API layer); offsets past the end of the table
+// yield an empty page — a walk can neither error nor loop.
+//
+// Database errors are propagated (issue #71): a failed query is an
+// error, never a silent empty audit log — the compliance trail must
+// not be able to disappear quietly.
 func (s *Store) ListAudit(o state.AuditOptions) ([]state.AuditEntry, error) {
 	limit := o.Limit
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 || limit > auditQueryLimit {
 		limit = 100
+	}
+	// Offset cursor decode (issue #107) — same bound as the memory
+	// store: maxCursorOffset keeps the int conversion safe.
+	offset := 0
+	if o.Cursor != "" {
+		n, err := state.DecodeCursor(o.Cursor)
+		if err != nil {
+			return nil, state.ErrBadRequest
+		}
+		offset = int(n)
 	}
 
 	where := make([]string, 0, 2)
@@ -650,7 +677,8 @@ func (s *Store) ListAudit(o state.AuditOptions) ([]state.AuditEntry, error) {
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")
 	}
-	query += fmt.Sprintf(` ORDER BY seq DESC LIMIT $%d`, len(args))
+	query += fmt.Sprintf(` ORDER BY seq DESC LIMIT $%d OFFSET $%d`, len(args), len(args)+1)
+	args = append(args, offset)
 
 	ctx, cancel := s.ctx()
 	defer cancel()
