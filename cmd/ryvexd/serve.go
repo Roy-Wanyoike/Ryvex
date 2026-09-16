@@ -156,14 +156,14 @@ func runServe(args []string) error {
 	// --- RBAC (issue #16): authorizer + bootstrap of static admin keys ---
 	// Static --api-keys entries are registered as admin key resources
 	// (principal=name, roles=[admin], scopes=["org/*"]) so they show up
-	// in GET /v1/keys; the static fallback in AuthZMiddleware keeps them
-	// working even if the store lost them.
+	// in GET /v1/keys and are governed by the same lifecycle as managed
+	// keys (issue #73): authentication is derived from these resources
+	// only — there is no static digest fallback — so revocation,
+	// demotion and disablement via /v1/keys take effect on the next
+	// authorizer refresh. Seeding runs BEFORE the first Refresh so the
+	// very first request after boot authenticates.
 	authorizer := authz.New(store, eventBus, authz.Options{Logger: log})
-	for name, tok := range auth.APIKeys {
-		if err := api.SeedAdminKey(store, name, tok, log); err != nil {
-			log.Warn("bootstrap admin key not registered", "principal", name, "err", err)
-		}
-	}
+	seedBootstrapKeys(store, auth.APIKeys, log)
 	if err := authorizer.Refresh(); err != nil {
 		log.Error("authz key cache bootstrap failed", "err", err)
 	}
@@ -249,6 +249,24 @@ func runServe(args []string) error {
 	// --- end nats bus ---
 	log.Info("ryvexd stopped cleanly")
 	return nil
+}
+
+// seedBootstrapKeys registers every --api-keys entry as an admin key
+// resource (issue #73: the APIKey resource view is the only
+// authentication state, so the seed must succeed for the token to
+// work at all). auth.APIKeys maps token→principal; SeedAdminKey wants
+// (principal, token). The loop this helper replaced bound its range
+// variables swapped and seeded principal=<raw token>, which never
+// passed validation — masked for years by the static digest path that
+// issue #73 removes. Failures are logged and non-fatal so one bad
+// entry cannot block the daemon (the affected token simply never
+// authenticates — fail closed).
+func seedBootstrapKeys(store state.Backend, keys map[string]string, log *slog.Logger) {
+	for token, principal := range keys {
+		if err := api.SeedAdminKey(store, principal, token, log); err != nil {
+			log.Warn("bootstrap admin key not registered", "principal", principal, "err", err)
+		}
+	}
 }
 
 // checkDevAuthGuard refuses to boot when --dev-auth is combined with a

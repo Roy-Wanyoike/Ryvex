@@ -234,3 +234,162 @@ func TestRBACCrossOrgBodyScope(t *testing.T) {
 		t.Fatalf("scope-path write outside project: want 403, got %d", w.Code)
 	}
 }
+
+// ---- issue #73: bootstrap keys are governed by the /v1/keys lifecycle ----
+
+// bootstrapKeyID lists the keys and returns the resource ID backing a
+// principal (bootstrap keys included: they are APIKey resources).
+func bootstrapKeyID(t *testing.T, h http.Handler, adminToken, principal string) string {
+	t.Helper()
+	w := doAuth(t, h, http.MethodGet, "/v1/keys", adminToken, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list keys: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Keys []struct {
+			ID        string `json:"id"`
+			Principal string `json:"principal"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("list keys decode: %v", err)
+	}
+	for _, k := range resp.Keys {
+		if k.Principal == principal {
+			return k.ID
+		}
+	}
+	t.Fatalf("no APIKey resource for principal %q", principal)
+	return ""
+}
+
+func TestBootstrapKeyDeleteRevokesImmediately(t *testing.T) {
+	admin := "ryk_admin_boot_0001"
+	h, _ := newRBACServer(t, admin)
+	// Control: a managed (non-bootstrap) key must be unaffected by
+	// bootstrap revocation.
+	ops, opsID := mintKey(t, h, admin, "acme-ops", "operator", "acme", "")
+
+	bootID := bootstrapKeyID(t, h, admin, "root")
+	if bootID == "" || bootID == opsID {
+		t.Fatalf("bootstrap key lookup failed: id=%q ops=%q", bootID, opsID)
+	}
+	// Sanity: the bootstrap token authenticates (managed path) before
+	// revocation, on /v1 and on the /healthz probe tier.
+	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, ""); w.Code != http.StatusOK {
+		t.Fatalf("bootstrap token before revoke: want 200, got %d", w.Code)
+	}
+	if w := doAuth(t, h, http.MethodGet, "/healthz", admin, ""); !strings.Contains(w.Body.String(), "authenticated_as") {
+		t.Fatalf("bootstrap token must classify on /healthz before revoke: %s", w.Body.String())
+	}
+
+	if w := doAuth(t, h, http.MethodDelete, "/v1/keys/"+bootID, admin, ""); w.Code != http.StatusNoContent {
+		t.Fatalf("delete bootstrap key: want 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// The regression in #73: the static digest index used to keep the
+	// --api-keys token admin forever. The resource is gone, so the next
+	// request must be a 401 — no restart, no residual static path.
+	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked bootstrap token: want 401, got %d: %s", w.Code, w.Body.String())
+	}
+	// /healthz classifies the revoked token as anonymous again.
+	if w := doAuth(t, h, http.MethodGet, "/healthz", admin, ""); strings.Contains(w.Body.String(), "authenticated_as") {
+		t.Fatalf("revoked bootstrap token must probe as anonymous: %s", w.Body.String())
+	}
+	// Non-bootstrap keys keep working.
+	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", ops, ""); w.Code != http.StatusOK {
+		t.Fatalf("managed key after bootstrap revoke: want 200, got %d", w.Code)
+	}
+}
+
+func TestBootstrapKeyDemoteEnforced(t *testing.T) {
+	admin := "ryk_admin_boot_0002"
+	h, _ := newRBACServer(t, admin)
+	bootID := bootstrapKeyID(t, h, admin, "root")
+
+	// Demote admin → operator scoped to org/acme. The scopes must move
+	// off "org/*" in the same update: the wildcard is admin-only syntax
+	// and the store rejects the demotion otherwise.
+	body := `{"roles":["operator"],"scopes":["org/acme"]}`
+	if w := doAuth(t, h, http.MethodPut, "/v1/keys/"+bootID, admin, body); w.Code != http.StatusOK {
+		t.Fatalf("demote bootstrap key: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Enforcement follows the demoted role without a restart: the token
+	// still authenticates, but only with operator powers inside acme.
+	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, ""); w.Code != http.StatusOK {
+		t.Fatalf("demoted read inside scope: want 200, got %d", w.Code)
+	}
+	if w := doAuth(t, h, http.MethodPost, "/v1/resources", admin, appBodyAcme); w.Code != http.StatusCreated {
+		t.Fatalf("demoted write inside scope: want 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if w := doAuth(t, h, http.MethodPost, "/v1/resources", admin, appBodyGlobex); w.Code != http.StatusForbidden {
+		t.Fatalf("demoted write outside scope: want 403, got %d", w.Code)
+	}
+	// Admin terrain (key management) is gone.
+	if w := doAuth(t, h, http.MethodGet, "/v1/keys", admin, ""); w.Code != http.StatusForbidden {
+		t.Fatalf("demoted key management: want 403, got %d", w.Code)
+	}
+}
+
+func TestBootstrapKeyDisableRevokes(t *testing.T) {
+	admin := "ryk_admin_boot_0003"
+	h, _ := newRBACServer(t, admin)
+	bootID := bootstrapKeyID(t, h, admin, "root")
+	if w := doAuth(t, h, http.MethodPut, "/v1/keys/"+bootID, admin, `{"active":false}`); w.Code != http.StatusOK {
+		t.Fatalf("disable bootstrap key: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled bootstrap token: want 401, got %d", w.Code)
+	}
+}
+
+func TestBootstrapKeyRotationWithoutRestart(t *testing.T) {
+	admin := "ryk_admin_boot_0004"
+	h, _ := newRBACServer(t, admin)
+	// Rotate through the lifecycle: mint a replacement admin key, then
+	// revoke the bootstrap key. Both steps are plain /v1/keys calls.
+	replacement, _ := mintKey(t, h, admin, "root-v2", "admin", "acme", "")
+	bootID := bootstrapKeyID(t, h, admin, "root")
+	if w := doAuth(t, h, http.MethodDelete, "/v1/keys/"+bootID, admin, ""); w.Code != http.StatusNoContent {
+		t.Fatalf("delete bootstrap key: want 204, got %d", w.Code)
+	}
+	// The rotated-out token is dead; the rotated-in one is admin. No
+	// restart, no flag change, no residual static grant.
+	if w := doAuth(t, h, http.MethodGet, "/v1/keys", admin, ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("rotated-out bootstrap token: want 401, got %d", w.Code)
+	}
+	if w := doAuth(t, h, http.MethodGet, "/v1/keys", replacement, ""); w.Code != http.StatusOK {
+		t.Fatalf("rotated-in admin token: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSeedAdminKeyCollisionSemantics(t *testing.T) {
+	store := state.NewStore()
+	tok1 := "ryk_boot_root_0001"
+	tok2 := "ryk_boot_root_0002"
+	if err := SeedAdminKey(store, "root", tok1, discardLogger()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Idempotent restart with the same token: untouched, still valid.
+	if err := SeedAdminKey(store, "root", tok1, discardLogger()); err != nil {
+		t.Fatalf("re-seed same token: %v", err)
+	}
+	// Principal collision with a different token: no-op — the resource
+	// view stays authoritative, so the new token never authenticates
+	// (issue #73 removed the static path that used to grant it admin).
+	if err := SeedAdminKey(store, "root", tok2, discardLogger()); err != nil {
+		t.Fatalf("colliding seed: %v", err)
+	}
+	az := authz.New(store, bus.New(), authz.Options{Logger: discardLogger()})
+	if err := az.Refresh(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if p, ok := az.Authenticate(tok1); !ok || p != "root" {
+		t.Fatalf("original bootstrap token must keep authenticating: p=%q ok=%v", p, ok)
+	}
+	if _, ok := az.Authenticate(tok2); ok {
+		t.Fatalf("colliding bootstrap token must not authenticate")
+	}
+}

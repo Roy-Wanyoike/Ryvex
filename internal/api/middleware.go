@@ -64,8 +64,8 @@ func ActorFrom(ctx context.Context) string {
 
 // Identity is the authenticated caller attached to the request
 // context by AuthZMiddleware (issue #16). Admin is true for keys
-// carrying the admin role, for static bootstrap keys and in dev-auth
-// mode.
+// carrying the admin role — including bootstrap keys, which are
+// APIKey resources like any other (issue #73) — and in dev-auth mode.
 type Identity struct {
 	Principal string
 	Roles     []string
@@ -178,9 +178,13 @@ func (w *statusWriter) WriteHeader(code int) {
 
 // AuthOptions configures bearer-token authentication.
 type AuthOptions struct {
-	// APIKeys maps bearer tokens to principal names. Tokens are
-	// hashed once at boot (see staticKeyIndex) — this map is only
-	// read during construction, never compared per request.
+	// APIKeys maps bearer tokens to principal names. It feeds the
+	// legacy bearer-only AuthMiddleware (hashed once at boot, see
+	// staticKeyIndex — never compared per request). With an RBAC
+	// authorizer wired, the daemon seeds these tokens as APIKey
+	// resources at boot (cmd/ryvexd) and authentication is derived
+	// from the live resource view instead (issue #73): the map is
+	// then only used to build that seed, never to authenticate.
 	APIKeys map[string]string
 	// DevAuth, when true, accepts any well-formed ryk_ token. It is a
 	// development affordance and must be disabled in production.
@@ -363,18 +367,20 @@ type requestScope struct {
 }
 
 // AuthZMiddleware enforces authentication plus org/project-scoped
-// RBAC (issue #16). /healthz stays open. Tokens resolve in order:
-// managed keys (authorizer), then static APIKeys (treated as admin;
-// compared as sha256 digests, issue #38), then — when devAuth is set —
-// any well-formed ryk_ token (full access, logged through the
+// RBAC (issue #16). /healthz stays open. Tokens resolve against the
+// authorizer's live APIKey-resource view: bootstrap tokens seeded
+// from --api-keys are APIKey resources like any other, so they
+// authenticate only while their resource exists and is active, with
+// the roles/scopes the resource carries (issue #73 — revoking,
+// disabling or demoting them via /v1/keys takes effect on the next
+// authorizer refresh, no restart). When devAuth is set, any
+// well-formed ryk_ token is accepted (full access, logged through the
 // injected logger). The org/project target comes from the path
 // (segment counts), the query string, or — for POST /v1/resources —
 // the JSON body, which is read once here and reinjected for the
 // handler. Denials are 403 envelopes with code "forbidden" and land
 // in the audit log as authz_denied.
 func AuthZMiddleware(az *authz.Authorizer, opts AuthOptions, log *slog.Logger) func(http.Handler) http.Handler {
-	// Hash the static tokens once at construction (issue #38).
-	ix := newStaticKeyIndex(opts.APIKeys)
 	devAuth := opts.DevAuth
 	if log == nil {
 		log = slog.Default()
@@ -391,11 +397,12 @@ func AuthZMiddleware(az *authz.Authorizer, opts AuthOptions, log *slog.Logger) f
 				return
 			}
 			var ident Identity
-			switch principal, info, kind := resolveToken(az, ix, devAuth, tok); kind {
+			switch principal, info, kind := resolveToken(az, devAuth, tok); kind {
 			case tokenManaged:
+				// Bootstrap keys land here too (issue #73):
+				// identity comes from the APIKey resource,
+				// never from the boot-time flag list.
 				ident = Identity{Principal: principal, Roles: info.Roles, Admin: authz.HasRole(info.Roles, state.RoleAdmin)}
-			case tokenStatic:
-				ident = Identity{Principal: principal, Admin: true}
 			case tokenDev:
 				ident = Identity{Principal: principal, Admin: true}
 				// Routed through the injected logger, not
@@ -442,19 +449,21 @@ type tokenKind int
 const (
 	tokenUnknown tokenKind = iota
 	tokenManaged
-	tokenStatic
 	tokenDev
 )
 
-// resolveToken authenticates a token against managed keys, static
-// key digests, and (when enabled) dev-auth — mirroring the legacy order.
-func resolveToken(az *authz.Authorizer, static staticKeyIndex, devAuth bool, tok string) (principal string, info authz.KeyInfo, kind tokenKind) {
+// resolveToken authenticates a token against the authorizer's live
+// APIKey-resource view and, when enabled, dev-auth. The authorizer's
+// hash cache IS the bootstrap digest index (issue #73): it is derived
+// from the APIKey resources — seeded from --api-keys at boot and kept
+// current by Refresh (key events on the bus, every /v1/keys mutation,
+// and the periodic safety net) — so there is no separate static tier
+// and lifecycle changes take effect without a restart. Digest
+// comparison stays constant-time (authz.Authenticate).
+func resolveToken(az *authz.Authorizer, devAuth bool, tok string) (principal string, info authz.KeyInfo, kind tokenKind) {
 	if p, ok := az.Authenticate(tok); ok {
 		info, _ = az.Lookup(p)
 		return p, info, tokenManaged
-	}
-	if name, ok := static.lookup(tok); ok {
-		return name, authz.KeyInfo{}, tokenStatic
 	}
 	if devAuth && strings.HasPrefix(tok, TokenPrefix) && len(tok) > len(TokenPrefix)+3 {
 		return "dev:" + tok[len(TokenPrefix):], authz.KeyInfo{}, tokenDev
