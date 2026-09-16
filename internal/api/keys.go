@@ -171,7 +171,10 @@ func (k *KeyService) Update(actor, id string, req updateKeyRequest) (KeyView, er
 }
 
 // Delete revokes a key by ID. Revocation is immediate: the API layer
-// refreshes the authorizer cache after the store delete.
+// refreshes the authorizer cache after the store delete. Bootstrap
+// keys seeded from --api-keys revoke the same way (issue #73): the
+// APIKey resource is the only authentication state, so a deleted
+// resource means a dead token on the next request.
 func (k *KeyService) Delete(actor, id string) error {
 	res, err := k.store.GetResource(id)
 	if err != nil {
@@ -185,14 +188,36 @@ func (k *KeyService) Delete(actor, id string) error {
 
 // SeedAdminKey registers a static bootstrap token (e.g. from
 // --api-keys) as an admin key resource with scopes ["org/*"]. It is
-// idempotent: an already-registered principal is left untouched.
+// idempotent across restarts: an existing resource for the principal
+// is left untouched, so lifecycle changes made via /v1/keys
+// (revocation, demotion, disablement) survive a reboot with the same
+// flag set. When the principal is already owned by a DIFFERENT token,
+// the configured bootstrap token is not registered — the APIKey
+// resource view is the single source of authentication truth
+// (issue #73), so the operator resolves the collision through
+// /v1/keys; a warning is logged.
 func SeedAdminKey(store state.Backend, principal, token string, log *slog.Logger) error {
+	hash := authz.HashToken(token)
+	if existing, err := store.GetByLogicalKey(state.ReservedOrg, state.ReservedProject, state.ReservedEnv, state.KindAPIKey, principal); err == nil {
+		if spec, perr := state.ParseAPIKeySpec(existing.Spec); perr == nil {
+			if log != nil {
+				if spec.KeyHash == hash {
+					log.Debug("keys: bootstrap admin key already registered", "principal", principal)
+				} else {
+					log.Warn("keys: bootstrap principal is owned by a different key; the configured bootstrap token will not authenticate until the collision is resolved via /v1/keys", "principal", principal)
+				}
+			}
+			return nil
+		}
+	}
 	_, err := store.CreateResource(
-		state.NewAPIKeyResource(principal, []string{state.RoleAdmin}, []string{"org/*"}, authz.HashToken(token)),
+		state.NewAPIKeyResource(principal, []string{state.RoleAdmin}, []string{"org/*"}, hash),
 		state.WriteOptions{Actor: "bootstrap", Reason: "static api key bootstrap"},
 	)
 	switch {
 	case err == state.ErrAlreadyExists:
+		// Lost a race or the existing resource is malformed; the
+		// principal stays owned by whatever is already in the store.
 		if log != nil {
 			log.Debug("keys: bootstrap admin key already registered", "principal", principal)
 		}
