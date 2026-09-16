@@ -13,6 +13,7 @@
  */
 export { Ryvex, DEFAULT_TIMEOUT_MS, type RyvexClientOptions, type CallOptions } from "./client.js";
 export { RyvexError, DEFAULT_CODE_BY_STATUS, STATUS_BY_CODE, type ErrorCode, type ErrorDetail } from "./errors.js";
+export { RESOURCE_KINDS } from "./types.js";
 export type {
   ApiIndex,
   AuditEntry,
