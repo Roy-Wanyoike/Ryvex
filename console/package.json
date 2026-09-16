@@ -7,7 +7,8 @@
     "dev": "next dev -p 3100",
     "build": "next build",
     "start": "next start -p 3100",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "bun test"
   },
   "dependencies": {
     "next": "15.1.6",
@@ -16,7 +17,9 @@
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",
+    "@happy-dom/global-registrator": "^20.14.5",
     "@tailwindcss/postcss": "^4.0.6",
+    "@types/bun": "^1.4.2",
     "@types/node": "^22.10.10",
     "@types/react": "^19.0.8",
     "@types/react-dom": "^19.0.3",

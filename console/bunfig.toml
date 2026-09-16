@@ -1,0 +1,6 @@
+# Bun test configuration for the console suite (issue #77).
+# Preloads the happy-dom global registrator so tests get window,
+# localStorage/sessionStorage, document, fetch, etc. Bun's own fetch and
+# Response remain available; individual tests override globalThis.fetch.
+[test]
+preload = ["./test/preload.ts"]

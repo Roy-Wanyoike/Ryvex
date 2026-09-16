@@ -10,8 +10,9 @@ import {
   getScope,
   hydrateApiFromStorage,
 } from "@/lib/api";
-import type { FetchHealth, FetchResult, ScopeConfig } from "@/lib/api";
+import type { FetchResult, ScopeConfig } from "@/lib/api";
 import type { AuditEntry, Resource, RyvexEvent } from "@/lib/types";
+import { worstHealth, worstResult, type FeedResults } from "@/lib/health";
 import { ResourceDrawer } from "@/components/drawer";
 import { SettingsView } from "@/components/settings";
 import { Toasts } from "@/components/toasts";
@@ -30,30 +31,6 @@ const NAV: { key: ViewKey; label: string; glyph: string }[] = [
 ];
 
 const POLL_INTERVAL_MS = 15_000;
-
-type FeedResults = {
-  resources: FetchResult<Resource[]>;
-  events: FetchResult<{ events: RyvexEvent[] }>;
-  audit: FetchResult<{ entries: AuditEntry[] }>;
-};
-
-const HEALTH_RANK: Record<FetchHealth, number> = { ok: 0, degraded: 1, error: 2 };
-
-/** Worst of the three feed statuses — what the badge and banner render. */
-function worstHealth(results: FeedResults | null): FetchHealth | null {
-  if (!results) return null;
-  const all: FetchHealth[] = [results.resources.status, results.events.status, results.audit.status];
-  return all.reduce<FetchHealth>((worst, s) => (HEALTH_RANK[s] > HEALTH_RANK[worst] ? s : worst), "ok");
-}
-
-/** The failing feed with the highest rank, for banner reason/time display. */
-function worstResult(results: FeedResults): FetchResult<unknown> {
-  const all: FetchResult<unknown>[] = [results.resources, results.events, results.audit];
-  return all.reduce<FetchResult<unknown>>(
-    (worst, r) => (HEALTH_RANK[r.status] > HEALTH_RANK[worst.status] ? r : worst),
-    all[0],
-  );
-}
 
 export default function Home() {
   const [view, setView] = useState<ViewKey>("overview");
