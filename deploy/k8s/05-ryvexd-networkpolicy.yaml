@@ -83,22 +83,38 @@ spec:
           protocol: TCP
     - # Webhook deliveries to public targets (app-layer SSRF guard
       # already blocks private ranges; mirrored here), over IPv4 and
-      # IPv6 so public v6 subscription targets are reachable too. The
-      # IPv6 except list mirrors the v6 checks of
-      # state.ForbiddenWebhookIPReason (issue #36): unspecified,
-      # loopback, link-local (fe80::/10), unique-local (fc00::/7) and
-      # multicast (ff00::/8, which subsumes interface-local ff01::/16).
+      # IPv6 so public v6 subscription targets are reachable too.
+      # CONSISTENCY RULE: both except lists mirror the checks of
+      # state.ForbiddenWebhookIPReason (internal/state/subscription.go)
+      # so the network layer refuses exactly what the app-layer guard
+      # refuses, per family — if the guard's list changes, these lists
+      # must change with it (issues #36, #121, #131):
+      #   IPv4: 0.0.0.0/8 (this-network), RFC1918 private, CGNAT
+      #     100.64.0.0/10, loopback 127.0.0.0/8, link-local
+      #     169.254.0.0/16, multicast 224.0.0.0/4 (subsumes
+      #     interface-local 224.0.0.0/24) and reserved 240.0.0.0/4
+      #     (incl. 255.255.255.255 broadcast);
+      #   IPv6: unspecified (::/128), loopback (::1/128), link-local
+      #     (fe80::/10), unique-local (fc00::/7) and multicast
+      #     (ff00::/8, which subsumes interface-local ff01::/16).
       # The guard normalizes IPv4-mapped IPv6 (::ffff:0:0/96) to its
       # IPv4 value, which the IPv4 ipBlock above governs.
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
+            # Mirrors the v4 refused ranges of
+            # state.ForbiddenWebhookIPReason (issue #131 brought the
+            # list to full parity with the app-layer guard).
             except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
-              - 100.64.0.0/10
-              - 169.254.0.0/16
+              - 0.0.0.0/8       # this-network / unspecified
+              - 10.0.0.0/8      # RFC1918 private
+              - 100.64.0.0/10   # CGNAT
+              - 127.0.0.0/8     # loopback
+              - 169.254.0.0/16  # link-local
+              - 172.16.0.0/12   # RFC1918 private
+              - 192.168.0.0/16  # RFC1918 private
+              - 224.0.0.0/4     # multicast (incl. interface-local 224.0.0.0/24)
+              - 240.0.0.0/4     # reserved (incl. 255.255.255.255 broadcast)
         - ipBlock:
             cidr: "::/0"
             except:
