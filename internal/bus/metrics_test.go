@@ -7,6 +7,14 @@ import (
 	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 )
 
+// TestMetricsPublishedAndDelivered pins the memory bus's half of the
+// published_total metric contract (issue #109): "published" means
+// accepted by the bus for delivery — here unconditionally at the
+// Publish call, since the memory bus has no persistence boundary and
+// cannot fail. The JetStream backend keeps the same contract with its
+// persist-ack acceptance gate (internal/bus/natsbus); the shared
+// parity suite (internal/bus/bustest) asserts the contract on both
+// backends.
 func TestMetricsPublishedAndDelivered(t *testing.T) {
 	// Default-registry counters are shared across the package's tests,
 	// so assert on deltas around the publishes below.

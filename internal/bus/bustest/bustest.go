@@ -10,6 +10,14 @@
 // Publish; the NATS backend delivers asynchronously. The suite is
 // therefore written against eventual delivery (bounded polling), so
 // a single scenario set exercises both backends unmodified.
+//
+// Metric contract (issue #109): the suite also pins the cross-backend
+// semantics of ryvex_bus_events_published_total — one increment per
+// event the bus accepts for delivery, observable by the time Publish
+// returns (the memory bus accepts synchronously, having no persistence
+// boundary; the JetStream bus after the server persist ack, which its
+// Publish blocks on). Counting acceptance keeps the two backends on
+// one semantic point without changing either counter's meaning.
 package bustest
 
 import (
@@ -18,6 +26,7 @@ import (
 	"time"
 
 	"github.com/Roy-Wanyoike/Ryvex/internal/bus"
+	"github.com/Roy-Wanyoike/Ryvex/internal/metrics"
 )
 
 // Bus is the minimal surface the parity suite drives. It mirrors the
@@ -317,6 +326,38 @@ func RunSuite(t *testing.T, name string, newBus Factory, opts SuiteOptions) {
 		}
 		if len(evts) != 0 {
 			t.Fatalf("empty bus returned %d events", len(evts))
+		}
+	})
+
+	// metric_published_total_contract pins the cross-backend semantics
+	// of ryvex_bus_events_published_total (issue #109): every publish
+	// the bus accepts advances the counter by exactly one, and the
+	// increment is observable as soon as Publish returns — the memory
+	// bus accepts synchronously (no persistence boundary), the
+	// JetStream bus after the persist ack (its Publish blocks on the
+	// ack). No subscription is attached on purpose: the counter tracks
+	// acceptance, not delivery (that is delivered_total's job), so
+	// subscriber presence must not influence it. Publishes a backend
+	// refuses are not accepted and are accounted on that backend's
+	// failure instrument (natsbus: ryvex_bus_publish_failures_total)
+	// instead of polluting published_total.
+	t.Run(name+"/metric_published_total_contract", func(t *testing.T) {
+		b, done := newBus(t)
+		defer done()
+
+		pub := metrics.BusEventsPublishedTotal.WithLabelValues(bus.EventCreated)
+		before := pub.Value()
+
+		const accepted = 3
+		for i := 0; i < accepted; i++ {
+			b.Publish(bus.Event{Org: "acme", Kind: "Deployment", Type: bus.EventCreated, Name: markerName(i)})
+		}
+
+		// Deliberately no waitFor/settle: acceptance is complete when
+		// Publish returns on every backend, so the counter must already
+		// be settled — a post-ack backend cannot lag its own Publish.
+		if got := pub.Value() - before; got != accepted {
+			t.Fatalf("published_total delta after %d accepted publishes = %v, want %d (contract: one increment per accepted publish, at Publish return)", accepted, got, accepted)
 		}
 	})
 

@@ -231,6 +231,18 @@ func (b *Bus) Subscribe(pattern string, h Handler) Sub {
 // deliveries are counted on the ryvex_bus_events_* metrics
 // (issue #17); the counters are mutex-guarded and independent of the
 // bus lock, so instrumentation adds no contention.
+//
+// Metric contract (issue #109): ryvex_bus_events_published_total
+// counts events accepted by the bus for delivery — one increment per
+// accepted publish, independent of subscriber presence and of
+// delivery outcomes (deliveries are ryvex_bus_events_delivered_total).
+// The memory bus has no persistence boundary and Publish cannot fail,
+// so acceptance is the Publish call itself: the increment happens
+// here, before ring append and fan-out. The JetStream backend
+// (internal/bus/natsbus) keeps the same "accepted for delivery"
+// semantics but its acceptance gate is the server persist ack — its
+// increment lands only after the ack, and publishes that fail to
+// persist are counted on ryvex_bus_publish_failures_total instead.
 func (b *Bus) Publish(e Event) {
 	if e.Subject == "" {
 		e.Subject = Subject(e.Org, e.Kind, e.Type)
