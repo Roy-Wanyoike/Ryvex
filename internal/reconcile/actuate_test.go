@@ -252,6 +252,75 @@ func waitFor(t *testing.T, s *state.Store, id string, cond func(*state.Resource)
 	return nil
 }
 
+// statusWatch observes one resource's status_changed events on the
+// bus. Some phases are transient: under heavy parallel load (-race,
+// full suite, concurrent packages) a phase's store window — here the
+// retry backoff, ~1ms under the fast policy — can close and turn
+// terminal before a store poll wakes up, so the poll never sees it
+// (issue #130). The bus invokes handlers synchronously inside the
+// reconciler's Publish, so a watcher subscribed before Start captures
+// every stamp regardless of the test goroutine's scheduling.
+type statusWatch struct {
+	mu     sync.Mutex
+	phases []string
+	msgs   map[string]string
+}
+
+// watchStatus subscribes to res's status_changed events. Call it
+// BEFORE the reconciler starts: subscriptions only see later events.
+func watchStatus(b *bus.Bus, store *state.Store, res *state.Resource) *statusWatch {
+	w := &statusWatch{msgs: map[string]string{}}
+	b.Subscribe(bus.Subject(res.Org, res.Kind, bus.EventStatusChanged), func(e bus.Event) {
+		if e.Type != bus.EventStatusChanged || e.ResourceID != res.ID {
+			return
+		}
+		// Runs inline inside the reconciler's Publish, immediately after
+		// the status write and while that pass still holds the
+		// per-resource single-actor claim — no other writer can
+		// interleave, so the read reflects exactly the stamp this event
+		// announces.
+		if r, err := store.GetResource(res.ID); err == nil {
+			w.mu.Lock()
+			w.phases = append(w.phases, e.Phase)
+			w.msgs[e.Phase] = r.Status.Message
+			w.mu.Unlock()
+		}
+	})
+	return w
+}
+
+// waitSeen polls (bounded) until the watched stream shows phase.
+func (w *statusWatch) waitSeen(t *testing.T, phase string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		w.mu.Lock()
+		saw := false
+		for _, p := range w.phases {
+			if p == phase {
+				saw = true
+			}
+		}
+		seen := append([]string(nil), w.phases...)
+		w.mu.Unlock()
+		if saw {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status stream never showed %s; saw %v", phase, seen)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// messageAt returns the status message captured when phase was last
+// stamped.
+func (w *statusWatch) messageAt(phase string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.msgs[phase]
+}
+
 func mkActuatedRes(t *testing.T, store *state.Store, name, image string) *state.Resource {
 	t.Helper()
 	res := mkRes(state.KindApplication, name)
@@ -320,22 +389,19 @@ func TestTransientRetriesThenReady(t *testing.T) {
 	res := mkActuatedRes(t, store, "web", "demo:1")
 	act.failFirst(2, provider.Transient, errors.New("engine hiccup"))
 
+	// Degraded lasts only one backoff window per attempt (~1ms under
+	// the fast policy); under heavy parallel load a store poll can sleep
+	// straight through every window, so observe the transitions on the
+	// synchronous event stream instead of racing the store (issue
+	// #130). Subscribed before Start, so nothing is missed.
+	watch := watchStatus(b, store, res)
+
 	rec, cancel := startActuated(t, store, b, act, fastPolicy(4), time.Hour)
 	defer rec.Stop(2 * time.Second)
 	defer cancel()
 
 	// Degraded is observable between attempts...
-	seenDegraded := false
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && !seenDegraded {
-		if r, err := store.GetResource(res.ID); err == nil && r.Status.Phase == state.PhaseDegraded {
-			seenDegraded = true
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !seenDegraded {
-		t.Fatal("transient failures never surfaced Degraded")
-	}
+	watch.waitSeen(t, state.PhaseDegraded)
 	// ...and the resource still converges once the provider recovers.
 	waitPhase(t, store, res.ID, state.PhaseReady)
 	if n := act.applyCount(); n != 3 {
@@ -419,13 +485,23 @@ func TestUnavailableGoesDegradedThenFailed(t *testing.T) {
 	act.setApplyErr(provider.E(provider.Unavailable, "apply:create",
 		errors.New("dial unix /var/run/docker.sock: connect: no such file or directory")))
 
+	// Degraded lasts exactly one backoff window (~1ms under the fast
+	// policy); under heavy parallel load the budget-exhausting second
+	// attempt can stamp Failed — terminal for the generation — before
+	// this test's store poll wakes up, so the window never reopens and
+	// a store poll times out. That is the #130 flake. Watch the
+	// synchronous status event stream for the Degraded stamp instead,
+	// then assert the terminal phase in the store as before.
+	watch := watchStatus(b, store, res)
+
 	rec, cancel := startActuated(t, store, b, act, fastPolicy(2), time.Hour)
 	defer rec.Stop(2 * time.Second)
 	defer cancel()
 
-	waitFor(t, store, res.ID, func(r *state.Resource) bool {
-		return r.Status.Phase == state.PhaseDegraded && strings.Contains(r.Status.Message, "unavailable")
-	})
+	watch.waitSeen(t, state.PhaseDegraded)
+	if msg := watch.messageAt(state.PhaseDegraded); !strings.Contains(msg, "unavailable") {
+		t.Fatalf("unexpected degraded message: %q", msg)
+	}
 	waitPhase(t, store, res.ID, state.PhaseFailed)
 }
 
