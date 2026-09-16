@@ -1,0 +1,139 @@
+# Ryvex node agent: DaemonSet + ConfigMap (issue #76).
+#
+# One agent pod per node enrolls that node as a `Node` resource with the
+# control plane and heartbeats on an interval. Traffic is GET/PUT only
+# (agent/ryvex-agent/src/client.rs: GET /healthz, GET/PUT the node
+# path) — the agent opens NO listen port, so there is no Service here
+# and nothing to allow INBOUND; 05-ryvexd-networkpolicy.yaml governs the
+# ryvexd side of this traffic (same-namespace rule).
+#
+# Image: ghcr.io/roy-wanyoike/ryvex-agent, published by the release
+# workflow on `v*` tags; built locally by Dockerfile.agent. Override the
+# tag via deploy/k8s/kustomization.yaml (`kubectl apply -k deploy/k8s`).
+#
+# The token comes from ryvexd-secret key `agent-token` (see
+# 03-ryvexd-secret.yaml): it MUST be a real ryk_ key whose scope covers
+# the agent's org/project/env, minted via POST /v1/keys or a static
+# --api-keys entry. The binary exits 2 without one — fail closed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ryvex-agent-config
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: ryvex-agent
+    app.kubernetes.io/part-of: ryvex
+data:
+  # Env var names are verbatim from agent/ryvex-agent/src/config.rs
+  # (clap `env =` attributes) — 9 total, all listed in .env.example.
+  RYVEX_AGENT_API: "http://ryvexd.ryvex.svc.cluster.local:8080"
+  RYVEX_AGENT_CLUSTER: "k8s"
+  # Scope of the Node resource the agent manages. Change these to match
+  # real org/project/env values (they must exist for RBAC to allow the
+  # agent key to write there).
+  RYVEX_AGENT_ORG: "acme"
+  RYVEX_AGENT_PROJECT: "core"
+  RYVEX_AGENT_ENV: "prod"
+  # Optional tuning (defaults from config.rs; uncomment to override):
+  # RYVEX_AGENT_INTERVAL: "10"            # heartbeat seconds (clamped >= 5)
+  # RYVEX_AGENT_SPEC_REFRESH_SECS: "300"  # min secs between spec.last_seen refreshes
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ryvex-agent
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: ryvex-agent
+    app.kubernetes.io/part-of: ryvex
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ryvex-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ryvex-agent
+        app.kubernetes.io/part-of: ryvex
+    spec:
+      # Node-agent semantics: follow the fleet, control-plane taints
+      # included. (No nodeSelector: every node is a data-plane node.)
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master # pre-1.24 key, ignored where absent
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ryvex-agent
+          image: ghcr.io/roy-wanyoike/ryvex-agent:v1.1.0
+          imagePullPolicy: IfNotPresent
+          # No command/args: the image ENTRYPOINT is the agent binary;
+          # all configuration flows through RYVEX_AGENT_* env vars.
+          env:
+            - name: RYVEX_AGENT_API
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvex-agent-config
+                  key: RYVEX_AGENT_API
+            - name: RYVEX_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ryvexd-secret
+                  key: agent-token
+            - name: RYVEX_AGENT_NAME
+              # spec.nodeName, not pod name: one stable Node resource
+              # per Kubernetes node, surviving pod restarts (a pod-name
+              # suffix would enroll a fresh node on every reschedule).
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RYVEX_AGENT_CLUSTER
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvex-agent-config
+                  key: RYVEX_AGENT_CLUSTER
+            - name: RYVEX_AGENT_ORG
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvex-agent-config
+                  key: RYVEX_AGENT_ORG
+            - name: RYVEX_AGENT_PROJECT
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvex-agent-config
+                  key: RYVEX_AGENT_PROJECT
+            - name: RYVEX_AGENT_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: ryvex-agent-config
+                  key: RYVEX_AGENT_ENV
+            # Optional (uncomment + add the keys to ryvex-agent-config):
+            # - name: RYVEX_AGENT_INTERVAL
+            #   valueFrom: {configMapKeyRef: {name: ryvex-agent-config, key: RYVEX_AGENT_INTERVAL}}
+            # - name: RYVEX_AGENT_SPEC_REFRESH_SECS
+            #   valueFrom: {configMapKeyRef: {name: ryvex-agent-config, key: RYVEX_AGENT_SPEC_REFRESH_SECS}}
+          # No liveness/readiness/startup probes: the agent has no HTTP
+          # endpoint to probe (it is a pure client). Crash-looping is
+          # already self-healing — restartPolicy: Always plus the
+          # binary's internal exponential backoff (1s→30s, jittered).
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # The agent writes nothing to disk (logs to stderr, state
+            # lives in the control plane), so a read-only root FS is
+            # safe and turns an exploit into a dead end.
+            readOnlyRootFilesystem: true

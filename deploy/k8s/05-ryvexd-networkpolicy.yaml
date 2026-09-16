@@ -1,0 +1,98 @@
+# NetworkPolicy: default-deny around ryvexd (issue #76).
+#
+# INGRESS to ryvexd pods — only:
+#   * pods in the `ryvex` namespace (a same-namespace Prometheus scraping
+#     :9090, kubectl port-forward users, anything else we deploy here);
+#   * pods in ANY namespace labeled `app.kubernetes.io/part-of: ryvex`
+#     — the documented home for the web console and future ryvex
+#     workloads — on :8080 only.
+# Assumption: the console is NOT part of these manifests; deploy it into
+# a namespace carrying that label (e.g. `ryvex-console`) or into `ryvex`
+# itself. Anything else (including other namespaces) cannot reach the
+# control plane.
+#
+# EGRESS from ryvexd pods — only:
+#   * DNS to kube-system (:53 UDP+TCP) — required for the svc DNS names
+#     in the DSN and RYVEX_NATS_URL;
+#   * Postgres (:5432) and NATS (:4222) within the `ryvex` namespace
+#     (NATS is only dialed when args add "--bus", "nats");
+#   * HTTP/HTTPS (:80/:443) to the world for webhook deliveries — the
+#     dispatcher must reach subscription targets on the public internet.
+#     Private/loopback/CGNAT targets are already refused at the
+#     application layer by the SSRF egress guard (webhook/egress.go,
+#     RYVEX_ALLOW_PRIVATE_WEBHOOKS); the `except:` CIDR list below is
+#     the same policy enforced in the network layer (defense in depth).
+# Assumption: Postgres and NATS live in the `ryvex` namespace (as these
+# manifests deploy them). Relocating either breaks the egress rules.
+#
+# PolicyTypes are both Ingress+Egress, so applying this file also blocks
+# ryvexd's egress — including to other pods in `ryvex` NOT matched by
+# the rules above.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ryvexd
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: ryvexd
+    app.kubernetes.io/part-of: ryvex
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ryvexd
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - # Same namespace: everything ryvex-side, metrics scraping included.
+      from:
+        - podSelector: {}
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 9090
+          protocol: TCP
+    - # Console / other ryvex-labeled namespaces: API port only.
+      from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: ryvex
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - # DNS (kube-system is the standard host for the cluster resolver;
+      # UDP for A/AAAA, TCP for truncated/large answers).
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - # Postgres + NATS, same namespace (pod IPs are matched by the
+      # podSelector even though they sit in RFC1918 space — the two
+      # rule sets are OR'd).
+      to:
+        - podSelector: {}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 4222
+          protocol: TCP
+    - # Webhook deliveries to public targets (app-layer SSRF guard
+      # already blocks private ranges; mirrored here).
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP

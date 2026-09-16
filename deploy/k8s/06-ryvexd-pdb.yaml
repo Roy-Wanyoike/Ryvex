@@ -1,0 +1,25 @@
+# PodDisruptionBudget for ryvexd (issue #76).
+#
+# minAvailable: 1 with `replicas: 1` (04-ryvexd.yaml) means voluntary
+# disruptions — node drains, cluster upgrades, `kubectl drain` — are
+# REFUSED while the single control-plane replica is the only one: the
+# operator must scale ryvexd to 2+ (or delete the PDB consciously)
+# before draining. That is deliberate: the control plane owns the
+# authoritative audit trail and there is no HA story yet. Involuntary
+# failures (crash, OOM, node loss) are unaffected by a PDB.
+#
+# Once HA/federation lands and replicas > 1, this budget becomes a real
+# availability floor with no edits needed here.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ryvexd
+  namespace: ryvex
+  labels:
+    app.kubernetes.io/name: ryvexd
+    app.kubernetes.io/part-of: ryvex
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ryvexd
