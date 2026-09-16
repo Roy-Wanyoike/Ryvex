@@ -112,6 +112,16 @@ const (
 	// Audit actions appended per delivery attempt.
 	ActionDelivered = "webhook_delivered"
 	ActionFailed    = "webhook_failed"
+
+	// DurableName is the deterministic JetStream consumer the
+	// dispatcher runs under when the bus supports durable consumers
+	// (issue #81): restart-idempotent (the same consumer is rebound,
+	// never duplicated), at-least-once with explicit acks, and events
+	// published while the process was down are delivered after
+	// restart. The dead-letter stream for exhausted/poison events is
+	// natsbus.RYVEX_DLQ (documented here to keep this package
+	// bus-agnostic: the memory bus has no DLQ).
+	DurableName = "RYVEX_DISPATCHER"
 )
 
 // Options configures the Dispatcher. Every field is optional; zero
@@ -165,6 +175,10 @@ type Dispatcher struct {
 	bus   bus.BusI
 	opts  Options
 	log   *slog.Logger
+
+	// durable records whether the event source is the durable JetStream
+	// consumer (issue #81); surfaced in the start log for operators.
+	durable atomic.Bool
 
 	mu   sync.RWMutex
 	subs map[string]*subHandle
@@ -265,13 +279,37 @@ func RandomSecret() string {
 }
 
 // Start loads the subscription view, launches one worker per
-// subscription and subscribes to the bus. It returns immediately.
-// Cancel ctx (or call Stop) to shut down.
+// subscription and subscribes to the bus — via a durable JetStream
+// consumer when the bus supports it (issue #81), else the best-effort
+// live subscription. It returns immediately. Cancel ctx (or call
+// Stop) to shut down.
 func (d *Dispatcher) Start(ctx context.Context) {
 	d.ctx, d.cancel = context.WithCancel(ctx)
-	d.refresh()
-	d.busSub = d.bus.Subscribe(SubjectPattern, d.onEvent)
-	d.log.Info("webhook dispatcher started", "pattern", SubjectPattern, "subscriptions", d.count())
+	if err := d.refresh(); err != nil {
+		d.log.Warn("webhook subscription refresh failed at start", "err", err)
+	}
+	d.busSub = d.subscribe()
+	d.log.Info("webhook dispatcher started", "pattern", SubjectPattern,
+		"subscriptions", d.count(), "durable", d.durable.Load())
+}
+
+// subscribe wires the event source. Buses implementing
+// bus.DurableSubscriber (JetStream) get the durable consumer
+// RYVEX_DISPATCHER: at-least-once, explicitly acked, retried on
+// transient failure, dead-lettered when exhausted. Any durable
+// subscribe failure (or a bus without the capability — the memory
+// bus) falls back to the plain live subscription so webhook delivery
+// degrades instead of dying.
+func (d *Dispatcher) subscribe() bus.Sub {
+	if ds, ok := d.bus.(bus.DurableSubscriber); ok {
+		sub, err := ds.SubscribeDurable(DurableName, SubjectPattern, d.onEventDurable)
+		if err == nil {
+			d.durable.Store(true)
+			return sub
+		}
+		d.log.Error("webhook dispatcher durable subscribe failed; falling back to live subscription", "durable", DurableName, "err", err)
+	}
+	return d.bus.Subscribe(SubjectPattern, d.onEvent)
 }
 
 // Stop unsubscribes from the bus, cancels in-flight attempts and
@@ -298,8 +336,9 @@ func (d *Dispatcher) Stop(timeout time.Duration) {
 	}
 }
 
-// onEvent is the single bus subscription: keep the subscription view
-// fresh, then fan the event out to matching subscriptions.
+// onEvent is the plain live subscription: keep the subscription view
+// fresh (best-effort), then fan the event out to matching
+// subscriptions.
 func (d *Dispatcher) onEvent(e bus.Event) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -307,9 +346,39 @@ func (d *Dispatcher) onEvent(e bus.Event) {
 		}
 	}()
 	if strings.EqualFold(e.Kind, state.KindSubscription) {
-		d.refresh() // created/updated/deleted subscription: sync first
+		_ = d.refresh() // created/updated/deleted subscription: sync first
 	}
 	d.fanout(e)
+}
+
+// onEventDurable is the durable-consumer variant (issue #81): it maps
+// dispatcher outcomes onto the bus failure taxonomy so the event is
+// acked only after it was fully processed.
+//
+//	nil                      fanout completed: the event is acked
+//	bus.ErrEventRetry        store refresh failed, or a panic: redeliver
+//	                         (bounded by MaxDeliver, then dead-lettered)
+//
+// Queue-overflow drops remain an ack (they are terminal per event and
+// already audited — redelivering would duplicate the event onto every
+// OTHER matching subscription), preserving today's drop-and-audit
+// policy.
+func (d *Dispatcher) onEventDurable(e bus.Event) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			d.log.Error("webhook dispatcher panic on event", "panic", r)
+			err = bus.ErrEventRetry // redeliver instead of silently dropping
+		}
+	}()
+	if strings.EqualFold(e.Kind, state.KindSubscription) {
+		if rerr := d.refresh(); rerr != nil {
+			// The subscription view could not be synced; retrying later
+			// (at-least-once) beats delivering against a stale view.
+			return bus.ErrEventRetry
+		}
+	}
+	d.fanout(e)
+	return nil
 }
 
 // fanout enqueues the event on every active subscription whose
@@ -354,8 +423,10 @@ func (d *Dispatcher) enqueue(h *subHandle, e bus.Event) {
 // refresh reloads every Subscription resource from the store and
 // reconciles the worker pool with it: new subscriptions get a queue
 // and worker, updated ones get their view swapped atomically, and
-// removed ones get their worker stopped (deliveries cease).
-func (d *Dispatcher) refresh() {
+// removed ones get their worker stopped (deliveries cease). The store
+// error is returned (issue #81: the durable consume path maps it to a
+// redelivery); the live path keeps treating it as best-effort.
+func (d *Dispatcher) refresh() error {
 	type entry struct {
 		res  *state.Resource
 		spec state.SubscriptionSpec
@@ -368,7 +439,7 @@ func (d *Dispatcher) refresh() {
 		})
 		if err != nil {
 			d.log.Error("webhook subscription refresh failed", "err", err)
-			return
+			return err
 		}
 		for _, r := range page {
 			spec, err := state.ParseSubscriptionSpec(r.Spec)
@@ -412,6 +483,7 @@ func (d *Dispatcher) refresh() {
 		d.wg.Add(1)
 		go d.work(h)
 	}
+	return nil
 }
 
 // work drains one subscription's queue until the subscription is
