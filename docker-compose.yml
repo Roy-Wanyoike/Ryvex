@@ -14,7 +14,8 @@
 # before exposing the stack beyond loopback:
 #
 #   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
-#   RYVEX_API_KEYS       comma-separated name=token pairs (see ryvexd below)
+#   RYVEX_API_KEYS       REQUIRED — no default ships (fail closed, #119):
+#                        generate with "openssl rand -hex 32" (see ryvexd)
 #   RYVEX_WEBHOOK_SECRET / RYVEX_CORS_ORIGINS / RYVEX_NATS_URL
 #
 # Backups (run from the host; the dump lands in your current directory):
@@ -66,9 +67,22 @@ services:
       # never leaves the compose network; switch to verify-full with a
       # managed Postgres.
       RYVEX_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ryvex}?sslmode=disable
-      # SAMPLE ONLY — replace with long random tokens before real use, e.g.:
-      #   RYVEX_API_KEYS=ops=ryk_$(openssl rand -hex 24),ci=ryk_$(openssl rand -hex 24)
-      RYVEX_API_KEYS: ${RYVEX_API_KEYS:-admin=ryk_REPLACE_ME_with_a_long_random_token}
+      # ISSUE #119 (fail closed): NO applyable known-credential default.
+      # The previously-defaulted sample booted every `docker compose up`
+      # with a publicly-known admin token — mirroring the k8s Secret
+      # template fix (deploy/k8s/03-ryvexd-secret.yaml, issue #76).
+      # Generate real keys and keep them out of git — put them in a .env
+      # file next to this one (see .env.example) or export them in your
+      # shell:
+      #
+      #   echo "RYVEX_API_KEYS=admin=ryk_$(openssl rand -hex 32)" >> .env
+      #
+      # Multiple keys: comma-separated name=token pairs. With the
+      # variable unset, ryvexd boots WITHOUT any bootstrap admin key:
+      # /healthz and /readyz answer, every /v1 request is rejected (the
+      # daemon logs "no API keys configured"), and the stack stays
+      # unusable by design until a real key is configured.
+      # RYVEX_API_KEYS: admin=ryk_CHANGE_ME_generate_with_openssl_rand_hex_32
       # Empty (default) = webhook signatures use a fresh random secret per
       # boot; set a fixed value for stable signatures across restarts.
       RYVEX_WEBHOOK_SECRET: ${RYVEX_WEBHOOK_SECRET:-}
@@ -81,7 +95,15 @@ services:
       # Uncomment to expose /metrics on a second listener (issue #17):
       # RYVEX_METRICS_ADDR: ":9090"
     ports:
-      - "8080:8080"
+      # Loopback only (issue #119): a plain `docker compose up` must not
+      # publish the control plane on all interfaces — the previous
+      # "8080:8080" binding made the API reachable from the whole LAN,
+      # which (combined with the known-credential default that used to
+      # ship in this file) handed the admin face to the local network. To
+      # intentionally expose the API beyond loopback, change this
+      # binding (e.g. to "8080:8080") and put a reverse proxy / auth
+      # gateway in front — do not simply open the port.
+      - "127.0.0.1:8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
