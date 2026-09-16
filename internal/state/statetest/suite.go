@@ -59,6 +59,7 @@ func RunSuite(t *testing.T, newStore func(t *testing.T) Store) {
 	t.Run("AuditReasonNotRecorded", func(t *testing.T) { testAuditReasonNotRecorded(t, newStore(t)) })
 	t.Run("AppendAudit", func(t *testing.T) { testAppendAudit(t, newStore(t)) })
 	t.Run("AuditListEmptyOptions", func(t *testing.T) { testAuditListEmptyOptions(t, newStore(t)) })
+	t.Run("AuditCursorPagination", func(t *testing.T) { testAuditCursorPagination(t, newStore(t)) })
 	t.Run("Count", func(t *testing.T) { testCount(t, newStore(t)) })
 	t.Run("CountByKindPhase", func(t *testing.T) { testCountByKindPhase(t, newStore(t)) })
 	t.Run("PingHealthy", func(t *testing.T) { testPingHealthy(t, newStore(t)) })
@@ -721,6 +722,55 @@ func testAuditListEmptyOptions(t *testing.T, s Store) {
 	}
 	if n := mustListAudit(t, s, state.AuditOptions{Limit: 1}); len(n) != 1 || n[0].ResourceID != r2.ID {
 		t.Fatalf("limit 1 must keep only the newest entry: %+v", n)
+	}
+}
+
+// testAuditCursorPagination covers the #107 audit feed cursor at the
+// store layer: offsets address the filtered newest-first sequence with
+// the same shared v2 tokens the resource listing issues, so a cursor
+// walk concatenates into exactly the unpaginated listing (continuity,
+// no repeats, no gaps), an offset past the end clamps to an empty page
+// and a malformed token is ErrBadRequest. Runs for every backend, so
+// the Postgres store must accept and apply byte-identical tokens.
+func testAuditCursorPagination(t *testing.T, s Store) {
+	t.Helper()
+	for i := 0; i < 7; i++ {
+		if _, err := s.CreateResource(mkRes("Application", "acme", "core", "prod", fmt.Sprintf("cursor-%d", i)), state.WriteOptions{Actor: "t"}); err != nil {
+			t.Fatalf("seed acme %d: %v", i, err)
+		}
+	}
+	if _, err := s.CreateResource(mkRes("Application", "globex", "core", "prod", "other"), state.WriteOptions{Actor: "t"}); err != nil {
+		t.Fatalf("seed globex: %v", err)
+	}
+
+	full := mustListAudit(t, s, state.AuditOptions{Org: "acme"})
+	if len(full) != 7 {
+		t.Fatalf("unfiltered acme listing = %d entries, want 7", len(full))
+	}
+
+	// Walk offset 0,3,6 with page size 3; every page must be the
+	// corresponding slice of the full listing (continuity check).
+	var walked []state.AuditEntry
+	for offset := 0; offset < len(full); offset += 3 {
+		page := mustListAudit(t, s, state.AuditOptions{Org: "acme", Limit: 3, Cursor: state.EncodeCursor(uint64(offset))})
+		walked = append(walked, page...)
+	}
+	if len(walked) != len(full) {
+		t.Fatalf("cursor walk yielded %d entries, want %d", len(walked), len(full))
+	}
+	for i := range walked {
+		if walked[i].ID != full[i].ID {
+			t.Fatalf("walk position %d = %s, want %s (continuity broken)", i, walked[i].ID, full[i].ID)
+		}
+	}
+
+	// Offsets past the end (and past any #85 eviction window) clamp to
+	// an empty page without erroring.
+	if got := mustListAudit(t, s, state.AuditOptions{Org: "acme", Limit: 3, Cursor: state.EncodeCursor(99)}); len(got) != 0 {
+		t.Fatalf("offset past the end must clamp to an empty page, got %d", len(got))
+	}
+	if _, err := s.ListAudit(state.AuditOptions{Org: "acme", Cursor: "@@bad@@"}); !errors.Is(err, state.ErrBadRequest) {
+		t.Fatalf("malformed audit cursor: want ErrBadRequest, got %v", err)
 	}
 }
 
