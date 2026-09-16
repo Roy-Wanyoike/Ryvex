@@ -127,8 +127,8 @@ func TestSeedDemoDataIdempotent(t *testing.T) {
 	if second != 0 {
 		t.Fatalf("second seed created %d resources, want 0", second)
 	}
-	if got := store.Count(); got != first {
-		t.Fatalf("store holds %d resources after reseed, want %d", got, first)
+	if got, err := store.Count(); err != nil || got != first {
+		t.Fatalf("store holds %d resources after reseed (err=%v), want %d", got, err, first)
 	}
 
 	page, next, err := store.ListResources(state.ListOptions{})

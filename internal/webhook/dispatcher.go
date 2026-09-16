@@ -551,7 +551,7 @@ func (d *Dispatcher) wait(ctx context.Context, dur time.Duration) bool {
 
 // audit appends a delivery-outcome entry referencing the subscription.
 func (d *Dispatcher) audit(view *subView, action, reason string) {
-	_ = d.store.AppendAudit(state.AuditEntry{
+	if _, err := d.store.AppendAudit(state.AuditEntry{
 		Time:       d.opts.Clock().UTC(),
 		Actor:      AuditActor,
 		Action:     action,
@@ -560,7 +560,14 @@ func (d *Dispatcher) audit(view *subView, action, reason string) {
 		LogicalKey: view.res.LogicalKey(),
 		Generation: view.res.Generation,
 		Reason:     reason,
-	})
+	}); err != nil {
+		// Issue #71: the store now reports append failures instead of
+		// swallowing them. Delivery outcome auditing is best-effort —
+		// it must not block or retry the delivery loop — but a lost
+		// compliance entry is logged loudly instead of vanishing.
+		d.log.Error("webhook audit append failed",
+			"subscription", view.res.ID, "action", action, "err", err)
+	}
 }
 
 // secretFor derives the per-subscription signing secret:

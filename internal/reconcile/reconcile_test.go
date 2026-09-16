@@ -138,8 +138,8 @@ func TestScanPagesPastListLimit(t *testing.T) {
 		}
 		ids = append(ids, r.ID)
 	}
-	if store.Count() != total {
-		t.Fatalf("seeded %d resources, want %d", store.Count(), total)
+	if got, err := store.Count(); err != nil || got != total {
+		t.Fatalf("seeded %d resources (err=%v), want %d", got, err, total)
 	}
 
 	rec := New(store, b, Options{Interval: 5 * time.Millisecond, Concurrency: 4, Logger: slog.Default()})

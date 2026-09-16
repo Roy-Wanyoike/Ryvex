@@ -90,16 +90,21 @@ func Handler() http.Handler { return Default.Handler() }
 // metrics snapshot needs. *state.Store satisfies it; the tiny
 // interface keeps this package free of internal imports.
 type ResourceCounter interface {
-	CountByKindPhase() map[string]map[string]int64
+	CountByKindPhase() (map[string]map[string]int64, error)
 }
 
 // ReconcileMetrics refreshes the ryvex_resources gauge from a store
 // snapshot. The reconciler calls it once per scan. Pairs that
 // disappear from the snapshot are zeroed (not deleted), so resource
 // deletions are reflected without churning series. It returns the
-// number of live kind/phase pairs in the snapshot.
-func ReconcileMetrics(rc ResourceCounter) int {
-	snap := rc.CountByKindPhase()
+// number of live kind/phase pairs in the snapshot. A failed snapshot
+// is returned as an error (issue #71) and leaves the previous gauge
+// values untouched — a stale gauge beats a falsely empty one.
+func ReconcileMetrics(rc ResourceCounter) (int, error) {
+	snap, err := rc.CountByKindPhase()
+	if err != nil {
+		return 0, err
+	}
 
 	resourcesMu.Lock()
 	defer resourcesMu.Unlock()
@@ -120,7 +125,7 @@ func ReconcileMetrics(rc ResourceCounter) int {
 			live++
 		}
 	}
-	return live
+	return live, nil
 }
 
 var (

@@ -138,7 +138,10 @@ func waitUntil(t *testing.T, what string, timeout time.Duration, cond func() boo
 
 // webhookAudit returns the dispatcher-written audit entries.
 func webhookAudit(st *state.Store) []state.AuditEntry {
-	entries := st.ListAudit(state.AuditOptions{Kind: state.KindSubscription, Limit: 500})
+	entries, err := st.ListAudit(state.AuditOptions{Kind: state.KindSubscription, Limit: 500})
+	if err != nil {
+		panic(err) // the in-memory store cannot fail; keep the helper signature
+	}
 	var out []state.AuditEntry
 	for _, e := range entries {
 		if e.Actor == AuditActor {

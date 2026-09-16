@@ -555,12 +555,12 @@ func TestHandlerServesExposition(t *testing.T) {
 
 type fakeStore map[string]map[string]int64
 
-func (f fakeStore) CountByKindPhase() map[string]map[string]int64 { return f }
+func (f fakeStore) CountByKindPhase() (map[string]map[string]int64, error) { return f, nil }
 
 func TestReconcileMetricsSnapshot(t *testing.T) {
 	// Two live kind/phase pairs.
-	if n := ReconcileMetrics(fakeStore{"Application": {"Pending": 2}, "Database": {"Ready": 1}}); n != 2 {
-		t.Fatalf("live pairs = %d, want 2", n)
+	if n, err := ReconcileMetrics(fakeStore{"Application": {"Pending": 2}, "Database": {"Ready": 1}}); err != nil || n != 2 {
+		t.Fatalf("live pairs = %d (err=%v), want 2", n, err)
 	}
 	if got := Resources.WithLabelValues("Application", "Pending").Value(); got != 2 {
 		t.Fatalf("Application/Pending = %v, want 2", got)
@@ -571,8 +571,8 @@ func TestReconcileMetricsSnapshot(t *testing.T) {
 
 	// A pair that vanishes from the snapshot must be zeroed, not left
 	// stale (series are kept for scrape stability, value goes to 0).
-	if n := ReconcileMetrics(fakeStore{"Application": {"Ready": 3}}); n != 1 {
-		t.Fatalf("live pairs = %d, want 1", n)
+	if n, err := ReconcileMetrics(fakeStore{"Application": {"Ready": 3}}); err != nil || n != 1 {
+		t.Fatalf("live pairs = %d (err=%v), want 1", n, err)
 	}
 	if got := Resources.WithLabelValues("Application", "Pending").Value(); got != 0 {
 		t.Fatalf("stale Application/Pending = %v, want 0", got)

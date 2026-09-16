@@ -162,7 +162,10 @@ func TestPeriodicRefreshStops(t *testing.T) {
 func TestAuditDenied(t *testing.T) {
 	az, store := newAuthz(t)
 	az.AuditDenied("ops", "acme", "core", "POST", "/v1/resources", "no scope covers org/acme/project/core")
-	entries := store.ListAudit(state.AuditOptions{Limit: 10})
+	entries, err := store.ListAudit(state.AuditOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
 	if len(entries) != 1 {
 		t.Fatalf("want 1 audit entry, got %d", len(entries))
 	}

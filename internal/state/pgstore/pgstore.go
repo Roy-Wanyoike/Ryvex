@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -561,27 +560,45 @@ func (s *Store) DeleteResource(id string, opts state.WriteOptions) error {
 	return nil
 }
 
+// Ping answers a real database round trip for /healthz and /readyz
+// (issue #71): database/sql PingContext. When the caller's context
+// carries no deadline a 5s bound is applied so a wedged database
+// cannot stall a probe.
+func (s *Store) Ping(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+	}
+	return s.db.PingContext(ctx)
+}
+
 // Count returns the number of stored resources (used by /healthz).
-// A database error reports 0 — the signature has no error return.
-func (s *Store) Count() int {
+// Database errors are propagated (issue #71) instead of being
+// reported as an empty store.
+func (s *Store) Count() (int, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 	var n int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM resources`).Scan(&n); err != nil {
-		return 0
+		return 0, fmt.Errorf("pgstore: count: %w", err)
 	}
-	return n
+	return n, nil
 }
 
 // CountByKindPhase returns the per-kind/per-phase snapshot backing the
-// ryvex_resources metrics gauge.
-func (s *Store) CountByKindPhase() map[string]map[string]int64 {
+// ryvex_resources metrics gauge. Database errors are propagated
+// (issue #71): a failed snapshot is never reported as an empty store.
+func (s *Store) CountByKindPhase() (map[string]map[string]int64, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT kind, phase, COUNT(*) FROM resources GROUP BY kind, phase`)
 	if err != nil {
-		return map[string]map[string]int64{}
+		return nil, fmt.Errorf("pgstore: count by kind/phase: %w", err)
 	}
 	defer rows.Close()
 	out := map[string]map[string]int64{}
@@ -589,7 +606,7 @@ func (s *Store) CountByKindPhase() map[string]map[string]int64 {
 		var kind, phase string
 		var n int64
 		if err := rows.Scan(&kind, &phase, &n); err != nil {
-			return map[string]map[string]int64{}
+			return nil, fmt.Errorf("pgstore: scan kind/phase row: %w", err)
 		}
 		ph := out[kind]
 		if ph == nil {
@@ -598,15 +615,20 @@ func (s *Store) CountByKindPhase() map[string]map[string]int64 {
 		}
 		ph[phase] += n
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgstore: iterate kind/phase rows: %w", err)
+	}
+	return out, nil
 }
 
 // ListAudit returns audit entries newest-first. The org filter is a
 // prefix match on the logical key, mirroring the reference store.
 // With no filters at all the WHERE clause is omitted entirely —
 // emitting a bare "WHERE" rendered invalid SQL (issue #39) and every
-// unfiltered call failed.
-func (s *Store) ListAudit(o state.AuditOptions) []state.AuditEntry {
+// unfiltered call failed. Database errors are propagated (issue #71):
+// a failed query is an error, never a silent empty audit log — the
+// compliance trail must not be able to disappear quietly.
+func (s *Store) ListAudit(o state.AuditOptions) ([]state.AuditEntry, error) {
 	limit := o.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -634,12 +656,7 @@ func (s *Store) ListAudit(o state.AuditOptions) []state.AuditEntry {
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		// The state.Backend signature carries no error return, so
-		// the failure cannot reach the API layer; it must at least
-		// not be silent (issue #39). A signature change is tracked
-		// as a follow-up — see the #39 PR notes.
-		log.Printf("pgstore: ListAudit query failed, returning empty audit log: %v", err)
-		return nil
+		return nil, fmt.Errorf("pgstore: list audit: %w", err)
 	}
 	defer rows.Close()
 
@@ -648,25 +665,21 @@ func (s *Store) ListAudit(o state.AuditOptions) []state.AuditEntry {
 		var e state.AuditEntry
 		if err := rows.Scan(&e.ID, &e.Time, &e.Actor, &e.Action, &e.ResourceID,
 			&e.Kind, &e.LogicalKey, &e.Generation, &e.Reason); err != nil {
-			log.Printf("pgstore: ListAudit scan failed, returning empty audit log: %v", err)
-			return nil
+			return nil, fmt.Errorf("pgstore: scan audit row: %w", err)
 		}
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("pgstore: ListAudit iteration failed, returning empty audit log: %v", err)
-		return nil
+		return nil, fmt.Errorf("pgstore: iterate audit rows: %w", err)
 	}
-	return out
+	return out, nil
 }
 
 // AppendAudit records a caller-built entry (e.g. webhook delivery
-// outcomes), filling in ID and Time when empty. The completed entry is
-// returned. The state.Backend signature has no error return, so insert
-// failures cannot be threaded to the caller; they are logged loudly
-// instead of being silently dropped (issue #39 — a signature change is
-// tracked as a follow-up, see the #39 PR notes).
-func (s *Store) AppendAudit(e state.AuditEntry) state.AuditEntry {
+// outcomes), filling in ID and Time when empty. Insert failures are
+// propagated (issue #71): the zero entry plus the error, so a lost
+// compliance entry can never be mistaken for a persisted one.
+func (s *Store) AppendAudit(e state.AuditEntry) (state.AuditEntry, error) {
 	if e.ID == "" {
 		e.ID = newAuditID()
 	}
@@ -676,10 +689,10 @@ func (s *Store) AppendAudit(e state.AuditEntry) state.AuditEntry {
 	ctx, cancel := s.ctx()
 	defer cancel()
 	if err := insertAudit(ctx, s.db, e); err != nil {
-		log.Printf("pgstore: AppendAudit insert failed, audit entry %s (%s by %s) NOT persisted: %v",
+		return state.AuditEntry{}, fmt.Errorf("pgstore: append audit entry %s (%s by %s): %w",
 			e.ID, e.Action, e.Actor, err)
 	}
-	return e
+	return e, nil
 }
 
 // escapeLike neutralises LIKE metacharacters in a filter value so the

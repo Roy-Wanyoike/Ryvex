@@ -85,6 +85,16 @@ type Replayer interface {
 	RecentFrom(org string, limit int, from uint64) ([]Event, uint64, error)
 }
 
+// HealthChecker is the optional capability of a bus that can report
+// dependency health for the /healthz and /readyz probes (issue #71).
+// *Bus implements it trivially (no external dependency); the
+// JetStream *natsbus.Bus reports its connection state. Buses without
+// the capability are treated as healthy by the probe handlers.
+type HealthChecker interface {
+	// Healthy returns nil while the bus can serve events.
+	Healthy() error
+}
+
 // Subscription ties a handler to a subject pattern.
 type Subscription struct {
 	ID      string
@@ -243,6 +253,12 @@ func Match(pattern, subject string) bool {
 func match(pattern, subject string) bool {
 	return Match(pattern, subject)
 }
+
+// Healthy reports bus health for /healthz and /readyz (issue #71).
+// The in-memory bus has no external dependency, so it is always
+// healthy; the method exists so both bus backends share the
+// bus.HealthChecker capability.
+func (b *Bus) Healthy() error { return nil }
 
 // Recent returns up to limit most recent events, newest first,
 // optionally filtered by org. limit <= 0 falls back to 100. The

@@ -218,8 +218,10 @@ func (a *Authorizer) Authorize(principal, org, project string, write bool) Decis
 }
 
 // AppendAudit records a caller-built audit entry (used by the API
-// layer for authz_denied outcomes) in the underlying store.
-func (a *Authorizer) AppendAudit(e state.AuditEntry) state.AuditEntry {
+// layer for authz_denied outcomes) in the underlying store. The error
+// return propagates the store's answer (issue #71) so callers can
+// detect a lost compliance entry.
+func (a *Authorizer) AppendAudit(e state.AuditEntry) (state.AuditEntry, error) {
 	return a.store.AppendAudit(e)
 }
 
@@ -230,12 +232,16 @@ func (a *Authorizer) AuditDenied(actor, org, project, method, path, reason strin
 	if org != "" {
 		lk = org + "/" + project
 	}
-	a.AppendAudit(state.AuditEntry{
+	if _, err := a.AppendAudit(state.AuditEntry{
 		Actor:      actor,
 		Action:     "authz_denied",
 		LogicalKey: lk,
 		Reason:     method + " " + path + ": " + reason,
-	})
+	}); err != nil {
+		// Issue #71: append failures are visible instead of swallowed;
+		// a denial must still be answered, so logging is the remedy.
+		a.log.Error("authz: failed to persist authz_denied audit entry", "err", err)
+	}
 }
 
 // Start launches the periodic refresh loop; it exits when ctx is

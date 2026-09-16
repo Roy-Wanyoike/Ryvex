@@ -120,7 +120,10 @@ func TestRBACOperatorScopedToOrg(t *testing.T) {
 		t.Fatalf("403 must use the frozen envelope code: %s", w.Body.String())
 	}
 	// denial must be audited
-	entries := store.ListAudit(state.AuditOptions{Org: "globex", Limit: 10})
+	entries, err := store.ListAudit(state.AuditOptions{Org: "globex", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
 	if len(entries) == 0 {
 		t.Fatalf("authz_denied entries missing")
 	}

@@ -79,8 +79,9 @@ type Bus struct {
 }
 
 var (
-	_ bus.BusI     = (*Bus)(nil)
-	_ bus.Replayer = (*Bus)(nil)
+	_ bus.BusI          = (*Bus)(nil)
+	_ bus.Replayer      = (*Bus)(nil)
+	_ bus.HealthChecker = (*Bus)(nil)
 )
 
 // New connects to url, ensures the RYVEX stream exists and returns a
@@ -395,4 +396,19 @@ func (b *Bus) Close() error {
 	var err error
 	b.closeOnce.Do(func() { err = b.nc.Drain() })
 	return err
+}
+
+// Healthy reports bus dependency health for /healthz and /readyz
+// (issue #71): the JetStream bus is healthy only while its NATS
+// connection is up. Any other state (reconnecting, closed, draining)
+// is reported as unhealthy so /readyz can hold the pod out of
+// rotation during a broker outage.
+func (b *Bus) Healthy() error {
+	if b.nc == nil {
+		return fmt.Errorf("natsbus: no connection")
+	}
+	if st := b.nc.Status(); st != nats.CONNECTED {
+		return fmt.Errorf("natsbus: connection status %s", st)
+	}
+	return nil
 }
