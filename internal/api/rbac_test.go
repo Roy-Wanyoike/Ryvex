@@ -174,10 +174,13 @@ func TestRBACKeyManagementIsAdminOnly(t *testing.T) {
 	if w := doAuth(t, h, http.MethodDelete, "/v1/keys/"+opsID, admin, ""); w.Code != http.StatusNoContent && w.Code != http.StatusOK {
 		t.Fatalf("admin revoke: want 2xx, got %d: %s", w.Code, w.Body.String())
 	}
-	// revoked token is dead immediately
-	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", ops, ""); w.Code != http.StatusUnauthorized {
-		t.Fatalf("revoked token: want 401, got %d", w.Code)
-	}
+	// revoked token is dead as soon as the authorizer refresh lands
+	// (#134: the refresh is asynchronous — poll with a bounded deadline
+	// instead of point-reading, same eventual-consistency pattern as
+	// #66/#70/#130).
+	waitUntil(t, "revoked token to stop authenticating", 2*time.Second, func() bool {
+		return doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", ops, "").Code == http.StatusUnauthorized
+	})
 }
 
 func TestRBACDisableKeyImmediately(t *testing.T) {
@@ -188,9 +191,9 @@ func TestRBACDisableKeyImmediately(t *testing.T) {
 	if w := doAuth(t, h, http.MethodPut, "/v1/keys/"+opsID, admin, `{"active":false}`); w.Code != http.StatusOK {
 		t.Fatalf("disable key: want 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", ops, ""); w.Code != http.StatusUnauthorized {
-		t.Fatalf("disabled key must not authenticate: want 401, got %d", w.Code)
-	}
+	waitUntil(t, "disabled key to stop authenticating", 2*time.Second, func() bool {
+		return doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", ops, "").Code == http.StatusUnauthorized
+	})
 }
 
 func TestRBACDevAuthUnchanged(t *testing.T) {
@@ -388,9 +391,10 @@ func TestBootstrapKeyDeleteRevokesImmediately(t *testing.T) {
 	// The regression in #73: the static digest index used to keep the
 	// --api-keys token admin forever. The resource is gone, so the next
 	// request must be a 401 — no restart, no residual static path.
-	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, ""); w.Code != http.StatusUnauthorized {
-		t.Fatalf("revoked bootstrap token: want 401, got %d: %s", w.Code, w.Body.String())
-	}
+	// (#134: poll — the authorizer refresh is asynchronous.)
+	waitUntil(t, "revoked bootstrap token to stop authenticating", 2*time.Second, func() bool {
+		return doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, "").Code == http.StatusUnauthorized
+	})
 	// /healthz classifies the revoked token as anonymous again.
 	if w := doAuth(t, h, http.MethodGet, "/healthz", admin, ""); strings.Contains(w.Body.String(), "authenticated_as") {
 		t.Fatalf("revoked bootstrap token must probe as anonymous: %s", w.Body.String())
@@ -438,9 +442,9 @@ func TestBootstrapKeyDisableRevokes(t *testing.T) {
 	if w := doAuth(t, h, http.MethodPut, "/v1/keys/"+bootID, admin, `{"active":false}`); w.Code != http.StatusOK {
 		t.Fatalf("disable bootstrap key: want 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if w := doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, ""); w.Code != http.StatusUnauthorized {
-		t.Fatalf("disabled bootstrap token: want 401, got %d", w.Code)
-	}
+	waitUntil(t, "disabled bootstrap token to stop authenticating", 2*time.Second, func() bool {
+		return doAuth(t, h, http.MethodGet, "/v1/resources?org=acme", admin, "").Code == http.StatusUnauthorized
+	})
 }
 
 func TestBootstrapKeyRotationWithoutRestart(t *testing.T) {
@@ -454,10 +458,11 @@ func TestBootstrapKeyRotationWithoutRestart(t *testing.T) {
 		t.Fatalf("delete bootstrap key: want 204, got %d", w.Code)
 	}
 	// The rotated-out token is dead; the rotated-in one is admin. No
-	// restart, no flag change, no residual static grant.
-	if w := doAuth(t, h, http.MethodGet, "/v1/keys", admin, ""); w.Code != http.StatusUnauthorized {
-		t.Fatalf("rotated-out bootstrap token: want 401, got %d", w.Code)
-	}
+	// restart, no flag change, no residual static grant. (#134: poll —
+	// the authorizer refresh is asynchronous.)
+	waitUntil(t, "rotated-out bootstrap token to stop authenticating", 2*time.Second, func() bool {
+		return doAuth(t, h, http.MethodGet, "/v1/keys", admin, "").Code == http.StatusUnauthorized
+	})
 	if w := doAuth(t, h, http.MethodGet, "/v1/keys", replacement, ""); w.Code != http.StatusOK {
 		t.Fatalf("rotated-in admin token: want 200, got %d: %s", w.Code, w.Body.String())
 	}
