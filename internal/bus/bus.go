@@ -113,7 +113,14 @@ func (s *Subscription) Cancel() {
 	subs := s.bus.subs[s.Pattern]
 	for i, x := range subs {
 		if x.ID == s.ID {
-			s.bus.subs[s.Pattern] = append(subs[:i], subs[:i+1]...)
+			// Standard slice delete: drop element i by shifting
+			// everything after it down. The pre-fix form
+			// (append(subs[:i], subs[:i+1]...)) duplicated subs[0]
+			// instead of removing subs[i], leaving a zombie entry whose
+			// nil handler was invoked (recovered panic) and counted on
+			// every later matching publish, while starving the real
+			// subscribers after it (issue #69).
+			s.bus.subs[s.Pattern] = append(subs[:i], subs[i+1:]...)
 			break
 		}
 	}

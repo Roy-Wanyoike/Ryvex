@@ -141,15 +141,21 @@ impl ApiClient {
             .map_err(|e| format!("get node: {e}"))?;
         match resp.status() {
             reqwest::StatusCode::NOT_FOUND => Ok(None),
-            s if s.is_success() => {
-                Ok(Some(resp.json().await.map_err(|e| format!("node json: {e}"))?))
-            }
+            s if s.is_success() => Ok(Some(
+                resp.json().await.map_err(|e| format!("node json: {e}"))?,
+            )),
             s => Err(format!("get node: http {s}")),
         }
     }
 
     /// PUT the node document; classifies the response. Public so the
     /// mock-server integration suite can drive single transitions.
+    /// Classification: 2xx → [`Outcome::Upserted`], 409 → CAS
+    /// [`Outcome::Conflict`] (fresh generation fetched), 404 →
+    /// [`Outcome::Missing`], 5xx → [`Outcome::Transient`] (issue #75:
+    /// server trouble backs off with the same exponential+jitter
+    /// policy as GET 5xx instead of being treated as a permanent
+    /// rejection), anything else → [`Outcome::Rejected`].
     pub async fn put_node(&self, doc: &Value) -> Outcome {
         let resp = match self.put(&self.cfg.node_path(), doc).send().await {
             Ok(r) => r,
@@ -173,6 +179,13 @@ impl ApiClient {
                 }
             }
             reqwest::StatusCode::NOT_FOUND => Outcome::Missing,
+            // 5xx (flaky LB, 502/503 bursts): transient, same as the
+            // GET fetch path. The caller backs off exponentially with
+            // jitter and resets on the next success. Issue #75: this
+            // used to fall through to Rejected, so a proxy hiccup
+            // turned the fleet into a fixed-interval retry hammer
+            // synchronized on the next heartbeat tick.
+            s if s.is_server_error() => Outcome::Transient(format!("put node: http {s}")),
             s => Outcome::Rejected(format!("http {s}")),
         }
     }
@@ -205,10 +218,19 @@ impl ApiClient {
                 Ok(None) => None,
                 Err(e) => return Outcome::Transient(e),
             };
-            let doc = spec::node_document(&self.cfg, agent_version, &last_seen, generation, status_message);
+            let doc = spec::node_document(
+                &self.cfg,
+                agent_version,
+                &last_seen,
+                generation,
+                status_message,
+            );
             match self.put_node(&doc).await {
                 Outcome::Conflict { fresh_generation } if attempt < 2 => {
-                    tracing::debug!(fresh_generation, "CAS conflict, retrying with fresh generation");
+                    tracing::debug!(
+                        fresh_generation,
+                        "CAS conflict, retrying with fresh generation"
+                    );
                     let doc = spec::node_document(
                         &self.cfg,
                         agent_version,

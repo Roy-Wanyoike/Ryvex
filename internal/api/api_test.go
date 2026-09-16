@@ -214,10 +214,56 @@ func TestScopeAddressingAndPutCAS(t *testing.T) {
 	}
 }
 
+// waitUntil polls cond every 5ms until it holds or the timeout
+// expires: the eventual-consistency pattern from the #66 webhook fix
+// ("wait for the audit trail, not the wire") for synchronizing with
+// asynchronous background writers instead of racing them.
+func waitUntil(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// auditTrail fetches an org's audit entries through the API.
+// ListAudit is newest-first.
+func auditTrail(t *testing.T, h http.Handler, org string) []any {
+	t.Helper()
+	w := do(t, h, http.MethodGet, "/v1/"+org+"/audit", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("audit: want 200, got %d", w.Code)
+	}
+	return decode(t, w)["entries"].([]any)
+}
+
+// findAuditEntry returns the first audit entry matching the given
+// action and actor, or nil.
+func findAuditEntry(entries []any, action, actor string) map[string]any {
+	for _, e := range entries {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["action"] == action && m["actor"] == actor {
+			return m
+		}
+	}
+	return nil
+}
+
 func TestEventsAndAudit(t *testing.T) {
 	h := newTestServer(t)
 	do(t, h, http.MethodPost, "/v1/resources", appBody)
 
+	// No poll needed here: the created event is published synchronously
+	// inside the POST handler before the 201 is written, and the
+	// reconciler's async status_changed events share the same subject
+	// namespace, so the prefix assertion holds under any interleaving.
 	w := do(t, h, http.MethodGet, "/v1/acme/events", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("events: want 200, got %d", w.Code)
@@ -231,17 +277,35 @@ func TestEventsAndAudit(t *testing.T) {
 		t.Fatalf("subject must use the ryvex namespace: %v", first)
 	}
 
-	w = do(t, h, http.MethodGet, "/v1/acme/audit", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("audit: want 200, got %d", w.Code)
-	}
-	entries := decode(t, w)["entries"].([]any)
+	// Issue #70: newTestServer runs real reconciler workers whose
+	// initial scan appends a status_changed entry (actor "reconciler")
+	// to the same audit log asynchronously, so asserting the head
+	// straight off the wire races that write. Wait for the audit trail
+	// itself instead (same pattern as the #66 webhook fix).
+	waitUntil(t, "created/ci audit entry", 5*time.Second, func() bool {
+		return findAuditEntry(auditTrail(t, h, "acme"), "created", "ci") != nil
+	})
+
+	entries := auditTrail(t, h, "acme")
 	if len(entries) == 0 {
 		t.Fatalf("expected audit entries")
 	}
-	e0 := entries[0].(map[string]any)
-	if e0["action"] != "created" || e0["actor"] != "ci" {
-		t.Fatalf("unexpected audit head: %v", e0)
+	if findAuditEntry(entries, "created", "ci") == nil {
+		t.Fatalf("created/ci entry missing from the settled audit trail: %v", entries)
+	}
+	// Head semantics under a live reconciler: the newest-first head is
+	// legitimately either the API's created/ci entry or the
+	// reconciler's async status_changed write — asserting a particular
+	// winner is what made this test flaky. Assert the head is one of
+	// the two legitimate writers for this timeline instead.
+	head := entries[0].(map[string]any)
+	switch {
+	case head["action"] == "created" && head["actor"] == "ci":
+		// API create still leads the trail.
+	case head["action"] == "status_changed" && head["actor"] == "reconciler":
+		// The reconciler's async status write won the head — valid.
+	default:
+		t.Fatalf("unexpected audit head: %v", head)
 	}
 }
 

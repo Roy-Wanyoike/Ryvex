@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Roy-Wanyoike/Ryvex/internal/authz"
 	"github.com/Roy-Wanyoike/Ryvex/internal/state"
 )
 
@@ -223,5 +224,44 @@ func TestRunServeFlagValidation(t *testing.T) {
 func TestVersionIsStamped(t *testing.T) {
 	if Version == "" {
 		t.Fatal("Version is empty, want a non-empty build stamp")
+	}
+}
+
+// ---- bootstrap key seeding (issue #73) ----
+
+func TestSeedBootstrapKeysRegistersAdminResources(t *testing.T) {
+	store := state.NewStore()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	token := "ryk_bootstrap_unit_0001"
+	seedBootstrapKeys(store, map[string]string{token: "root"}, log)
+
+	// The resource must exist under the PRINCIPAL name (not the token —
+	// the regression this test pins: the seed loop used to swap the two,
+	// so every bootstrap seed failed validation while the static digest
+	// path silently kept the token admin).
+	res, err := store.GetByLogicalKey(state.ReservedOrg, state.ReservedProject, state.ReservedEnv, state.KindAPIKey, "root")
+	if err != nil {
+		t.Fatalf("bootstrap resource for principal root: %v", err)
+	}
+	spec, err := state.ParseAPIKeySpec(res.Spec)
+	if err != nil {
+		t.Fatalf("parse seeded spec: %v", err)
+	}
+	if !authz.HasRole(spec.Roles, state.RoleAdmin) {
+		t.Fatalf("bootstrap roles = %v, want admin", spec.Roles)
+	}
+	if want := authz.HashToken(token); spec.KeyHash != want {
+		t.Fatalf("seeded hash = %s, want sha256 of the configured token", spec.KeyHash)
+	}
+
+	// Seeding plus one Refresh is exactly the boot ordering runServe
+	// uses, so the very first request after boot authenticates.
+	az := authz.New(store, nil, authz.Options{Logger: log})
+	if err := az.Refresh(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if p, ok := az.Authenticate(token); !ok || p != "root" {
+		t.Fatalf("bootstrap token must authenticate after seed+refresh: p=%q ok=%v", p, ok)
 	}
 }

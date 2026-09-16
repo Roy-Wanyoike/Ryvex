@@ -35,8 +35,10 @@ type Server struct {
 	// back to the package const when ServerOptions.Version is empty.
 	version string
 	// staticKeys holds sha256 digests of the bootstrap tokens for
-	// constant-time comparison (issue #38); devAuth mirrors
-	// AuthOptions.DevAuth so /healthz probes can be classified.
+	// constant-time comparison in the LEGACY bearer-only mode
+	// (issue #38). In RBAC mode it stays empty: authentication is
+	// derived from live APIKey resources (issue #73), so revoked or
+	// demoted bootstrap keys cannot ride a boot-time digest index.
 	staticKeys staticKeyIndex
 	devAuth    bool
 }
@@ -72,10 +74,14 @@ func NewServer(store state.Backend, b bus.BusI, rec *reconcile.Reconciler, o Ser
 	if o.Version == "" {
 		o.Version = Version // const fallback when nothing is plumbed (issue #38)
 	}
-	// Static bootstrap tokens are hashed once at boot (issue #38):
-	// requests compare sha256 digests in constant time instead of
-	// leaking token bytes through map-lookup timing.
-	ix := newStaticKeyIndex(o.Auth.APIKeys)
+	// Static bootstrap digests are needed only by the legacy
+	// bearer-only middleware (no RBAC authorizer). In RBAC mode the
+	// authorizer's resource-derived cache is the single digest index
+	// (issue #73) — no separate static copy of token digests is kept.
+	var ix staticKeyIndex
+	if o.Authorizer == nil {
+		ix = newStaticKeyIndex(o.Auth.APIKeys)
+	}
 	s := &Server{
 		store: store, bus: b, reconciler: rec, log: o.Logger, mux: http.NewServeMux(),
 		version: o.Version, staticKeys: ix, devAuth: o.Auth.DevAuth,
@@ -235,7 +241,7 @@ func (s *Server) probeActor(r *http.Request) string {
 		return ""
 	}
 	if s.authorizer != nil {
-		if p, _, kind := resolveToken(s.authorizer, s.staticKeys, s.devAuth, tok); kind != tokenUnknown {
+		if p, _, kind := resolveToken(s.authorizer, s.devAuth, tok); kind != tokenUnknown {
 			return p
 		}
 		return ""

@@ -20,6 +20,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use ryvex_agent::backoff::Backoff;
 use ryvex_agent::client::{next_last_seen, ApiClient, Outcome};
 use ryvex_agent::config::Config;
 
@@ -144,8 +145,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Record> {
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    let body =
-        String::from_utf8_lossy(&buf[body_start..body_start + content_length]).into_owned();
+    let body = String::from_utf8_lossy(&buf[body_start..body_start + content_length]).into_owned();
     let request_line = head.lines().next().unwrap_or_default().to_owned();
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or_default().to_owned();
@@ -164,6 +164,8 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::R
         404 => "Not Found",
         409 => "Conflict",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
         _ => "OK",
     };
     let head = format!(
@@ -259,11 +261,11 @@ async fn sync_updates_with_observed_generation() {
 async fn single_conflict_is_resolved_internally() {
     let mock = spawn_mock(
         vec![
-            Action::Respond(200, node_json(1)),  // initial fetch
+            Action::Respond(200, node_json(1)), // initial fetch
             Action::Respond(200, node_json(2)), // conflict re-fetch
         ],
         vec![
-            Action::Respond(409, error_json("conflict")),         // stale CAS
+            Action::Respond(409, error_json("conflict")), // stale CAS
             Action::Respond(200, r#"{"generation":3}"#.into()), // retry wins
         ],
     );
@@ -290,7 +292,12 @@ async fn put_conflict_returns_fresh_generation() {
     let client = ApiClient::new(test_cfg(&mock.url())).expect("client");
     let doc = serde_json::json!({"kind": "Node", "name": "mock-node"});
     let outcome = client.put_node(&doc).await;
-    assert_eq!(outcome, Outcome::Conflict { fresh_generation: 2 });
+    assert_eq!(
+        outcome,
+        Outcome::Conflict {
+            fresh_generation: 2
+        }
+    );
 }
 
 /// Issue #43 regression: sustained CAS contention (every PUT 409) must
@@ -304,7 +311,10 @@ async fn sustained_conflicts_yield_transient_not_panic() {
     );
     let client = ApiClient::new(test_cfg(&mock.url())).expect("client");
     let outcome = client.sync_node("test-1.0", None).await;
-    assert_eq!(outcome, Outcome::Transient("gave up after CAS retries".into()));
+    assert_eq!(
+        outcome,
+        Outcome::Transient("gave up after CAS retries".into())
+    );
     let puts = mock.requests().iter().filter(|r| r.method == "PUT").count();
     assert!(puts >= 3, "expected at least 3 CAS attempts, got {puts}");
 }
@@ -341,9 +351,8 @@ async fn non_json_success_body_is_transient() {
     }
 }
 
-/// GET 500 → Transient (server trouble backs off). Note the pre-existing
-/// asymmetry: PUT 500 currently maps to Rejected — see the PR's
-/// out-of-scope notes.
+/// GET 500 → Transient (server trouble backs off). PUT 5xx shares
+/// this classification since issue #75.
 #[tokio::test]
 async fn get_500_is_transient() {
     let mock = spawn_mock(
@@ -355,16 +364,96 @@ async fn get_500_is_transient() {
     assert!(matches!(outcome, Outcome::Transient(_)), "got {outcome:?}");
 }
 
-/// Non-JSON 500 on PUT → Rejected (error body never parsed, no panic).
+/// Issue #75: a 5xx on PUT is transient regardless of body
+/// decodability (error body never parsed, no panic) — it used to be a
+/// permanent Rejected, skipping the backoff entirely.
 #[tokio::test]
-async fn put_500_with_non_json_body_is_rejected() {
+async fn put_500_with_non_json_body_is_transient() {
     let mock = spawn_mock(
         vec![Action::Respond(200, node_json(1))],
         vec![Action::Respond(500, "<html>boom</html>".into())],
     );
     let client = ApiClient::new(test_cfg(&mock.url())).expect("client");
     let outcome = client.sync_node("test-1.0", None).await;
-    assert!(matches!(outcome, Outcome::Rejected(_)), "got {outcome:?}");
+    assert!(matches!(outcome, Outcome::Transient(_)), "got {outcome:?}");
+}
+
+/// Issue #75 acceptance: sustained 502s (flaky LB burst) must classify
+/// as Transient on every cycle — never Rejected, never a panic — so
+/// the run loop (main.rs) backs off. The wait sequence below mirrors
+/// run()'s policy exactly: advance the shared `Backoff` on every
+/// Transient, reset on success. Jitter-aware growth assertion: each
+/// wait lands inside the ±20% band of the doubling sequence
+/// 1,2,4,8,16,30,30,30 (truncated to whole seconds), and the pre-cap
+/// bands are ordered, so the realized waits grow monotonically until
+/// the 30s cap.
+#[tokio::test]
+async fn sustained_put_502_backs_off_exponentially_without_panic() {
+    let mock = spawn_mock(
+        vec![Action::Respond(200, node_json(1))], // every fetch
+        vec![Action::Respond(502, error_json("bad_gateway"))], // every PUT
+    );
+    let client = ApiClient::new(test_cfg(&mock.url())).expect("client");
+    let mut bo = Backoff::new();
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+        match client.sync_node("test-1.0", None).await {
+            Outcome::Transient(_) => waits.push(bo.advance().as_secs()),
+            other => panic!("sustained 502 must stay Transient, got {other:?}"),
+        }
+    }
+    assert_eq!(waits.len(), 8);
+    // Expected ±20% jitter bands (floored at 1s, capped at 30s):
+    // [1,1] [1,2] [3,4] [6,9] [12,19] [24,35] [24,35] [24,35].
+    let bands = [
+        (1, 1),
+        (1, 2),
+        (3, 4),
+        (6, 9),
+        (12, 19),
+        (24, 35),
+        (24, 35),
+        (24, 35),
+    ];
+    for (i, w) in waits.iter().enumerate() {
+        assert!(
+            *w >= bands[i].0 && *w <= bands[i].1,
+            "wait[{i}]={w} outside its band {:?}",
+            bands[i]
+        );
+    }
+    // Pre-cap the bands cannot overlap downwards, so realized waits
+    // grow monotonically; at the cap they plateau (24–35s).
+    for i in 0..5 {
+        assert!(
+            waits[i + 1] >= waits[i],
+            "backoff must grow pre-cap: waits[{i}]={}, waits[{}]={}",
+            waits[i],
+            i + 1,
+            waits[i + 1]
+        );
+    }
+}
+
+/// Issue #75 recovery: a 502 burst that clears (next PUT answers 200)
+/// returns to Upserted with no restart — exactly one PUT per cycle,
+/// and run() resets its backoff counter on the success.
+#[tokio::test]
+async fn put_502_burst_recovers_after_200() {
+    let mock = spawn_mock(
+        vec![Action::Respond(200, node_json(1))],
+        vec![
+            Action::Respond(502, error_json("bad_gateway")),
+            Action::Respond(200, r#"{"generation":2}"#.into()),
+        ],
+    );
+    let client = ApiClient::new(test_cfg(&mock.url())).expect("client");
+    let first = client.sync_node("test-1.0", None).await;
+    assert!(matches!(first, Outcome::Transient(_)), "got {first:?}");
+    let second = client.sync_node("test-1.0", None).await;
+    assert_eq!(second, Outcome::Upserted { generation: 2 });
+    let puts = mock.requests().iter().filter(|r| r.method == "PUT").count();
+    assert_eq!(puts, 2, "one PUT per cycle, no hidden retry storm");
 }
 
 /// Connection dropped mid-PUT (accepted, read, closed without a
@@ -449,8 +538,7 @@ async fn spec_refreshes_every_cycle_when_window_is_zero() {
 
 #[test]
 fn throttle_decision_refreshes_without_previous_value() {
-    let (ls, refreshed) =
-        next_last_seen(None, Some(std::time::Duration::from_secs(0)), 300, "t2");
+    let (ls, refreshed) = next_last_seen(None, Some(std::time::Duration::from_secs(0)), 300, "t2");
     assert_eq!(ls, "t2");
     assert!(refreshed);
 }
