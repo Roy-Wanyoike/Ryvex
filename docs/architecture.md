@@ -82,16 +82,49 @@ touching the API or the reconciler.
 - Synchronous fan-out with subscriber panic isolation.
 - 1024-event replay ring (in-memory) powering `GET /v1/{org}/events`;
   the JetStream backend replays from the stream and adds the
-  `?from=` sequence cursor (see below).
+  `?from=` sequence cursor (see [Durable events](#durable-events-nats-jetstream))
+  plus durable consumers and a dead-letter queue (below).
 
 ### Reconciler (`internal/reconcile`)
 
 - Fixed-interval scan + out-of-band `Trigger(id)` (used by
   `POST /v1/{org}/reconcile/{id}`).
 - Bounded worker pool (configurable concurrency).
-- Reference policy converges `Pending → Provisioning → Ready` and
-  stamps `observed_generation`; the `evaluate` hook is the seam where
-  real controllers plug in.
+- Status-only kinds (no actuator) converge `Pending → Provisioning →
+  Ready` and stamp `observed_generation`; the `evaluate` hook is the
+  seam where real controllers plug in. This is the exact flow every
+  kind had before the provider SPI — it is unchanged for kinds without
+  an actuator.
+- **Provider SPI (issue #80, [ADR-0002](adr/0002-provider-spi.md)).**
+  `internal/provider` defines the actuator contract — one `Actuator`
+  per kind (`Kind`, pure `Plan`, idempotent `Apply`, `Inspect`,
+  `Capabilities`), an optional `FieldMapper` capability behind drift
+  detection, and a three-class error taxonomy (`Transient` /
+  `Permanent` / `Unavailable`, mirroring the node agent's `Outcome`
+  classes). Actuators live in a per-daemon registry; the reconciler
+  keeps every piece of control-plane policy: phases, retry/backoff,
+  drift comparison, audit, events, metrics. The reference provider is
+  a stdlib Docker Engine actuator behind the `docker` build tag
+  (`internal/provider/docker`), enabled with `--enable-docker-actuator`
+  (a binary built without the tag degrades honestly: loud warning,
+  status-only convergence; a dead engine on a tagged binary refuses
+  boot, same posture as `--bus nats`).
+- **Retry/backoff (issue #80).** Classified-Transient/Unavailable
+  failures retry per kind (`RetryPolicy`: default 4 attempts, 1s base,
+  ×2 growth, 30s cap, per resource per generation episode, in-memory).
+  The resource sits **Degraded** between attempts and lands **Failed**
+  when the budget is exhausted (or immediately on a Permanent
+  failure); both phases are reachable and audited. `Failed` is
+  terminal for the current generation — a new spec re-opens
+  convergence.
+- **Drift detection (issue #80).** A dedicated pass (default every
+  60s, `--drift-interval`) inspects `Ready` resources of drift-capable
+  actuated kinds and compares desired spec fields against observed
+  external state. Drift never mutates anything directly: the resource
+  is annotated (`Drifted: …`, phase stays `Ready`), audited
+  (`drift_detected`), published on the bus with the drifted field
+  list, counted in `ryvex_reconciler_drifts_total` — and corrected by
+  re-running the same Plan→Apply path as ordinary convergence.
 
 ### REST API (`internal/api`)
 
@@ -101,6 +134,12 @@ touching the API or the reconciler.
 - Manual `/v1` dispatcher because the path space
   (`/v1/resources/{id}` vs `/v1/{org}/events`) is ambiguous to pattern
   routers.
+- Probes (issue #71): `/healthz` reports liveness with an honest body
+  (`"status": "degraded"` + per-dependency states when the store or
+  bus is down, still HTTP 200) and `/readyz` answers 503 until both
+  dependencies answer a real query — a dead-Postgres pod leaves the
+  Service rotation instead of serving errors. Contract details in
+  [api-contracts.md](./api-contracts.md).
 - Hardening: conservative response headers (`X-Content-Type-Options:
   nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store` on
   `/v1`), production server timeouts (30s read / 10s read-header /
@@ -126,7 +165,11 @@ ryvexd serve --http :8080 --dev-auth --seed --cors-origins http://localhost:3100
 | `--api-keys` | `RYVEX_API_KEYS` | Static keys `name=token,…` (bootstrapped as admin keys) |
 | `--cors-origins` | `RYVEX_CORS_ORIGINS` | Browser origins allowed cross-origin |
 | `--webhook-secret` | `RYVEX_WEBHOOK_SECRET` | HMAC key for webhook signatures (random per boot when unset) |
+| `--audit-cap` | `RYVEX_AUDIT_CAP` | Max audit entries kept by the **memory** backend, oldest evicted first (default 10000; ignored with `--store postgres`, issue #85) |
 | `--metrics-addr` | `RYVEX_METRICS_ADDR` | Dedicated `/metrics` sidecar address (empty disables) |
+| `--enable-docker-actuator` | | Actuate Application resources against a Docker Engine (needs a binary built with `-tags docker`, issue #80) |
+| `--docker-socket` | `RYVEX_DOCKER_SOCKET` | Docker Engine unix socket when `--enable-docker-actuator` is set |
+| `--drift-interval` | | Cadence of the drift-detection pass for actuated kinds (default 60s, issue #80) |
 | `--seed` | | Load the 15-resource demo dataset |
 | `--log-level` | | `debug` … `error` |
 
@@ -201,10 +244,28 @@ How it works:
   bus (`*` = one segment, trailing `>` = tail).
 - **Publish.** Events are JSON-marshalled onto their canonical subject; the
   publish is acknowledged by the server before `Publish` returns
-  (at-least-once). Failures are logged, never fatal to the request path.
+  (at-least-once). Failures are logged, never fatal to the request path —
+  and since issue #81 they are not silent either: every failed publish
+  increments `ryvex_bus_publish_failures_total`, and callers that must
+  observe the outcome use `PublishErr` (same bus, error returned after the
+  count).
 - **Subscribe.** Live deliveries ride core NATS subscriptions (no replay on
   subscribe, matching memory-bus semantics). Handler panics are contained and
   `Cancel()` stops delivery immediately.
+- **Durable consumers (issue #81).** `SubscribeDurable(name,
+  pattern, handler)` attaches a named, restart-idempotent JetStream pull
+  consumer: at-least-once delivery with explicit acks, redelivery of
+  failed handlers (the handler returns `bus.ErrEventRetry`, `nil`, or
+  `bus.ErrEventPoison`) bounded by the consumer's `MaxDeliver` (default 5
+  deliveries, `AckWait` 30s), and consumer-config drift reconciled on
+  subscribe. A consumer created for the first time starts at the stream
+  tail, so the first boot does not flood receivers with old events; from
+  then on the consumer's own cursor provides resume-after-restart
+  redelivery. Rolling deploys are safe — multiple fetchers on one durable
+  name split the work. The webhook dispatcher runs as the durable
+  consumer `RYVEX_DISPATCHER`, so webhook events published while the
+  daemon was down are delivered when it comes back; buses without the
+  capability (in-memory) fall back to plain best-effort `Subscribe`.
 - **Recent / RecentFrom.** `Recent(org, limit)` replays the newest events from
   the stream (server-side filtered per org, newest first, scans capped at 5000
   messages for safety). `RecentFrom(org, limit, from)` is the sequence-cursor
@@ -213,6 +274,16 @@ How it works:
   duplicates. The in-memory bus does not implement the cursor (the `from`
   parameter is simply ignored there); `last_seq` appears in the response only
   on the JetStream backend.
+- **Dead-letter queue (issue #81).** A second JetStream stream,
+  `RYVEX_DLQ` on `ryvex.dlq.>` (7-day retention), retains dead-lettered
+  events: handler failures marked `bus.ErrEventPoison` (or undecodable
+  payloads) immediately, and exhausted `MaxDeliver` budgets otherwise.
+  The original payload is republished verbatim on
+  `ryvex.dlq.<stream-sequence>` with failure headers
+  (`X-Ryvex-DLQ-Reason: poison|max_deliver`, cause, original stream
+  sequence, consumer name), the delivery is terminated, and
+  `ryvex_bus_dlq_total{reason}` increments. Operators inspect and
+  re-drive the DLQ stream directly with any NATS tooling.
 
 Boot semantics: with `--bus nats` a failed connection is a fatal boot error —
 the daemon refuses to silently degrade to the in-memory bus. The memory bus
@@ -267,3 +338,28 @@ How it works:
 - **Parity testing.** The pgstore suite runs the shared behavioral suite
   against a live database when `RYVEX_TEST_PG_DSN` is provided
   (`RYVEX_TEST_PG_DSN=… go test ./internal/state/...`).
+
+## Node agent packaging (issue #76)
+
+The Rust agent ships as a first-class deployable, not a build-it-yourself
+crate:
+
+- **Images.** `ghcr.io/roy-wanyoike/ryvex-agent` (static musl binary,
+  UID 10002, alpine) is published by the release workflow on `v*` tags,
+  alongside `ghcr.io/roy-wanyoike/ryvexd`. The agent image builds from
+  `Dockerfile.agent` (context trimmed by `Dockerfile.agent.dockerignore`,
+  pinned `rust:1.98-alpine` toolchain, `--locked` against `Cargo.lock`).
+- **Compose.** The `agent` profile adds the node agent next to
+  postgres + ryvexd (and the `nats` profile's JetStream bus); it needs a
+  real `RYVEX_AGENT_TOKEN` and opens no listen port — it is a pure
+  GET/PUT client of the REST API (fetch its node document, upsert
+  enrollment/heartbeat state).
+- **Kubernetes.** `deploy/k8s/07-ryvex-agent.yaml` runs one agent per node
+  as a non-root DaemonSet (`RYVEX_AGENT_NAME` from `spec.nodeName`, so
+  each node stays one stable `Node` resource across pod reschedules);
+  `deploy/k8s/kustomization.yaml` parameterizes both image tags so a
+  release roll is a `kustomize edit set image` away.
+
+The full self-hosting walkthrough — image provenance, the fail-closed
+secrets contract, network-policy assumptions, Postgres sslmode and
+probe budgets — lives in [deploy.md](./deploy.md).

@@ -14,8 +14,12 @@
   `/healthz` is open but auth-tiered (see [Service](#service)).
 - **Content type:** `application/json` everywhere. Request bodies are
   capped at **1 MiB**; larger bodies get `413 payload_too_large`.
-- **Tracing:** every response carries `X-Request-Id` (client-supplied
-  IDs are honored).
+- **Tracing:** every response carries `X-Request-Id`. A client-supplied
+  ID is honored only when it is 1–64 characters of `[A-Za-z0-9._-]`;
+  anything else — too long, whitespace, control bytes, quotes — is
+  discarded and replaced with a fresh server-generated 12-hex-char id,
+  so the value echoed into logs and error envelopes is always safe to
+  interpolate (issue #84).
 - **Security headers:** responses carry `X-Content-Type-Options:
   nosniff` and `X-Frame-Options: DENY`; `/v1` responses add
   `Cache-Control: no-store`.
@@ -44,6 +48,17 @@
 | 409 | `conflict` | CAS generation mismatch |
 | 413 | `payload_too_large` | Request body exceeds the 1 MiB cap |
 | 500 | `internal_error` | Bug or backend failure |
+
+Status mapping is **`errors.Is`-based** (issue #84): the store's
+sentinel errors (`ErrNotFound`, `ErrAlreadyExists`, `ErrConflict`,
+`ErrBadRequest`, `ErrValidation`) are matched through their wrap chain,
+and validation is matched with `errors.As` against
+`*state.ValidationError`. An intermediate layer wrapping a sentinel —
+`fmt.Errorf("pg insert: %w", err)` — still lands on the correct status
+and code instead of falling through to a misleading `500
+internal_error`. The `message` of a validation or bad-request error is
+the wrapped error's text (it names the offending field); the other
+mappings use fixed, non-leaking messages.
 
 ## Resource document
 
@@ -90,23 +105,50 @@ Rules:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/healthz` | Liveness + version (no auth required) |
+| GET | `/healthz` | Liveness + version + dependency states (no auth required) |
+| GET | `/readyz` | Readiness: `200 ready` only when store **and** bus answer a real query, else `503 unavailable` (issue #71) |
 | GET | `/v1` | API index (machine-readable endpoint list) |
 
 `/healthz` is **auth-tiered**. Anonymous callers — load balancers, k8s
 probes, `ryvex health` without a token — get `status`, `service`,
-`version` and `time` only; resource counts do not leak without a key.
-A valid bearer token additionally returns `resources` (store count)
-and `authenticated_as` (the principal):
+`version`, `time` and the `dependencies` map; resource counts do not
+leak without a key. A valid bearer token additionally returns
+`resources` (store count) and `authenticated_as` (the principal):
 
 ```json
-{ "status": "ok", "service": "ryvexd", "version": "v1.1.0", "time": "…" }
+{ "status": "ok", "service": "ryvexd", "version": "v1.1.0", "time": "…",
+  "dependencies": { "store": "ok", "bus": "ok" } }
 ```
 
 ```json
 { "status": "ok", "service": "ryvexd", "version": "v1.1.0", "time": "…",
+  "dependencies": { "store": "ok", "bus": "ok" },
   "resources": 15, "authenticated_as": "ops" }
 ```
+
+- **`status` is honest, not optimistic** (issue #71): when a
+  dependency check fails the body says `"status": "degraded"` and the
+  offending entry flips to `"unavailable"` — but the HTTP code stays
+  **200**, because a restart cannot fix a dead Postgres. Liveness owns
+  restarts; readiness owns rotation.
+- Each dependency check is bounded by a 2s timeout so a wedged backend
+  cannot stall a probe past the k8s probe timeout.
+
+`/readyz` (issue #71) is the rotation gate. It runs the same two checks
+— `Store.Ping` (a genuine round trip on the Postgres backend) and the
+bus health check — and answers **503** the moment either fails, so a
+dead-dependency pod leaves the Service rotation instead of serving
+errors. The 503 body has the same shape, with `"status":
+"unavailable"`:
+
+```json
+{ "status": "unavailable", "service": "ryvexd", "version": "v1.1.0",
+  "time": "…", "dependencies": { "store": "unavailable", "bus": "ok" } }
+```
+
+Error details stay in the server log — the anonymous probe body never
+leaks them. Both routes are unauthenticated by design: they expose no
+resource data.
 
 ### Resources (handle-addressed)
 
@@ -132,6 +174,22 @@ previous page until it comes back `""`.
 **Optimistic concurrency (CAS):** include `"generation": N` in the PUT
 body to fail with `409 conflict` if the stored generation is no longer
 `N`. Omit it for last-writer-wins.
+
+**Method enforcement on the list route (#84):** the scope list is a
+read-only collection. Any non-GET method on
+`/v1/{org}/{project}/{env}/{kind}` — including POST and PUT, which
+previously fell through to the list handler — is rejected with `405
+method_not_allowed` carrying an `Allow: GET` header and the standard
+error envelope. (PUT/DELETE belong to the `{name}` routes below.)
+
+**No-op heartbeats are silent (#72):** a PUT whose spec **and** labels
+are byte-identical to the stored document answers `200` with the
+unchanged `generation` — but publishes no `updated` event and writes no
+audit entry. The node agent re-sends identical heartbeat PUTs between
+spec refreshes specifically to avoid event churn, so event publication
+is gated on the same spec/labels comparison that decides the generation
+bump. A real spec/labels change keeps the full `200` + event + audit
+behavior.
 
 ### Key management (`/v1/keys`)
 
@@ -173,6 +231,24 @@ omit both and default to `org/*`):
 Revocation is immediate: the authorizer's key cache is refreshed on
 every create/update/delete.
 
+**Bootstrap keys are governed by this lifecycle (#73).** Static keys
+supplied via `--api-keys` / `RYVEX_API_KEYS` are seeded at boot as
+`APIKey` resources (principal = name, `roles: ["admin"]`, `scopes:
+["org/*"]`) in the reserved namespace — they appear in `GET /v1/keys`
+like any managed key. Authentication is derived **only** from the live
+`APIKey` resource view; there is no separate boot-time digest fallback.
+Consequences:
+
+- **Revocable and demotable.** DELETE (revoke), PUT (`active: false`,
+  role/scope changes) on a bootstrap key take effect on the next
+  authorizer refresh — no daemon restart. A revoked bootstrap token
+  simply stops authenticating (fail closed).
+- **Conditional admin.** Admin rights come from the resource's current
+  roles, not from the flag: demote the resource to `operator` and the
+  token loses key-management and cross-org reach immediately.
+- Recreating a revoked bootstrap key requires re-seeding (restart with
+  the flag, or mint a managed replacement via `POST /v1/keys`).
+
 ### Observability & control
 
 | Method | Path | Description |
@@ -188,6 +264,17 @@ can resume without gaps or duplicates. A non-integer `from` is a `400`
 validation error. The in-memory bus does not implement the cursor —
 `from` is ignored there and `last_seq` is absent.
 
+**Feed pagination (`cursor` + `next_cursor`):** the paginated list
+faces return a `next_cursor` field alongside their items and accept a
+`cursor` query parameter for the following page. The stable rule,
+regardless of backend: pass back the `next_cursor` you received until
+it comes back **empty (`""`)**, which means the feed is exhausted.
+This contract is being wired through the events and audit feeds
+([#107](https://github.com/Roy-Wanyoike/Ryvex/issues/107) — in flight;
+until it merges, `/v1/{org}/audit` takes `kind`/`limit`, the events
+feed takes `limit` plus the JetStream `from=` cursor above, and
+`/v1/resources` + scope lists already honor `cursor`/`next_cursor`).
+
 ## Event subjects
 
 ```
@@ -196,12 +283,16 @@ ryvex.resource.{org}.{kind}.{event}
 kind  ∈ project, environment, application, deployment, cluster,
         node, database, cache, bucket, policy, secret, subscription,
         apikey                                                       (lowercase)
-event ∈ created | updated | deleted | status_changed
+event ∈ created | updated | deleted | status_changed | drift_detected
 ```
 
 Example: `ryvex.resource.acme.application.status_changed`. Managed key
 events publish under the reserved org, e.g.
-`ryvex.resource.ryvex.apikey.created`.
+`ryvex.resource.ryvex.apikey.created`. `drift_detected` (issue #80) is
+published when a drift pass observes an actuated resource diverging
+from its declared spec; `data.fields` carries the drifted field names
+and the resource's phase stays `Ready` (drift is an annotation, not a
+phase).
 
 Subject matching is available to in-process subscribers with `*`
 (one segment) and `>` (remaining segments) wildcards; the same grammar
