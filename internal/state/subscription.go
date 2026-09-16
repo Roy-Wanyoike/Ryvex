@@ -196,6 +196,15 @@ func ParseSubscriptionSpec(spec map[string]any) (SubscriptionSpec, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return out, &ValidationError{Field: "spec", Message: fmt.Sprintf("spec.url %q must be a valid http(s) URL", rawURLStr)}
 	}
+	// An explicit empty port ("http://host:/hook") parses cleanly
+	// but is almost certainly a typo: the dispatcher would silently
+	// dial the scheme's default port. Refuse it at create time
+	// (issue #121) — a Host ending in ":" covers both "host:" and
+	// "[v6]:" — while scheme-default URLs with no port at all stay
+	// valid.
+	if strings.HasSuffix(u.Host, ":") {
+		return out, &ValidationError{Field: "spec", Message: fmt.Sprintf("spec.url %q has an empty port; omit the colon or specify a port", rawURLStr)}
+	}
 	// Webhook SSRF egress guard (issue #36): refuse loopback,
 	// link-local, RFC1918, CGNAT and unresolvable targets at
 	// create/update time. The dispatcher re-checks the resolved IP

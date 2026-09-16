@@ -276,7 +276,9 @@ func NewDispatcher(store state.Backend, b bus.BusI, opts Options) *Dispatcher {
 		opts.QueueSize = DefaultQueueSize
 	}
 	if opts.ServerSecret == "" {
-		opts.ServerSecret = RandomSecret()
+		// Degraded (crypto/rand failure) logs loudly via randomSecret
+		// through the injected logger (issue #121).
+		opts.ServerSecret = randomSecret(opts.Logger)
 		opts.Logger.Info("webhook server secret generated at boot; set --webhook-secret for signatures stable across restarts")
 	}
 	if opts.TracerProvider == nil {
@@ -293,12 +295,32 @@ func NewDispatcher(store state.Backend, b bus.BusI, opts Options) *Dispatcher {
 }
 
 // RandomSecret returns 32 bytes of cryptographic randomness, hex
-// encoded, for use as Options.ServerSecret.
+// encoded, for use as Options.ServerSecret. It logs nothing (no
+// logger is in scope); NewDispatcher routes the degraded-mode case
+// through the dispatcher's injected logger — see randomSecret.
 func RandomSecret() string {
+	return randomSecret(nil)
+}
+
+// cryptoRandRead is the entropy source randomSecret reads from; a
+// package var so tests can simulate entropy failure (issue #121).
+var cryptoRandRead = rand.Read
+
+// randomSecret is RandomSecret with an optional logger. When the
+// crypto/rand read fails it keeps the documented deterministic
+// fallback (a deterministic secret beats panicking at boot) but says
+// so loudly through log (#121): every boot in this degraded mode
+// signs with the same well-known value, so webhook signatures are
+// forgeable until a real --webhook-secret is set or entropy is
+// restored. The fallback behavior itself is unchanged.
+func randomSecret(log *slog.Logger) string {
 	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	if _, err := cryptoRandRead(b[:]); err != nil {
 		// crypto/rand failing means the platform entropy source is
 		// broken; a deterministic fallback beats panicking at boot.
+		if log != nil {
+			log.Error("webhook signing secret DEGRADED: crypto/rand failed, falling back to the well-known deterministic secret — webhook signatures are forgeable until --webhook-secret is set or entropy is restored", "err", err)
+		}
 		return hex.EncodeToString([]byte("ryvex-insecure-fallback-webhook-secret"))
 	}
 	return hex.EncodeToString(b[:])

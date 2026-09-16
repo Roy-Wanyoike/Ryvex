@@ -10,7 +10,12 @@ import (
 
 // runHealth implements `ryvex health` against GET /healthz, which is
 // unauthenticated per the API contract, printing status, version and
-// resource count.
+// resource count. The server withholds "resources" from
+// anonymous/unauthorized probes (issue #38): the table shows "-" for
+// a withheld count instead of 0, which would read as an empty store
+// (issue #121). In -o json mode the raw response is passed through
+// verbatim, so a withheld count stays omitted — absent consistently
+// means withheld, never "empty store".
 func runHealth(w io.Writer, g globals, args []string) error {
 	fs := newFlagSet("health")
 	pos, err := parseCmdArgs(fs, args)
@@ -31,11 +36,15 @@ func runHealth(w io.Writer, g globals, args []string) error {
 	if err := json.Unmarshal(raw, &h); err != nil {
 		return fmt.Errorf("unexpected response from control plane: %w", err)
 	}
+	resources := "-"
+	if h.Resources != nil {
+		resources = strconv.Itoa(*h.Resources)
+	}
 	renderKV(w, [][2]string{
 		{"status", h.Status},
 		{"service", h.Service},
 		{"version", h.Version},
-		{"resources", strconv.Itoa(h.Resources)},
+		{"resources", resources},
 	})
 	return nil
 }
