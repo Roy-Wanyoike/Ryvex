@@ -314,7 +314,76 @@ func TestSetupTracing(t *testing.T) {
 	if err := tp.Shutdown(shutdownCtx); err != nil {
 		t.Errorf("provider shutdown: %v", err)
 	}
+	// Host:port form — exactly what --help, the usage text and
+	// .env.example advertise (issue #123): accepted, TLS by default
+	// (the insecure flag stays false when not set).
+	tp, err = setupTracing(context.Background(), log, "localhost:4318", false, 1.0)
+	if err != nil {
+		t.Fatalf("setupTracing(localhost:4318): %v", err)
+	}
+	if tp == nil {
+		t.Fatal("setupTracing with a host:port endpoint returned a nil provider")
+	}
+	if err := tp.Shutdown(shutdownCtx); err != nil {
+		t.Errorf("provider shutdown (host:port): %v", err)
+	}
 	restore()
+}
+
+// ---- OTLP endpoint forms (issue #123) ----
+
+// TestNormalizeOTLPEndpoint pins the accepted --otlp-endpoint forms:
+// the host:port form that --help and .env.example advertise (which the
+// previous url.Parse-based code rejected by reading "localhost:4318"
+// as scheme "localhost", issue #123), the explicit http:// and
+// https:// URLs, and rejection of garbage.
+func TestNormalizeOTLPEndpoint(t *testing.T) {
+	cases := []struct {
+		name      string
+		endpoint  string
+		insecure  bool
+		wantHost  string
+		wantInsec bool
+		wantErr   bool
+	}{
+		// The documented host:port form — TLS by default (issue #123).
+		{name: "host:port as documented", endpoint: "localhost:4318", wantHost: "localhost:4318"},
+		{name: "fqdn:port", endpoint: "collector.otel.svc.cluster.local:4318", wantHost: "collector.otel.svc.cluster.local:4318"},
+		{name: "host:port keeps --otlp-insecure", endpoint: "localhost:4318", insecure: true, wantHost: "localhost:4318", wantInsec: true},
+		{name: "ipv6 host:port", endpoint: "[::1]:4318", wantHost: "[::1]:4318"},
+		// Explicit URLs (pre-existing behavior, preserved).
+		{name: "http URL forces insecure", endpoint: "http://127.0.0.1:4318", wantHost: "127.0.0.1:4318", wantInsec: true},
+		{name: "http URL keeps explicit insecure", endpoint: "http://collector:4318", insecure: true, wantHost: "collector:4318", wantInsec: true},
+		{name: "https URL keeps TLS", endpoint: "https://collector.example.com:4318", wantHost: "collector.example.com:4318"},
+		// Garbage rejection.
+		{name: "unknown scheme", endpoint: "grpc://collector:4318", wantErr: true},
+		{name: "bare hostname without port", endpoint: "localhost", wantErr: true},
+		{name: "port without host", endpoint: ":4318", wantErr: true},
+		{name: "empty port", endpoint: "localhost:", wantErr: true},
+		{name: "non-numeric port", endpoint: "localhost:otlp", wantErr: true},
+		{name: "port out of range", endpoint: "localhost:99999", wantErr: true},
+		{name: "scheme URL without host", endpoint: "http://", wantErr: true},
+		{name: "unbracketed ipv6 (too many colons)", endpoint: "::1:4318", wantErr: true},
+		{name: "prose garbage", endpoint: "not a collector, honestly", wantErr: true},
+	}
+	for _, c := range cases {
+		gotHost, gotInsec, err := normalizeOTLPEndpoint(c.endpoint, c.insecure)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: normalizeOTLPEndpoint(%q) = %q, %v; want error", c.name, c.endpoint, gotHost, gotInsec)
+			} else if !strings.Contains(err.Error(), "invalid --otlp-endpoint") {
+				t.Errorf("%s: error = %v, want the invalid --otlp-endpoint message", c.name, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: normalizeOTLPEndpoint(%q): %v", c.name, c.endpoint, err)
+			continue
+		}
+		if gotHost != c.wantHost || gotInsec != c.wantInsec {
+			t.Errorf("%s: normalizeOTLPEndpoint(%q) = %q, %v; want %q, %v", c.name, c.endpoint, gotHost, gotInsec, c.wantHost, c.wantInsec)
+		}
+	}
 }
 
 // ---- default boot smoke test (issue #122) ----
