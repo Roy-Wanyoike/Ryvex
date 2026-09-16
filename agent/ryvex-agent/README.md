@@ -95,7 +95,10 @@ cargo clippy -- -D warnings
 Live E2E (run in CI-adjacent scripts, all verified):
 
 1. Agent enrolls against `ryvexd --seed` → node visible at its scope path
-2. Generation advances per heartbeat; node count stays at one
+2. Generation advances **only when `spec.last_seen` refreshes** — at
+   most once per `--spec-refresh-secs` (default 300s). Heartbeats
+   between refreshes are no-ops: same generation, no `updated` event
+   (see the Behavior section and #72). Node count stays at one
 3. `DELETE` the node mid-run → agent re-creates it within one tick
 4. SIGTERM → `status_message: "draining"` observable via the API
 

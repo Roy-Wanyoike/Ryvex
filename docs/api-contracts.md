@@ -263,8 +263,8 @@ Consequences:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/v1/{org}/events?limit=&from=` | Recent bus events for an org (newest first) |
-| GET | `/v1/{org}/audit?kind=&limit=` | Audit entries for an org (newest first) |
+| GET | `/v1/{org}/events?limit=&from=&cursor=` | Recent bus events for an org (newest first) |
+| GET | `/v1/{org}/audit?kind=&limit=&cursor=` | Audit entries for an org (newest first) |
 | POST | `/v1/{org}/reconcile/{id}` | Trigger an immediate reconcile. `202` |
 
 **Event cursor (`?from=`):** on the NATS JetStream bus, pass
@@ -274,16 +274,45 @@ can resume without gaps or duplicates. A non-integer `from` is a `400`
 validation error. The in-memory bus does not implement the cursor —
 `from` is ignored there and `last_seq` is absent.
 
-**Feed pagination (`cursor` + `next_cursor`):** the paginated list
-faces return a `next_cursor` field alongside their items and accept a
-`cursor` query parameter for the following page. The stable rule,
-regardless of backend: pass back the `next_cursor` you received until
-it comes back **empty (`""`)**, which means the feed is exhausted.
-This contract is being wired through the events and audit feeds
-([#107](https://github.com/Roy-Wanyoike/Ryvex/issues/107) — in flight;
-until it merges, `/v1/{org}/audit` takes `kind`/`limit`, the events
-feed takes `limit` plus the JetStream `from=` cursor above, and
-`/v1/resources` + scope lists already honor `cursor`/`next_cursor`).
+**Feed pagination (`cursor` + `next_cursor`):** both feed faces — events
+and audit — are cursor-paginated with the exact wire contract of the
+resources listing ([#107](https://github.com/Roy-Wanyoike/Ryvex/issues/107),
+merged via PR #114): pass `?cursor=`, receive `next_cursor` at the same
+envelope position, and pass it back until it comes back
+**empty (`""`)**, which means the feed is exhausted.
+
+- **Envelopes.** `GET /v1/{org}/events?limit=&cursor=` answers
+  `{events, count, next_cursor}`; `GET
+  /v1/{org}/audit?kind=&limit=&cursor=` answers `{entries, count,
+  next_cursor}`. The key is always present — `""` when the feed is
+  exhausted.
+- **Page size.** `limit` defaults to 100 and is capped at 500;
+  out-of-range values (≤ 0 or > 500) clamp back to 100.
+- **Events cursors are sequence-based.** Every bus backend stamps a
+  monotonic publish sequence into the event ID (`evt-<n>`); a cursor is
+  that sequence encoded in the shared v2 cursor-token format and means
+  *"everything strictly older than the oldest event already
+  delivered"*. Pages advance newest→oldest and the minted sequence
+  strictly decreases per page, so a walk terminates and can never loop.
+  A well-formed cursor **above** every retained sequence serves the
+  whole feed (everything is older than it); on the JetStream backend a
+  walk beyond the bounded scan window (#15) clamps to an empty page,
+  like a stale cursor — never an error.
+- **Audit cursors reuse the store's offset-cursor machinery** (the #85
+  semantics: the shared v2 token; offsets past the retained window
+  clamp to an empty page). Entries evicted from the audit retention
+  ring mid-walk neither error nor loop the walk.
+- **Stale or evicted cursor** (either face) clamps to a clean
+  **empty page with `next_cursor: ""`** — never an error.
+- **Malformed cursor → `400 bad_request`** — the same mapping as the
+  resources listing, on both feeds.
+- **`from` and `cursor` are mutually exclusive** on the events feed:
+  passing both is a `400 bad_request`, not a silent precedence rule.
+  `?from=` alone keeps the frozen replay contract above; on a bus
+  without sequence replay (the in-memory ring) `from` is ignored — the
+  request lands on the newest-first pagination path and the response
+  carries the additive `next_cursor` key (always `""`) while `last_seq`
+  stays absent.
 
 ## Event subjects
 

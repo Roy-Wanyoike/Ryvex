@@ -75,7 +75,7 @@
 1. **Postgres/NATS parity suites** execute only where service containers exist — the CI from issue #34, once it lands, runs them on every push; until then they self-skip locally. The memory backend is exercised everywhere.
 2. **Rust agent** first formal compile+clippy+test run happens in CI (see conditions above).
 3. Offset-based pagination can skip/duplicate under concurrent writes (inherent to offset cursors; keyset cursors are the follow-up if pagination-under-churn matters). Reconciler treats this benignly.
-4. `natsbus` publish-failure counting has no dedicated metric instrument yet (logged on failure; follow-up instrument suggested in PR #61).
+4. `natsbus` publish-failure counting has no dedicated metric instrument yet (logged on failure; follow-up instrument suggested in PR #61). *(Historical footnote: this gap has since closed — the JetStream backend registers `ryvex_bus_publish_failures_total` (#81) and the cross-backend publish-metric contract was pinned in #109; the supersession banner at the top of this report governs everything else.)*
 5. Console in live mode reads the API with a bearer token held in memory/sessionStorage — HttpOnly-cookie flow is the long-term hardening path (noted in PR #63).
 
 ## Onboarding statement
