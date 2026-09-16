@@ -30,11 +30,13 @@ func TestStoreAuditRetention(t *testing.T) {
 // TestStoreUpdateNoOpKeepsUpdatedAt pins the in-memory store's #108
 // semantics: a no-op update leaves UpdatedAt untouched (the
 // byte-identical heartbeat invariant) while a real change stamps a
-// fresh UpdatedAt alongside the generation bump. This case is
-// memory-backend only for now: the shared statetest suite is
-// backend-agnostic and pgstore.UpdateResource still documents
-// rewriting updated_at on no-op updates - aligning the durable backend
-// is a follow-up, noted in the #108 PR.
+// fresh UpdatedAt alongside the generation bump. The durable backend
+// has had the same guarantee since pgstore parity landed (issue #115,
+// PR #116): pgstore.UpdateResource detects no-ops via JSON equality on
+// the locked pre-image and stores a byte-identical row, and the shared
+// statetest suite runs UpdateNoOpPreservesUpdatedAt against every
+// backend. This hand-written case stays as a direct pin on the
+// reference in-memory store.
 func TestStoreUpdateNoOpKeepsUpdatedAt(t *testing.T) {
 	s := state.NewStore()
 	created, err := s.CreateResource(&state.Resource{

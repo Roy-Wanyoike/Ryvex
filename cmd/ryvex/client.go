@@ -211,10 +211,16 @@ type reconcileDoc struct {
 	Reason     string `json:"reason"`
 }
 
-// healthDoc is the /healthz document.
+// healthDoc is the /healthz document. Resources is a pointer so a
+// withheld count is distinguishable from a real zero: the server omits
+// the field for anonymous/unauthorized probes (issue #38), and nil
+// means "not sent". -o json mode passes the raw response through
+// verbatim (dumpJSON), so a withheld count stays omitted there too —
+// consistently representing absent as omitted, never null or 0
+// (issue #121).
 type healthDoc struct {
 	Status    string `json:"status"`
 	Service   string `json:"service"`
 	Version   string `json:"version"`
-	Resources int    `json:"resources"`
+	Resources *int   `json:"resources,omitempty"`
 }

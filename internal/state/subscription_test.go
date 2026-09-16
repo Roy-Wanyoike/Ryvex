@@ -66,6 +66,7 @@ func TestParseSubscriptionSpecInvalid(t *testing.T) {
 		{"not a url", subSpec(map[string]any{"url": "not a url"}), "spec.url"},
 		{"wrong scheme", subSpec(map[string]any{"url": "ftp://example.test/hook"}), "spec.url"},
 		{"no host", subSpec(map[string]any{"url": "http:///hook"}), "spec.url"},
+		{"empty port", subSpec(map[string]any{"url": "http://example.test:/hook"}), "spec.url"},
 		{"missing subjects", map[string]any{"url": "https://example.test/hook"}, "spec.subjects"},
 		{"subjects not array", subSpec(map[string]any{"subjects": "ryvex.resource.a.>"}), "spec.subjects"},
 		{"empty subjects", subSpec(map[string]any{"subjects": []any{}}), "spec.subjects"},
@@ -96,6 +97,39 @@ func TestParseSubscriptionSpecInvalid(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err.Error(), tc.inField)
 			}
 		})
+	}
+}
+
+// TestParseSubscriptionSpecEmptyPort pins the #121 URL hygiene rule:
+// an explicit empty port ("http://host:/hook") is refused at create
+// time — the dispatcher would silently dial the scheme's default port
+// and mask the typo — while scheme-default URLs (no port at all) and
+// real ports keep validating, including bracketed IPv6 hosts.
+func TestParseSubscriptionSpecEmptyPort(t *testing.T) {
+	for _, raw := range []string{
+		"http://example.test:/hook",
+		"https://hooks.example.test:/x",
+		"http://[2001:db8::1]:/hook", // bracketed v6 with an empty port
+	} {
+		_, err := ParseSubscriptionSpec(subSpec(map[string]any{"url": raw}))
+		var ve *ValidationError
+		if !errors.As(err, &ve) {
+			t.Errorf("ParseSubscriptionSpec(%q) err = %v, want *ValidationError", raw, err)
+			continue
+		}
+		if ve.Field != "spec" || !strings.Contains(ve.Message, "empty port") {
+			t.Errorf("ParseSubscriptionSpec(%q) error = %q, want spec field and empty-port message", raw, ve.Message)
+		}
+	}
+
+	for _, raw := range []string{
+		"https://example.test/hook",      // scheme-default: no port at all
+		"http://example.test:8443/hook",  // explicit port
+		"http://[2001:db8::1]:8443/hook", // bracketed v6 with a real port
+	} {
+		if _, err := ParseSubscriptionSpec(subSpec(map[string]any{"url": raw})); err != nil {
+			t.Errorf("ParseSubscriptionSpec(%q) err = %v, want nil", raw, err)
+		}
 	}
 }
 

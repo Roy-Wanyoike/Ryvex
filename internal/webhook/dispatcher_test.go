@@ -1004,3 +1004,50 @@ func TestOnEventDurableTaxonomy(t *testing.T) {
 		t.Fatalf("panic = %v, want bus.ErrEventRetry (contained, redelivered)", err)
 	}
 }
+
+// TestRandomSecretDegradedModeLogs pins the #121 observability fix:
+// when crypto/rand fails, the documented deterministic fallback stays
+// (unchanged behavior), but the dispatcher's injected logger must say
+// so loudly. The exported RandomSecret stays silent — it has no
+// logger in scope.
+func TestRandomSecretDegradedModeLogs(t *testing.T) {
+	var buf strings.Builder
+	degraded := slog.New(slog.NewTextHandler(&buf, nil))
+
+	orig := cryptoRandRead
+	cryptoRandRead = func(b []byte) (int, error) { return 0, errors.New("entropy source unavailable") }
+	t.Cleanup(func() { cryptoRandRead = orig })
+	want := hex.EncodeToString([]byte("ryvex-insecure-fallback-webhook-secret"))
+
+	// The exported helper keeps its fallback value, silently.
+	if got := RandomSecret(); got != want {
+		t.Fatalf("RandomSecret() = %q, want the documented fallback %q", got, want)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("RandomSecret() logged without a logger: %s", buf.String())
+	}
+
+	// NewDispatcher routes the degraded mode through the injected
+	// logger and still boots with the same fallback secret.
+	st := state.NewStore()
+	d := NewDispatcher(st, bus.New(), testOptions("", func(o *Options) { o.Logger = degraded }))
+	defer d.Stop(time.Second)
+	if got := d.opts.ServerSecret; got != want {
+		t.Fatalf("dispatcher fallback secret = %q, want %q", got, want)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "DEGRADED") || !strings.Contains(out, "crypto/rand failed") {
+		t.Fatalf("degraded-mode line missing from the injected logger, got:\n%s", out)
+	}
+	if !strings.Contains(out, "webhook server secret generated at boot") {
+		t.Fatalf("normal boot line missing, got:\n%s", out)
+	}
+
+	// A healthy entropy source stays silent.
+	cryptoRandRead = orig
+	buf.Reset()
+	_ = NewDispatcher(st, bus.New(), testOptions("", func(o *Options) { o.Logger = degraded }))
+	if out := buf.String(); strings.Contains(out, "DEGRADED") {
+		t.Fatalf("healthy entropy must not log the degraded line, got:\n%s", out)
+	}
+}

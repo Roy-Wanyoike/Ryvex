@@ -544,8 +544,16 @@ func AuthZMiddleware(az *authz.Authorizer, opts AuthOptions, log *slog.Logger) f
 			case tokenDev:
 				ident = Identity{Principal: principal, Admin: true}
 				// Routed through the injected logger, not
-				// slog.Default() (issue #38).
-				log.Info("authz", "mode", "dev", "principal", ident.Principal, "path", r.URL.Path)
+				// slog.Default() (issue #38). The principal
+				// is token-derived key material (issue
+				// #121): dev-auth also admits real API keys
+				// that are disabled/revoked, so echoing it
+				// would leak key material into logs. The
+				// line carries the fixed
+				// "dev-auth-rejected" marker instead; the
+				// context/audit identity keeps the "dev:"
+				// principal for traceability.
+				log.Info("authz", "mode", "dev", "principal", "dev-auth-rejected", "path", r.URL.Path)
 			default:
 				unauthorized(w, r)
 				return
@@ -598,6 +606,12 @@ const (
 // and the periodic safety net) — so there is no separate static tier
 // and lifecycle changes take effect without a restart. Digest
 // comparison stays constant-time (authz.Authenticate).
+//
+// The dev-auth principal it returns ("dev:" + the presented token
+// suffix) is token-derived key material (issue #121): identity and
+// audit records may carry it, but it must never be logged verbatim —
+// the AuthZMiddleware dev log line uses the fixed
+// "dev-auth-rejected" marker instead.
 func resolveToken(az *authz.Authorizer, devAuth bool, tok string) (principal string, info authz.KeyInfo, kind tokenKind) {
 	if p, ok := az.Authenticate(tok); ok {
 		info, _ = az.Lookup(p)

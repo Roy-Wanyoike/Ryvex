@@ -642,3 +642,30 @@ func TestRunHealthLive(t *testing.T) {
 		t.Fatalf("json health: code=%d out=%q", code, out)
 	}
 }
+
+// TestRunHealthWithheldResourceCount pins the #121 health-view fix:
+// the server omits "resources" from anonymous/unauthorized probes
+// (issue #38), and the table must show "-" rather than 0, which would
+// imply an empty store. The documented -o json representation is
+// pass-through verbatim, so a withheld count stays omitted there too.
+func TestRunHealthWithheldResourceCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","service":"ryvexd","version":"v1.2.3","time":"2026-01-01T00:00:00Z"}`))
+	}))
+	defer srv.Close()
+
+	code, out, errOut := captureCLI(t, strings.NewReader(""), "--api", srv.URL, "health")
+	if code != 0 || errOut != "" {
+		t.Fatalf("code=%d err=%q", code, errOut)
+	}
+	want := "status     ok\nservice    ryvexd\nversion    v1.2.3\nresources  -\n"
+	if out != want {
+		t.Fatalf("health output = %q, want %q", out, want)
+	}
+
+	// -o json keeps the server's shape: no resources field, not 0/null.
+	code, out, _ = captureCLI(t, strings.NewReader(""), "--api", srv.URL, "-o", "json", "health")
+	if code != 0 || strings.Contains(out, "resources") {
+		t.Fatalf("json health must keep a withheld count omitted: code=%d out=%q", code, out)
+	}
+}

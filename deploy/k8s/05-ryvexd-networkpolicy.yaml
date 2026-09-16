@@ -16,12 +16,13 @@
 #     in the DSN and RYVEX_NATS_URL;
 #   * Postgres (:5432) and NATS (:4222) within the `ryvex` namespace
 #     (NATS is only dialed when args add "--bus", "nats");
-#   * HTTP/HTTPS (:80/:443) to the world for webhook deliveries — the
-#     dispatcher must reach subscription targets on the public internet.
-#     Private/loopback/CGNAT targets are already refused at the
-#     application layer by the SSRF egress guard (webhook/egress.go,
-#     RYVEX_ALLOW_PRIVATE_WEBHOOKS); the `except:` CIDR list below is
-#     the same policy enforced in the network layer (defense in depth).
+#   * HTTP/HTTPS (:80/:443) to the world (IPv4 and IPv6) for webhook
+#     deliveries — the dispatcher must reach subscription targets on
+#     the public internet. Private/loopback/CGNAT targets are already
+#     refused at the application layer by the SSRF egress guard
+#     (webhook/egress.go, RYVEX_ALLOW_PRIVATE_WEBHOOKS); the `except:`
+#     CIDR lists below mirror that policy in the network layer
+#     (defense in depth) for each address family.
 # Assumption: Postgres and NATS live in the `ryvex` namespace (as these
 # manifests deploy them). Relocating either breaks the egress rules.
 #
@@ -81,7 +82,14 @@ spec:
         - port: 4222
           protocol: TCP
     - # Webhook deliveries to public targets (app-layer SSRF guard
-      # already blocks private ranges; mirrored here).
+      # already blocks private ranges; mirrored here), over IPv4 and
+      # IPv6 so public v6 subscription targets are reachable too. The
+      # IPv6 except list mirrors the v6 checks of
+      # state.ForbiddenWebhookIPReason (issue #36): unspecified,
+      # loopback, link-local (fe80::/10), unique-local (fc00::/7) and
+      # multicast (ff00::/8, which subsumes interface-local ff01::/16).
+      # The guard normalizes IPv4-mapped IPv6 (::ffff:0:0/96) to its
+      # IPv4 value, which the IPv4 ipBlock above governs.
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -91,6 +99,14 @@ spec:
               - 192.168.0.0/16
               - 100.64.0.0/10
               - 169.254.0.0/16
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "::/128"    # unspecified
+              - "::1/128"   # loopback
+              - "fe80::/10" # link-local
+              - "fc00::/7"  # unique-local (ULA)
+              - "ff00::/8"  # multicast (incl. interface-local ff01::/16)
       ports:
         - port: 80
           protocol: TCP

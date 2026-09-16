@@ -286,12 +286,19 @@ func TestDevAuthLogUsesInjectedLogger(t *testing.T) {
 		Authorizer: az,
 	})
 
-	w := doAuth(t, h, http.MethodGet, "/v1/resources", "ryk_devuser_deadbeef", "")
+	tok := "ryk_devuser_deadbeef"
+	w := doAuth(t, h, http.MethodGet, "/v1/resources", tok, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("dev-auth request: want 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(buf.String(), "msg=authz") || !strings.Contains(buf.String(), "principal=dev:devuser_deadbeef") {
+	if !strings.Contains(buf.String(), "msg=authz") || !strings.Contains(buf.String(), "principal=dev-auth-rejected") {
 		t.Fatalf("dev-auth line must go through the injected logger, got:\n%s", buf.String())
+	}
+	// Issue #121: dev-auth also admits real (disabled/revoked) API
+	// keys, so the log must not echo any token-derived material — the
+	// presented token's suffix is exactly what the old line leaked.
+	if strings.Contains(buf.String(), "devuser_deadbeef") {
+		t.Fatalf("dev-auth log echoed token-derived material:\n%s", buf.String())
 	}
 }
 
