@@ -38,6 +38,7 @@ issue tracker is the truth.
 
 ## 🧭 Next
 
+- [ ] **Durable workflow execution (ADR-0001)** — Postgres-backed in-process step durability for multi-step operations; decision and first workflow (Application deploy) in [docs/adr/0001](./adr/0001-durable-workflow-engine.md)
 - [ ] **Go SDK** — a third client alongside `sdk/ryvex-ts` and `sdk/ryvex-py` (does not exist yet)
 - [ ] **Terraform / OpenTofu provider** — manage Ryvex resources from HCL
 - [ ] **Policy-as-code packs** — reusable governance bundles (CIS, cost guardrails) evaluated at admission
