@@ -41,7 +41,9 @@ impl Backoff {
     /// synchronized on the ceiling. Now symmetric, per the contract.
     pub fn advance(&mut self) -> std::time::Duration {
         self.attempt = self.attempt.saturating_add(1);
-        let exp = self.base_secs.saturating_mul(1u64 << (self.attempt - 1).min(6));
+        let exp = self
+            .base_secs
+            .saturating_mul(1u64 << (self.attempt - 1).min(6));
         let capped = exp.min(self.cap_secs);
         let span = capped as f64 * 0.2;
         // thread_rng().r#gen::<f64>() is uniform in [0, 1).

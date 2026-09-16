@@ -5,7 +5,11 @@ use clap::Parser;
 
 /// Ryvex data-plane node agent.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "ryvex-agent", version, about = "Ryvex node agent — enrollment, heartbeats, self-healing")]
+#[command(
+    name = "ryvex-agent",
+    version,
+    about = "Ryvex node agent — enrollment, heartbeats, self-healing"
+)]
 pub struct Config {
     /// Control plane base URL.
     #[arg(long, env = "RYVEX_AGENT_API", default_value = "http://127.0.0.1:8080")]
