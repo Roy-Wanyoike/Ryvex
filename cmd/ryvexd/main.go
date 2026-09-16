@@ -30,6 +30,12 @@ Flags (serve):
   --metrics-addr addr  dedicated listen address for /metrics (empty disables, env RYVEX_METRICS_ADDR)
   --seed               load the demo dataset on boot
   --log-level lvl      debug | info | warn | error (default info)
+
+Provider SPI (issue #80, docs/adr/0002-provider-spi.md; actuator requires -tags docker):
+  --enable-docker-actuator  actuate Application resources against a Docker Engine
+  --docker-socket path      Docker Engine unix socket (default "/var/run/docker.sock",
+                            env RYVEX_DOCKER_SOCKET)
+  --drift-interval dur      drift-detection pass cadence for actuated kinds (default 60s)
 `
 
 func main() {

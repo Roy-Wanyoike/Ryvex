@@ -49,6 +49,15 @@ func runServe(args []string) error {
 	busKind := fs.String("bus", "memory", "event bus backend: memory (default) or nats (JetStream)")
 	natsURL := fs.String("nats-url", envOr("RYVEX_NATS_URL", "nats://127.0.0.1:4222"), "NATS server URL used when --bus=nats")
 	// --- end nats bus flags ---
+	// --- provider SPI (issue #80, docs/adr/0002-provider-spi.md): docker reference actuator ---
+	// The actuator is compiled in only with `-tags docker`; enabling it
+	// on a binary without the tag degrades honestly (loud warning,
+	// status-only convergence), while an engine that fails its boot ping
+	// on a tagged binary refuses to start (same posture as --bus=nats).
+	enableDockerActuator := fs.Bool("enable-docker-actuator", false, "actuate Application resources against a Docker Engine (requires a binary built with -tags docker)")
+	dockerSocket := fs.String("docker-socket", envOr("RYVEX_DOCKER_SOCKET", "/var/run/docker.sock"), "Docker Engine unix socket used when --enable-docker-actuator is set")
+	driftInterval := fs.Duration("drift-interval", 60*time.Second, "cadence of the drift-detection pass for actuated kinds")
+	// --- end provider SPI flags ---
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -125,10 +134,22 @@ func runServe(args []string) error {
 		log.Debug("event", "subject", e.Subject, "type", e.Type, "resource", e.Kind+"/"+e.Name)
 	})
 
+	// --- provider SPI (issue #80): actuator wiring ---
+	// dockerActuators is a build-tag seam: with -tags docker it pings the
+	// Engine and returns the reference actuator (a dead engine fails the
+	// boot); without the tag it warns loudly and returns nothing, so the
+	// reconciler converges status-only exactly as before #80.
+	acts, err := dockerActuators(*enableDockerActuator, *dockerSocket, log)
+	if err != nil {
+		return err
+	}
+
 	reconciler := reconcile.New(store, eventBus, reconcile.Options{
-		Interval:    30 * time.Second,
-		Concurrency: 4,
-		Logger:      log,
+		Interval:      30 * time.Second,
+		Concurrency:   4,
+		Logger:        log,
+		Actuators:     acts,
+		DriftInterval: *driftInterval,
 	})
 
 	// --- webhooks (issue #13): event dispatcher ---
