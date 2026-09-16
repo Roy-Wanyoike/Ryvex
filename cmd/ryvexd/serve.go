@@ -31,6 +31,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // runServe boots the full control plane stack:
@@ -39,6 +40,15 @@ import (
 //
 // and blocks until an interrupt signal triggers graceful shutdown.
 func runServe(args []string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runServeContext(ctx, args)
+}
+
+// runServeContext is runServe with an injectable lifetime: the daemon
+// passes a signal context, tests pass a cancellable one so the default
+// boot can be exercised in-process (issue #122 regression test).
+func runServeContext(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	httpAddr := fs.String("http", envOr("RYVEX_HTTP_ADDR", ":8080"), "HTTP listen address")
 	storeKind := fs.String("store", "memory", "state backend (memory)")
@@ -231,9 +241,6 @@ func runServe(args []string) error {
 		TracerProvider: tracerProvider, // nil = tracing disabled (issue #83)
 	})
 	srv := newHTTPServer(*httpAddr, handler)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	recCtx, recCancel := context.WithCancel(ctx)
 	defer recCancel()
@@ -458,12 +465,29 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
+// TracerProviderIface is the surface the daemon needs from the OTel
+// SDK tracer provider: the trace.TracerProvider span factory plus the
+// Shutdown hook the graceful-stop path flushes with.
+//
+// setupTracing declares this interface — NOT the concrete
+// *sdktrace.TracerProvider — as its return type, so the
+// tracing-disabled path can `return nil, nil` and produce a TRUE nil
+// interface (issue #122). Returning the concrete pointer instead made
+// the disabled-path nil a typed nil inside the interface-typed
+// Options.TracerProvider fields of the reconciler, API server and
+// webhook dispatcher; their `== nil` guards never fired and the very
+// first .Tracer(...) call panicked on every default boot.
+type TracerProviderIface interface {
+	trace.TracerProvider
+	Shutdown(ctx context.Context) error
+}
+
 // setupTracing boots the OpenTelemetry SDK when an OTLP endpoint is
 // configured (issue #83). It returns the started provider — whose
-// Shutdown flushes the exporter on the graceful-shutdown path — or nil
-// when tracing is disabled (the default posture: the global tracer
-// provider stays the no-op default and every span in the codebase
-// degenerates to a no-op).
+// Shutdown flushes the exporter on the graceful-shutdown path — or a
+// true nil interface when tracing is disabled (the default posture:
+// the global tracer provider stays the no-op default and every span
+// in the codebase degenerates to a no-op).
 //
 // Semantics:
 //   - propagation: W3C tracecontext, registered globally; an upstream
@@ -475,9 +499,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //   - an unreachable collector does NOT fail the boot: the exporter
 //     creates no connection here and batches spans in memory, so a
 //     missing collector degrades observability, never availability.
-func setupTracing(ctx context.Context, log *slog.Logger, endpoint string, insecure bool, ratio float64) (*sdktrace.TracerProvider, error) {
+func setupTracing(ctx context.Context, log *slog.Logger, endpoint string, insecure bool, ratio float64) (TracerProviderIface, error) {
 	if endpoint == "" {
-		return nil, nil
+		return nil, nil // true interface nil: never a typed *sdktrace.TracerProvider (issue #122)
 	}
 	if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" {
 		switch u.Scheme {

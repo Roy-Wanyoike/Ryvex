@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -275,8 +277,21 @@ func TestSetupTracing(t *testing.T) {
 
 	// Disabled (default): no endpoint, no provider, no error.
 	tp, err := setupTracing(context.Background(), log, "", false, 1.0)
-	if tp != nil || err != nil {
-		t.Errorf("setupTracing(\"\") = %v, %v; want nil, nil", tp, err)
+	if err != nil {
+		t.Errorf("setupTracing(\"\"): %v", err)
+	}
+	if tp != nil {
+		t.Errorf("setupTracing(\"\") = %v; want nil", tp)
+	}
+	// Issue #122 regression: the return used to be the concrete
+	// *sdktrace.TracerProvider, so this nil landed in the interface-typed
+	// Options.TracerProvider fields as a typed nil — a non-nil interface
+	// wrapping a nil pointer — and every `== nil` guard in reconcile,
+	// api and webhook missed, panicking on the default boot. The value
+	// the consumers receive must be a TRUE nil interface.
+	var iface trace.TracerProvider = tp // exactly what reconcile.Options / api.ServerOptions / webhook.Options store
+	if iface != nil {
+		t.Errorf("setupTracing(\"\") stored into trace.TracerProvider = %#v; want a true nil interface (typed nil, issue #122)", iface)
 	}
 
 	// Unsupported scheme: refuse to boot with a bad endpoint.
@@ -300,6 +315,83 @@ func TestSetupTracing(t *testing.T) {
 		t.Errorf("provider shutdown: %v", err)
 	}
 	restore()
+}
+
+// ---- default boot smoke test (issue #122) ----
+
+// TestRunServeDefaultBootSmoke boots the full daemon in-process with
+// default flags — no --otlp-endpoint, exactly the README quickstart —
+// which was impossible before #122: the typed-nil TracerProvider
+// panicked inside reconcile.New before any listener could come up.
+// Pins the acceptance points: /readyz answers 200, responses carry NO
+// X-Ryvex-Trace-Id header (tracing stays off without an endpoint),
+// and cancelling the lifetime context shuts the daemon down cleanly.
+func TestRunServeDefaultBootSmoke(t *testing.T) {
+	clearServeEnv(t)
+
+	// Reserve a free port, then release it for the daemon. The tiny
+	// bind-close-bind window is the accepted trade-off of in-process
+	// boot tests; a collision just fails the run, not the machine.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatalf("release reserved port: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- runServeContext(ctx, []string{"--http", addr}) }()
+
+	// Poll /readyz until the daemon is up (or dies early).
+	client := &http.Client{Timeout: 2 * time.Second}
+	readyz := "http://" + addr + "/readyz"
+	var resp *http.Response
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		select {
+		case err := <-errCh:
+			t.Fatalf("runServeContext exited before becoming ready: %v", err)
+		default:
+		}
+		r, getErr := client.Get(readyz)
+		if getErr == nil {
+			if r.StatusCode == http.StatusOK {
+				resp = r
+				break
+			}
+			r.Body.Close()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/readyz never returned 200 (last error: %v)", getErr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	defer resp.Body.Close()
+
+	// Tracing is OFF on the default boot: X-Ryvex-Trace-Id must be
+	// absent outright (the #83 contract is absent, never empty-valued).
+	if _, present := resp.Header[http.CanonicalHeaderKey("X-Ryvex-Trace-Id")]; present {
+		t.Errorf("X-Ryvex-Trace-Id present on the default boot; tracing must stay disabled without --otlp-endpoint")
+	}
+	if resp.Header.Get("X-Request-Id") == "" {
+		t.Error("X-Request-Id response header missing on /readyz")
+	}
+
+	// Graceful shutdown: cancelling the lifetime context (the test
+	// stand-in for SIGTERM) must return nil from runServeContext.
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runServeContext shutdown: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("runServeContext did not return after lifetime cancel")
+	}
 }
 
 // ---- version stamp ----
