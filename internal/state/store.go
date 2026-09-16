@@ -375,6 +375,18 @@ func logical(org, project, env, kind, name string) string {
 	return strings.Join([]string{org, project, env, kind, name}, "/")
 }
 
+// SpecLabelsEqual reports whether two resources carry an equivalent
+// spec and label set, using the store's canonical comparison: Spec is
+// compared via its JSON encoding (map key order can never matter) and
+// Labels via plain map equality. This is the exact predicate
+// UpdateResource uses to decide the generation bump and the "updated"
+// audit entry. It is exported so the API layer can gate EventUpdated
+// publication on the same decision (issue #72: no-op heartbeat PUTs
+// must not fan events) — the published and stored change decisions
+// therefore cannot drift apart, and the bus stays out of
+// internal/state.
+func SpecLabelsEqual(a, b *Resource) bool { return specLabelsEqual(a, b) }
+
 func specLabelsEqual(a, b *Resource) bool {
 	eq := func(m1, m2 map[string]string) bool {
 		if len(m1) != len(m2) {
