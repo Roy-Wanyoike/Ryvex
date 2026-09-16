@@ -30,13 +30,66 @@ type Store struct {
 	mu      sync.RWMutex
 	byID    map[string]*Resource
 	byLogic map[string]string // logical key -> id
-	audit   []AuditEntry
-	seq     uint64
+	// Audit retention ring (issue #85): a fixed-capacity ring keeping
+	// the newest auditCap entries with oldest-first eviction. The
+	// backing array is pre-allocated once in NewStore and never grows
+	// or reallocates; while len(audit) < auditCap entries append, and
+	// once full auditWrite marks the next slot to overwrite (the
+	// oldest entry). auditEvicted counts evictions; seq advances once
+	// per entry and is never reset, staying monotonic across evictions
+	// (mirroring the pgstore seq column that orders its audit table).
+	audit        []AuditEntry
+	auditWrite   int
+	auditCap     int
+	auditEvicted uint64
+	seq          uint64
 }
 
-// NewStore returns an empty store.
-func NewStore() *Store {
-	return &Store{byID: map[string]*Resource{}, byLogic: map[string]string{}}
+// DefaultAuditCap is the default audit-retention cap for the memory
+// backend (issue #85): the ring keeps the newest 10,000 entries and
+// evicts oldest-first once full. The Postgres backend needs no cap —
+// its audit table is the durable compliance record and is meant to
+// grow with traffic; only the in-memory log was unbounded.
+const DefaultAuditCap = 10000
+
+// NewStore returns an empty store. Options tune optional behaviour;
+// the zero-option form keeps the historical defaults (audit cap =
+// DefaultAuditCap, issue #85), so existing call sites are unchanged.
+func NewStore(opts ...Option) *Store {
+	c := storeConfig{auditCap: DefaultAuditCap}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&c)
+		}
+	}
+	if c.auditCap <= 0 {
+		c.auditCap = DefaultAuditCap
+	}
+	return &Store{
+		byID:     map[string]*Resource{},
+		byLogic:  map[string]string{},
+		audit:    make([]AuditEntry, 0, c.auditCap), // pre-allocated ring, never grown
+		auditCap: c.auditCap,
+	}
+}
+
+// Option adjusts optional Store behaviour at construction (issue #85).
+type Option func(*storeConfig)
+
+type storeConfig struct {
+	auditCap int
+}
+
+// WithAuditCap bounds the in-memory audit log to the newest n entries,
+// evicting oldest-first (issue #85). n <= 0 falls back to
+// DefaultAuditCap. The Postgres backend ignores the knob: its audit
+// table is unbounded by design.
+func WithAuditCap(n int) Option {
+	return func(c *storeConfig) {
+		if n > 0 {
+			c.auditCap = n
+		}
+	}
 }
 
 func newID() string {
@@ -315,6 +368,20 @@ type AuditOptions struct {
 // ListAudit returns audit entries newest-first. The in-memory store
 // cannot fail; the error return keeps parity with state.Backend
 // (issue #71).
+//
+// Retention (issue #85): the memory backend keeps at most AuditCap
+// entries (DefaultAuditCap by default; WithAuditCap / ryvexd
+// --audit-cap override) and evicts oldest-first once full, so the
+// newest-first contract is unaffected — evicted entries are simply
+// absent from listings, never phantom or reordered. Offset cursors
+// built from the shared v2 helpers (the 8-byte base64url tokens the
+// list pagination issues) keep decoding for any offset that was ever
+// minted: an offset that now lands past the retained window clamps to
+// an empty page exactly like a cursor past the end of a list, so a
+// walk across the eviction boundary can neither error nor loop. (The
+// audit listing itself is limit-paged; ListResources owns the
+// offset-cursor machinery this guarantee refers to.) The Postgres
+// backend needs no cap: its audit table is the durable record.
 func (s *Store) ListAudit(o AuditOptions) ([]AuditEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -322,9 +389,12 @@ func (s *Store) ListAudit(o AuditOptions) ([]AuditEntry, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
+	n := len(s.audit)
 	out := make([]AuditEntry, 0, limit)
-	for i := len(s.audit) - 1; i >= 0 && len(out) < limit; i-- {
-		e := s.audit[i]
+	for k := 0; k < n && len(out) < limit; k++ {
+		// newest-first over the ring: (auditWrite-1-k) mod n. The +n
+		// keeps the operand non-negative for every k < n.
+		e := s.audit[(s.auditWrite-1-k+n)%n]
 		if o.Org != "" && !strings.HasPrefix(e.LogicalKey, o.Org+"/") {
 			continue
 		}
@@ -336,9 +406,18 @@ func (s *Store) ListAudit(o AuditOptions) ([]AuditEntry, error) {
 	return out, nil
 }
 
+// AuditEvicted reports how many audit entries the memory backend has
+// evicted oldest-first since construction (issue #85). A steadily
+// climbing value is the operational signal that the retention ring is
+// rolling; the Postgres backend never evicts its audit table.
+func (s *Store) AuditEvicted() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.auditEvicted
+}
+
 func (s *Store) appendAuditLocked(actor, action string, r *Resource) {
-	s.seq++
-	s.audit = append(s.audit, AuditEntry{
+	s.appendAuditRingLocked(AuditEntry{
 		ID:         newAuditID(),
 		Time:       time.Now().UTC(),
 		Actor:      actor,
@@ -348,6 +427,30 @@ func (s *Store) appendAuditLocked(actor, action string, r *Resource) {
 		LogicalKey: r.LogicalKey(),
 		Generation: r.Generation,
 	})
+}
+
+// appendAuditRingLocked writes one entry into the audit ring (issue
+// #85). Below the cap it appends within the pre-reserved capacity —
+// the backing array is allocated once in NewStore and never grows or
+// reallocates — and at the cap it overwrites the oldest slot
+// (oldest-first eviction), advancing auditWrite and the eviction
+// counter. seq advances exactly once per entry and is never reset, so
+// the audit sequence stays monotonic across evictions.
+func (s *Store) appendAuditRingLocked(e AuditEntry) {
+	s.seq++
+	if s.auditCap <= 0 { // defensive: a zero-value Store stays bounded
+		s.auditCap = DefaultAuditCap
+	}
+	if len(s.audit) < s.auditCap {
+		s.audit = append(s.audit, e)
+		return
+	}
+	s.audit[s.auditWrite] = e
+	s.auditWrite++
+	if s.auditWrite == s.auditCap {
+		s.auditWrite = 0
+	}
+	s.auditEvicted++
 }
 
 // AppendAudit records a caller-built audit entry for outcomes that are
@@ -360,20 +463,31 @@ func (s *Store) appendAuditLocked(actor, action string, r *Resource) {
 func (s *Store) AppendAudit(e AuditEntry) (AuditEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.seq++
 	if e.ID == "" {
 		e.ID = newAuditID()
 	}
 	if e.Time.IsZero() {
 		e.Time = time.Now().UTC()
 	}
-	s.audit = append(s.audit, e)
+	s.appendAuditRingLocked(e)
 	return e, nil
 }
 
 func logical(org, project, env, kind, name string) string {
 	return strings.Join([]string{org, project, env, kind, name}, "/")
 }
+
+// SpecLabelsEqual reports whether two resources carry an equivalent
+// spec and label set, using the store's canonical comparison: Spec is
+// compared via its JSON encoding (map key order can never matter) and
+// Labels via plain map equality. This is the exact predicate
+// UpdateResource uses to decide the generation bump and the "updated"
+// audit entry. It is exported so the API layer can gate EventUpdated
+// publication on the same decision (issue #72: no-op heartbeat PUTs
+// must not fan events) — the published and stored change decisions
+// therefore cannot drift apart, and the bus stays out of
+// internal/state.
+func SpecLabelsEqual(a, b *Resource) bool { return specLabelsEqual(a, b) }
 
 func specLabelsEqual(a, b *Resource) bool {
 	eq := func(m1, m2 map[string]string) bool {

@@ -19,6 +19,8 @@ Usage:
 Flags (serve):
   --http addr          listen address (default ":8080", env RYVEX_HTTP_ADDR)
   --store kind         state backend: "memory" (default) or "postgres" (requires --dsn)
+  --audit-cap n        max audit entries kept by the memory backend, oldest evicted first
+                       (default 10000, env RYVEX_AUDIT_CAP; ignored with --store=postgres)
   --dsn url            Postgres DSN (required when --store=postgres, env RYVEX_DATABASE_URL)
   --bus kind           event bus backend: "memory" (default) or "nats" (JetStream)
   --nats-url url       NATS server URL used when --bus=nats (default "nats://127.0.0.1:4222", env RYVEX_NATS_URL)
