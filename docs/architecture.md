@@ -21,10 +21,10 @@
    │  SDKs &    │──────▶│              │                │
    │  Automation│       │  ┌───────────▼─────────────┐  │
    └────────────┘       │  │       Event Bus         │  │
-                        │  │ ryvex.resource.*        │  │
-                        │  └───────────┬─────────────┘  │
-                        │  ┌───────────▼─────────────┐  │
-                        │  │       Reconciler        │  │
+   ┌────────────┐       │  │ ryvex.resource.*        │  │
+   │ Node agent │──────▶│  └───────────┬─────────────┘  │
+   │  GET/PUT   │       │  ┌───────────▼─────────────┐  │
+   └────────────┘       │  │       Reconciler        │  │
                         │  │ Pending→Provisioning→   │  │
                         │  │ Ready, per generation   │  │
                         │  └─────────────────────────┘  │
@@ -50,8 +50,11 @@ touching the API or the reconciler.
    is Pending/Provisioning) and drives them toward the declared spec,
    stamping observed state as it goes.
 4. **Observe.** Every mutation and transition is a typed event on the
-   bus (`ryvex.resource.{org}.{kind}.{event}`) — the console, webhooks
-   and the node agent subscribe to exactly the slice they care about.
+   bus (`ryvex.resource.{org}.{kind}.{event}`). Webhook subscriptions
+   subscribe to exactly the slice they care about; the console and CLI
+   poll the replay API (`GET /v1/{org}/events`) instead. The Rust node
+   agent never subscribes — it talks plain GET/PUT to the REST API
+   (fetch its node document, upsert enrollment/heartbeat state).
 
 ## Components
 

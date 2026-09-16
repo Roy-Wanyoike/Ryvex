@@ -16,6 +16,7 @@ import { ResourceDrawer } from "@/components/drawer";
 import { SettingsView } from "@/components/settings";
 import { Toasts } from "@/components/toasts";
 import { toast } from "@/lib/toast";
+import { RYVEX_VERSION } from "@/lib/version";
 import { AuditView, EventsView, OverviewView, ResourcesView, TopologyView } from "@/components/views";
 
 type ViewKey = "overview" | "resources" | "topology" | "events" | "audit" | "settings";
@@ -220,7 +221,7 @@ export default function Home() {
               <span className="h-1.5 w-1.5 rounded-full bg-current" />
               {badge.label}
             </span>
-            <span className="chip">v1.0.0</span>
+            <span className="chip">{RYVEX_VERSION}</span>
             <span className="chip border-[var(--violet)]/40 text-[var(--violet)]">ryvexd</span>
           </div>
         </header>
