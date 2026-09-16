@@ -55,3 +55,70 @@ func TestMetricsPublishedAndDelivered(t *testing.T) {
 		t.Fatalf("published{unknown} delta = %v, want 1", got)
 	}
 }
+
+// TestCancelStopsDeliveredMetric pins the delivered-counter half of
+// issue #69: after a subscription is canceled, matching publishes must
+// not move ryvex_bus_events_delivered_total at all — not even for the
+// zombie entry the pre-fix wrong-element delete left behind (its nil
+// handler was invoked, recovered at runHandler, but still counted as a
+// delivery). A surviving subscriber on the same pattern proves the
+// counter tracks exactly its live deliveries.
+func TestCancelStopsDeliveredMetric(t *testing.T) {
+	b := New()
+	var survivor atomic.Int64
+	b.Subscribe("ryvex.resource.cancelmetric.>", func(Event) { survivor.Add(1) })
+	zombie := b.Subscribe("ryvex.resource.cancelmetric.>", func(Event) {})
+
+	b.Publish(Event{Org: "cancelmetric", Kind: "Node", Type: EventDeleted})
+	if survivor.Load() != 1 {
+		t.Fatalf("precondition failed: survivor got %d deliveries", survivor.Load())
+	}
+
+	del0 := metrics.BusEventsDeliveredTotal.Value()
+	zombie.Cancel()
+
+	b.Publish(Event{Org: "cancelmetric", Kind: "Node", Type: EventDeleted})
+	b.Publish(Event{Org: "cancelmetric", Kind: "Node", Type: EventDeleted})
+	if survivor.Load() != 3 {
+		t.Fatalf("survivor stopped receiving after the other sub was canceled: %d, want 3", survivor.Load())
+	}
+	if got := metrics.BusEventsDeliveredTotal.Value() - del0; got != 2 {
+		t.Fatalf("delivered delta after cancel = %v, want 2 (only the survivor counts)", got)
+	}
+}
+
+// TestCancelResubscribeChurn exercises subscribe/publish/cancel churn
+// on one pattern and asserts no growth: every round delivers exactly
+// once to a live handler, canceled rounds deliver nothing, the
+// delivered counter advances only for live deliveries, and the bus
+// ends with zero registered patterns (goroutine-free — the memory bus
+// has no background workers, so map state is the full leak surface).
+func TestCancelResubscribeChurn(t *testing.T) {
+	b := New()
+	pattern := "ryvex.resource.churn.>"
+	const rounds = 200
+	del0 := metrics.BusEventsDeliveredTotal.Value()
+
+	for i := 0; i < rounds; i++ {
+		var hits atomic.Int64
+		sub := b.Subscribe(pattern, func(Event) { hits.Add(1) })
+		b.Publish(Event{Org: "churn", Kind: "Node", Type: EventUpdated})
+		if hits.Load() != 1 {
+			t.Fatalf("round %d: %d deliveries to live subscription, want 1", i, hits.Load())
+		}
+		sub.Cancel()
+		// Post-cancel publish: must be fully silent (no handler hit and
+		// no delivered-counter movement, checked in aggregate below).
+		b.Publish(Event{Org: "churn", Kind: "Node", Type: EventUpdated})
+		if len(b.subs) != 0 {
+			t.Fatalf("round %d: canceled pattern still registered (leak)", i)
+		}
+	}
+
+	if got := metrics.BusEventsDeliveredTotal.Value() - del0; got != rounds {
+		t.Fatalf("delivered delta over %d churn rounds = %v, want %d (canceled subscriptions must not count)", rounds, got, rounds)
+	}
+	if len(b.subs) != 0 {
+		t.Fatalf("churn left %d registered patterns", len(b.subs))
+	}
+}

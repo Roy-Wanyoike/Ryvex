@@ -52,6 +52,43 @@ func TestSubscriptionCancel(t *testing.T) {
 	}
 }
 
+// TestSubscriptionCancelFirstOfTwo pins issue #69: with two
+// subscribers on one pattern, canceling the FIRST must remove exactly
+// that subscriber — the surviving one keeps receiving, and no zombie
+// entry may remain in the bus (the pre-fix wrong-element delete
+// starved the second subscriber and left a nil-handler entry behind).
+func TestSubscriptionCancelFirstOfTwo(t *testing.T) {
+	b := New()
+	var first, second atomic.Int64
+	subA := b.Subscribe("ryvex.resource.acme.>", func(Event) { first.Add(1) })
+	subB := b.Subscribe("ryvex.resource.acme.>", func(Event) { second.Add(1) })
+
+	b.Publish(Event{Org: "acme", Kind: "Node", Type: EventDeleted})
+	if first.Load() != 1 || second.Load() != 1 {
+		t.Fatalf("both subscribers must receive: first=%d second=%d", first.Load(), second.Load())
+	}
+
+	// Cancel the first subscriber; the second must keep receiving.
+	subA.Cancel()
+	b.Publish(Event{Org: "acme", Kind: "Node", Type: EventDeleted})
+	if first.Load() != 1 {
+		t.Fatalf("canceled subscriber still delivered: first=%d", first.Load())
+	}
+	if second.Load() != 2 {
+		t.Fatalf("second subscriber lost deliveries after the first was canceled: second=%d, want 2", second.Load())
+	}
+
+	// Canceling the second too must unregister the pattern entirely.
+	subB.Cancel()
+	b.Publish(Event{Org: "acme", Kind: "Node", Type: EventDeleted})
+	if first.Load() != 1 || second.Load() != 2 {
+		t.Fatalf("deliveries after all cancels: first=%d second=%d", first.Load(), second.Load())
+	}
+	if len(b.subs) != 0 {
+		t.Fatalf("canceled patterns still registered: %d remain", len(b.subs))
+	}
+}
+
 func TestHandlerPanicContained(t *testing.T) {
 	b := New()
 	var good atomic.Int64

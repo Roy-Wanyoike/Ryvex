@@ -188,6 +188,51 @@ func RunSuite(t *testing.T, name string, newBus Factory, opts SuiteOptions) {
 		}
 	})
 
+	// cancel_first_of_two_keeps_second pins issue #69: with two
+	// subscribers on one pattern, canceling the first must not touch
+	// the second. The pre-fix memory bus deleted the wrong slice
+	// element, which (a) stopped all deliveries to the surviving
+	// subscriber and (b) left a zombie entry that was "delivered" to
+	// (recovered nil-handler panic + inflated delivered counter) on
+	// every later matching publish. Both backends must behave
+	// identically here.
+	t.Run(name+"/cancel_first_of_two_keeps_second", func(t *testing.T) {
+		b, done := newBus(t)
+		defer done()
+		first := newCounter()
+		second := newCounter()
+		firstSub := b.Subscribe("ryvex.resource.acme.>", first.hit)
+		secondSub := b.Subscribe("ryvex.resource.acme.>", second.hit)
+		if firstSub == nil || secondSub == nil {
+			t.Fatal("Subscribe returned nil subscription")
+		}
+
+		b.Publish(bus.Event{Org: "acme", Kind: "Node", Type: bus.EventDeleted})
+		if !waitFor(func() bool { return first.n() == 1 && second.n() == 1 }) {
+			t.Fatalf("both subscribers must receive the event: first=%d second=%d", first.n(), second.n())
+		}
+
+		// Cancel the first subscriber: the second must keep receiving
+		// and the first must go silent.
+		firstSub.Cancel()
+		b.Publish(bus.Event{Org: "acme", Kind: "Node", Type: bus.EventDeleted})
+		if !waitFor(func() bool { return second.n() == 2 }) {
+			t.Fatalf("second subscriber stopped receiving after the first was canceled: second=%d", second.n())
+		}
+		settle()
+		if first.n() != 1 {
+			t.Fatalf("canceled first subscriber still received events: first=%d", first.n())
+		}
+
+		// Canceling the second too must silence the pattern entirely.
+		secondSub.Cancel()
+		b.Publish(bus.Event{Org: "acme", Kind: "Node", Type: bus.EventDeleted})
+		settle()
+		if first.n() != 1 || second.n() != 2 {
+			t.Fatalf("deliveries after both cancels: first=%d second=%d; want 1/2", first.n(), second.n())
+		}
+	})
+
 	t.Run(name+"/panic_containment", func(t *testing.T) {
 		b, done := newBus(t)
 		defer done()
